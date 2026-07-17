@@ -14,6 +14,7 @@ Codexとの会話を中心に、ローカルLLMアプリを段階的に開発す
 - [アーキテクチャ](docs/ARCHITECTURE.md)
 - [実装状況](docs/IMPLEMENTATION_STATUS.md)
 - [意思決定記録](docs/adr/)
+- [GitHub Flow運用](docs/GITHUB_FLOW.md)
 
 ## フィードバック
 

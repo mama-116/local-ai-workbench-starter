@@ -13,6 +13,7 @@
 
 ## Pull Request
 
+- 詳細な運用は [GitHub Flow 運用ガイド](docs/GITHUB_FLOW.md) を確認してください。
 - `main` へ直接pushせず、作業ブランチからPull Requestを作成してください。
 - 変更理由と確認方法を説明してください。
 - 関連するテスト、lint、秘密情報検査を実行してください。

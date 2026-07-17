@@ -67,22 +67,20 @@ local-ai-workbench-starter/
     local-ai-builder-kit/
       .codex-plugin/plugin.json
       skills/
-      hooks/
-      scripts/
-      assets/
   docs/
     REQUIREMENTS.md
     ARCHITECTURE.md
+    GITHUB_FLOW.md
     adr/
     templates/
-  prompts/
-    system/
-    characters/
   scripts/
     check-environment.ps1
+    setup-codex-plugin.ps1
     build-distribution.ps1
   app/
 ```
+
+初版PluginはSkillだけを同梱する。`hooks/`、Plugin内 `scripts/`、`assets/`、MCP、Appsは実体が必要になった時点で追加し、空フォルダーを完成扱いしない。アプリのキャラクタープロンプトはルートの `prompts/` へ複製せず、SQLiteの `character_versions` を正本とする。
 
 ### 5.2 初心者向け会話導線
 
