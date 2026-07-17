@@ -6,6 +6,7 @@ import platform
 import subprocess
 import time
 from ctypes import wintypes
+from typing import Protocol, cast
 
 from local_llm_chat.domain.models import TelemetryMetric
 
@@ -28,12 +29,18 @@ class _MemoryStatus(ctypes.Structure):
     ]
 
 
+class _Kernel32(Protocol):
+    def GetSystemTimes(self, idle: object, kernel: object, user: object, /) -> int: ...
+
+    def GlobalMemoryStatusEx(self, status: object, /) -> int: ...
+
+
 def _filetime_value(value: wintypes.FILETIME) -> int:
     return (value.dwHighDateTime << 32) | value.dwLowDateTime
 
 
 def _read_system_usage() -> tuple[float, float]:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = cast(_Kernel32, getattr(ctypes, "windll").kernel32)
 
     def system_times() -> tuple[int, int, int]:
         idle = wintypes.FILETIME()
