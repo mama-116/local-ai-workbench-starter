@@ -14,6 +14,7 @@ from local_llm_chat.domain.states import (
     TranslationState,
     ToolCallState,
     ContextSummaryState,
+    JobRunState,
 )
 
 
@@ -337,6 +338,30 @@ class ToolCallAudit:
     result_item_count: int | None
     result_size_bytes: int | None
     result_sha256: str | None
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledJob:
+    id: str
+    handler_name: str
+    interval_seconds: int
+    first_due_at: datetime
+    payload: dict[str, object]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class JobRun:
+    id: str
+    job_id: str
+    scheduled_for: datetime
+    attempt: int
+    state: JobRunState
+    retry_of_run_id: str | None
     failure_reason: str | None
     created_at: datetime
     started_at: datetime | None = None

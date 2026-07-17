@@ -13,6 +13,7 @@ from local_llm_chat.application.services.conversation_service import Conversatio
 from local_llm_chat.application.services.profile_service import ProfileService
 from local_llm_chat.application.services.rag_service import RagService
 from local_llm_chat.application.services.restart_service import RestartService
+from local_llm_chat.application.services.scheduler_service import SchedulerService
 from local_llm_chat.application.services.translation_service import TranslationService
 from local_llm_chat.application.services.telemetry_service import TelemetryService
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
@@ -47,8 +48,10 @@ class AppContainer:
     telemetry: TelemetryService
     chat: ChatService
     tool_access: ToolAccessService
+    scheduler: SchedulerService
 
     async def close(self) -> None:
+        await self.scheduler.close()
         await self.translations.close()
         await self.telemetry.close()
         await self.providers.close()
@@ -85,6 +88,8 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         ),
         on_change=tool_access.notify,
     )
+    scheduler = SchedulerService(repository, {})
+    scheduler.start()
 
     return AppContainer(
         paths=paths,
@@ -97,6 +102,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         translations=translations,
         telemetry=telemetry,
         tool_access=tool_access,
+        scheduler=scheduler,
         chat=ChatService(
             repository,
             providers,
