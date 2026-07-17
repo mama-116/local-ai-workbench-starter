@@ -375,7 +375,7 @@ class SQLiteAppRepository:
             ).fetchone()
             if row is None:  # pragma: no cover
                 raise PersistenceError("実行記録が見つかりません。")
-            return row
+            return cast(sqlite3.Row, row)
 
         return self._job_run_from_row(await self._write(operation))
 

@@ -71,8 +71,6 @@ class SchedulerService:
         )
 
     async def run_due_once(self, now: datetime) -> int:
-        if self._closing:
-            return 0
         executed = 0
         for _ in range(self._max_runs_per_tick):
             async with self._claim_lock:
@@ -86,13 +84,9 @@ class SchedulerService:
                 break
             await self._await_execution(run.id, task)
             executed += 1
-            if self._closing:
-                break
         return executed
 
     async def retry_failed(self, run_id: str, now: datetime) -> JobRun:
-        if self._closing:
-            raise RuntimeError("scheduler is closed")
         async with self._claim_lock:
             if self._closing:
                 raise RuntimeError("scheduler is closed")
