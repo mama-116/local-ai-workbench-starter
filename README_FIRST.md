@@ -5,11 +5,13 @@
 ## 最初の1回だけ
 
 1. ZIPを展開して、このフォルダーをCodexで開く。
-2. Codexを再起動する。
-3. **Plugins**で `Local AI Starter` を選び、`local-ai-builder-kit` をインストールする。
+2. PowerShellで `powershell -ExecutionPolicy Bypass -File .\scripts\setup-codex-plugin.ps1` を1回だけ実行する。
+3. Codexを再起動する。
 4. 新しいタスクでこのフォルダーを開く。
 
-Plugin一覧に表示されない場合でも、`AGENTS.md`による基本案内は動作する。その場合はPlugin導入をCodexへ相談する。
+このスクリプトは、同梱した `Local AI Starter` marketplaceを登録し、`local-ai-builder-kit` をインストールする。失敗した場合でも、`AGENTS.md`による基本案内は動作するため、表示されたエラーをCodexへ相談する。
+
+セットアップ状態を再確認する場合は、`powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1` を実行する。
 
 準備後、次の一文だけを送ってください。
 

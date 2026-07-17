@@ -14,12 +14,27 @@ if (-not $output.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
     throw "Output directory must stay inside the project: $root"
 }
 
+$allowed = @(
+    'README.md', 'README_FIRST.md', 'CONTRIBUTING.md', 'AGENTS.md',
+    '.gitignore', 'THIRD_PARTY_NOTICES.md',
+    '.agents', '.codex', 'docs', 'plugins', 'scripts'
+)
+
 $forbiddenPatterns = @(
     '*.env', '*.pem', '*.key', '*.pfx', '*.db', '*.sqlite', '*.sqlite3',
     'archive', 'raw', 'checksums', 'backups', 'logs', 'data'
 )
 
-$forbidden = Get-ChildItem -LiteralPath $root -Recurse -Force -File | Where-Object {
+$distributionFiles = foreach ($relative in $allowed) {
+    $source = Join-Path $root $relative
+    if (Test-Path -LiteralPath $source -PathType Leaf) {
+        Get-Item -LiteralPath $source -Force
+    } elseif (Test-Path -LiteralPath $source -PathType Container) {
+        Get-ChildItem -LiteralPath $source -Recurse -Force -File
+    }
+}
+
+$forbidden = $distributionFiles | Where-Object {
     $item = $_
     $forbiddenPatterns | Where-Object {
         $item.Name -like $_ -or $item.DirectoryName.Split([System.IO.Path]::DirectorySeparatorChar) -contains $_
@@ -30,11 +45,6 @@ if ($forbidden) {
     $list = ($forbidden.FullName -join [Environment]::NewLine)
     throw "Forbidden distribution files were found. ZIP creation stopped.`n$list"
 }
-
-$allowed = @(
-    'README_FIRST.md', 'AGENTS.md', '.gitignore', 'THIRD_PARTY_NOTICES.md',
-    '.agents', '.codex', 'docs', 'plugins', 'scripts'
-)
 
 $stage = Join-Path $env:TEMP ('local-ai-workbench-starter-' + [guid]::NewGuid().ToString('N'))
 $packageRoot = Join-Path $stage 'local-ai-workbench-starter'
