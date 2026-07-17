@@ -4,7 +4,12 @@ import pytest
 
 from local_llm_chat.domain.models import TelemetryMetric
 from local_llm_chat.application.services.rag_service import RagService
-from local_llm_chat.domain.states import MessageState, TranslationState
+from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.states import (
+    ContextSummaryState,
+    MessageState,
+    TranslationState,
+)
 from local_llm_chat.infrastructure.persistence.sqlite_repositories import (
     SQLiteAppRepository,
 )
@@ -232,3 +237,97 @@ async def test_rag_search_is_limited_to_documents_selected_for_conversation(
     assert [document.id for document in await service.selected_documents(conversation.id)] == [
         selected.id
     ]
+
+
+@pytest.mark.asyncio
+async def test_context_summary_is_derived_restart_safe_and_branch_scoped(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    await repository.initialize()
+    character = await repository.ensure_default_character()
+    profile = await repository.ensure_model_profile(
+        "ollama-local", "gemma4:12b", {"num_ctx": 64}
+    )
+    conversation = await repository.create_conversation(
+        "要約保存試験", character.id, profile.id
+    )
+    original = await repository.start_send(conversation.id, "日本語🙂の原文")
+    await repository.finish_response(
+        original, "変更されない回答", MessageState.COMPLETED
+    )
+    source_ids = (original.user_message.id, original.assistant_message.id)
+
+    prepared = await repository.prepare_context_summary(
+        conversation.id,
+        original.branch_id,
+        source_ids,
+        "source-hash",
+        "settings-hash",
+        "gemma4:12b",
+        "context-summary-v1",
+    )
+    assert prepared.should_generate
+    await repository.mark_context_summary_running(prepared.summary.id)
+    completed = await repository.finish_context_summary(
+        prepared.summary.id,
+        "ローカル要約🙂",
+        ContextSummaryState.COMPLETED,
+    )
+    assert completed.source_message_ids == source_ids
+
+    reopened = SQLiteAppRepository(database_path)
+    await reopened.initialize()
+    assert [message.content for message in await reopened.list_active_messages(conversation.id)] == [
+        "日本語🙂の原文",
+        "変更されない回答",
+    ]
+    reusable = await reopened.prepare_context_summary(
+        conversation.id,
+        original.branch_id,
+        source_ids,
+        "source-hash",
+        "settings-hash",
+        "gemma4:12b",
+        "context-summary-v1",
+    )
+    assert not reusable.should_generate
+    assert reusable.summary.id == completed.id
+
+    rewritten = await reopened.start_rewrite(
+        conversation.id, original.user_message.id, "別分岐"
+    )
+    branch_scoped = await reopened.prepare_context_summary(
+        conversation.id,
+        rewritten.branch_id,
+        (rewritten.user_message.id,),
+        "source-hash",
+        "settings-hash",
+        "gemma4:12b",
+        "context-summary-v1",
+    )
+    changed_settings = await reopened.prepare_context_summary(
+        conversation.id,
+        original.branch_id,
+        source_ids,
+        "source-hash",
+        "changed-settings-hash",
+        "gemma4:12b",
+        "context-summary-v1",
+    )
+    assert branch_scoped.should_generate
+    assert changed_settings.should_generate
+    assert branch_scoped.summary.id != completed.id
+    assert changed_settings.summary.id != completed.id
+
+    with pytest.raises(ValidationError, match="古い連続区間"):
+        await reopened.prepare_context_summary(
+            conversation.id,
+            rewritten.branch_id,
+            source_ids,
+            "cross-branch-source-hash",
+            "settings-hash",
+            "gemma4:12b",
+            "context-summary-v1",
+        )

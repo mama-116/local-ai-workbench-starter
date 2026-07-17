@@ -7,6 +7,8 @@ from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
     Conversation,
+    ContextSummary,
+    ContextSummaryPreparation,
     Message,
     ModelProfile,
     LatestTelemetry,
@@ -18,7 +20,12 @@ from local_llm_chat.domain.models import (
     ToolCallRequest,
     ToolFolderGrant,
 )
-from local_llm_chat.domain.states import MessageState, ToolCallState, TranslationState
+from local_llm_chat.domain.states import (
+    ContextSummaryState,
+    MessageState,
+    ToolCallState,
+    TranslationState,
+)
 
 
 class AppRepository(Protocol):
@@ -158,6 +165,31 @@ class AppRepository(Protocol):
     ) -> RunSession: ...
 
     async def context_to_message(self, message_id: str) -> list[Message]: ...
+
+    async def prepare_context_summary(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        source_message_ids: tuple[str, ...],
+        source_hash: str,
+        settings_hash: str,
+        model: str,
+        prompt_version: str,
+    ) -> ContextSummaryPreparation: ...
+
+    async def mark_context_summary_running(self, summary_id: str) -> ContextSummary: ...
+
+    async def finish_context_summary(
+        self,
+        summary_id: str,
+        content: str,
+        state: ContextSummaryState,
+        error_code: str | None = None,
+    ) -> ContextSummary: ...
+
+    async def list_context_summaries(
+        self, conversation_id: str
+    ) -> list[ContextSummary]: ...
 
     async def checkpoint_response(self, message_id: str, content: str) -> None: ...
 

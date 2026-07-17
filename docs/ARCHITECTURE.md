@@ -81,6 +81,7 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 - `threads`: 会話の目的と状態
 - `messages`: 利用者・AI・ツールの発言
+- `context_summaries`: 会話・分岐・対象メッセージ列に結び付くローカル要約の試行と状態
 - `message_translations`: 原文UUIDに関連する日本語訳の試行、再利用元、失敗状態
 - `runs`: モデル実行単位と設定
 - `model_profiles`: Provider、モデル、推論設定
@@ -96,6 +97,10 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `scheduled_jobs` / `job_runs`: 定期処理と実行履歴
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
+
+`messages.content` は自動圧縮でも変更・削除しない。コンテキスト容量は、system prompt、現在の分岐経路、RAG、ツール定義・結果、出力予約量をモデル呼出し前に合算する。実モデル用の初期推定はUTF-8 payload byte数をトークン相当単位として扱う保守的な方式とし、決定論的な偽カウンターへ交換できる契約にする。
+
+上限超過時は現在分岐の古い連続区間だけをローカル要約し、`context_summaries` へ会話ID、分岐ID、順序付き対象メッセージIDと内容ハッシュ、モデル設定ハッシュ、要約プロンプト版、状態を追記する。完了済み要約はこれらがすべて一致するときだけ再利用する。要約失敗時は直近メッセージだけで上限内へ収め、古い文脈を利用できなかったことを既存の画面通知で警告する。要約とフォールバックはいずれも原文を変更せず、外部Providerを利用しない。
 
 `messages.content` は会話履歴へ渡す原文の正本とし、表示用の日本語訳を混ぜない。翻訳は `message_translations` へ試行単位で保存し、状態値は `pending`、`running`、`completed`、`failed` とする。同じ原文ハッシュ、対象言語、Provider、モデルの完了済み結果は別メッセージでも再利用できる。再翻訳は元の試行を上書きせず、新しい試行を追加する。
 

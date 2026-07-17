@@ -38,6 +38,13 @@ class ToolCallState(StrEnum):
     DENIED = "denied"
 
 
+class ContextSummaryState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Locality(StrEnum):
     LOCAL = "local"
     LAN = "lan"
