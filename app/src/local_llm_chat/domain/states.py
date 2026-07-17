@@ -4,6 +4,7 @@ from enum import StrEnum
 class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
+    TOOL = "tool"
 
 
 class MessageState(StrEnum):
@@ -27,6 +28,14 @@ class TranslationState(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ToolCallState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
 
 
 class Locality(StrEnum):

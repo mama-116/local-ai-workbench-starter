@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from local_llm_chat.domain.states import (
@@ -11,6 +12,7 @@ from local_llm_chat.domain.states import (
     MessageState,
     RunState,
     TranslationState,
+    ToolCallState,
 )
 
 
@@ -246,6 +248,8 @@ class RunSession:
 class ChatMessageInput:
     role: MessageRole
     content: str
+    tool_name: str | None = None
+    tool_calls: tuple[ToolCallRequest, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +258,7 @@ class ChatRequest:
     system_prompt: str
     messages: tuple[ChatMessageInput, ...]
     options: dict[str, Any] = field(default_factory=dict)
+    tools: tuple[ToolDefinition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,3 +269,51 @@ class ChatChunk:
     output_tokens: int | None = None
     total_duration_ns: int | None = None
     generation_duration_ns: int | None = None
+    tool_calls: tuple[ToolCallRequest, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallRequest:
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolProviderResult:
+    content: str
+    item_count: int
+    is_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFolderGrant:
+    conversation_id: str
+    root_path: Path
+    granted_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallAudit:
+    id: str
+    conversation_id: str
+    run_id: str | None
+    provider: str
+    tool_name: str
+    input_arguments: dict[str, object]
+    state: ToolCallState
+    result_content: str | None
+    result_item_count: int | None
+    result_size_bytes: int | None
+    result_sha256: str | None
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None

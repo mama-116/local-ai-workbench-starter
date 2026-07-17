@@ -16,6 +16,10 @@ class OllamaUnavailable(AppError):
     pass
 
 
+class ToolUseUnavailable(AppError):
+    pass
+
+
 class ModelUnavailable(AppError):
     pass
 

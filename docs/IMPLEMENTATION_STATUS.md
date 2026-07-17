@@ -33,11 +33,18 @@
 - 配布版のFlet利用者専用データ領域と、配布フォルダーからの会話・設定分離
 - Phase 5の許可フォルダー外、リンク経由、秘密情報候補、非対応形式、1MiB超過を拒否する `ReadOnlyToolAccessPolicy`
 - Phase 5の許可済みUTF-8テキストを最大20件、相対パス・行番号・短い抜粋付きで返す `BuiltInFolderSearchTool`
+- Phase 5の許可済みUTF-8 `.txt` / `.md`を行範囲・64KiB上限付きで返す `BuiltInTextReadTool`
+- 内蔵検索・読取りを共通化する `ToolProvider` 契約と、会話単位のフォルダー許可・取消し・SQLite復元
+- `pending / running / completed / failed / denied`、入力、PRIVATE結果、件数、サイズ、SHA-256、理由、開始・終了時刻を保存する `tool_calls` 監査
+- 1発言3回、逐次実行、1回10秒、結果合計64KiBを強制する `ToolCoordinator`
+- Ollamaツール要求の実行と結果返却、最終回答生成、ツール非対応モデルの通常会話フォールバック
+- `CONTROL DESK` A案の許可フォルダー、取消し、利用可能ツール、実行中、直近結果、本文非表示の監査履歴導線
 
 ## 検証済み
 
-- `pytest`: 81件成功
+- `pytest`: 110件成功
 - `mypy --strict`: エラー0件
+- Phase 5内蔵Toolsを実Ollamaの `qwen3.5:9b` で画面確認し、異なる2件の検索・読取り・確認コード回答・読取件数、`CONTROL DESK` の `実行中: 1件` から完了への遷移、入力・件数・サイズ・SHA-256・開始終了時刻、監査本文の非表示を確認
 - Windows上のFletネイティブ画面起動と3カラム表示
 - Ollama Cloud無効化設定を確認し、ローカルモデル15件だけが利用可能になること
 - `qwen3.5:9b` の会話応答は初回12.3秒、読込後3.8秒、GPU使用約7.3GiB
@@ -57,7 +64,7 @@
 
 ## 初版後へ送るもの
 
-- Tools/MCP Phase 5（ADR-0014で設計済み、未実装）
+- Tools/MCP Phase 5のローカルMCP `stdio` 接続（内蔵ツール部分は実装済み）
 - 意味検索が必要になった場合のローカル埋め込みモデル比較
 - 登録文書が10件を超えた場合の専用文書ライブラリ
 - Web検索とプライバシー承認
