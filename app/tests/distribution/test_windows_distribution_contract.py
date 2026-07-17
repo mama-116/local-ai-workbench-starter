@@ -23,6 +23,9 @@ def test_portable_build_has_privacy_guard_and_user_instructions() -> None:
     assert script.is_file()
     script_text = script.read_text(encoding="utf-8")
     assert "flet build windows" in script_text
+    assert "uv run --frozen" in script_text
+    assert "pyinstaller" in script_text
+    assert "LocalNotesMCP.exe" in script_text
     assert ".local-data" in script_text
     assert ".flet" in script_text
     assert "*.sqlite*" in script_text

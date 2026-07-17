@@ -108,6 +108,8 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 初回のTool Gatewayは、会話ごとに許可された1フォルダーのUTF-8 `.txt` / `.md`検索・読取りと、信頼済みプロファイル1件のローカルMCP `stdio` 接続だけを扱う。書込み、削除、シェル、公開ネットワーク、MCPのResources、Prompts、Sampling、Tasksは扱わない。
 
+信頼済みプロファイルは、アプリと同梱する `local-notes MCP` だけとする。公開ツールは `search_text` と `read_text` の2件に固定し、現在の会話で許可されたフォルダーをMCP Rootsとしてセッション単位に渡す。モデルやMCPサーバーは許可ルートを変更できない。起動コマンド、引数、環境変数名、許可ツール名、起動時に固定した実行ファイルSHA-256を呼出し直前に再検査する。詳細な選定理由と見直し条件は [ADR-0017](adr/0017-use-bundled-local-notes-mcp.md) を参照する。
+
 `ToolCoordinator` はOllamaが返したツール要求を直接実行せず、現在の会話許可、Provider、ツール名、正規化済みパス、回数・時間・結果サイズ上限を検査する。内蔵ツールとMCPは同じ `ToolProvider` 契約を使う。MCPサーバーの申告は信頼せず、アプリ側の固定プロファイルと許可ツール一覧を正本にする。別プロセスである第三者MCPの挙動はアプリだけでは保証できないため、任意登録は初回対象外とする。
 
 `tool_calls` はUUID、会話、run、許可、Provider、ツール名、入力、状態、結果、時刻、失敗理由、結果ハッシュを保持する。結果本文は上限付きPRIVATEデータとしてSQLiteだけへ保存し、通常ログへ重複出力しない。状態値は `pending`、`running`、`completed`、`failed`、`denied` とし、再実行は別レコードへ追記する。詳細上限、UI、受入基準は [ADR-0014](adr/0014-start-read-only-tools-in-control-desk.md) を正本とする。

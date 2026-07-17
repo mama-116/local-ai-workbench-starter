@@ -20,6 +20,8 @@ from local_llm_chat.infrastructure.llm.ollama_registry import (
     LOCAL_PROVIDER_NAME,
     OllamaProviderRegistry,
 )
+from local_llm_chat.infrastructure.mcp.profile import local_notes_profile
+from local_llm_chat.infrastructure.mcp.tool_provider import TrustedMcpToolProvider
 from local_llm_chat.infrastructure.persistence.sqlite_repositories import (
     SQLiteAppRepository,
 )
@@ -76,7 +78,12 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     rag = RagService(repository)
     tool_access = ToolAccessService(repository)
     tool_coordinator = ToolCoordinator(
-        repository, (BuiltInToolProvider(repository),), on_change=tool_access.notify
+        repository,
+        (
+            BuiltInToolProvider(repository),
+            TrustedMcpToolProvider(repository, local_notes_profile()),
+        ),
+        on_change=tool_access.notify,
     )
 
     return AppContainer(

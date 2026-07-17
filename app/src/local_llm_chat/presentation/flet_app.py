@@ -235,11 +235,15 @@ class LocalChatApp:
                     ft.Row(
                         [
                             ft.Icon(ft.Icons.HANDYMAN_ROUNDED, size=16, color=ACCENT),
-                            ft.Text("内蔵TOOLS", size=11, weight=ft.FontWeight.W_600),
+                            ft.Text("TOOLS / MCP", size=11, weight=ft.FontWeight.W_600),
                         ],
                         spacing=6,
                     ),
-                    ft.Text("利用可能: フォルダー検索 / テキスト読取り", size=10, color=MUTED),
+                    ft.Text(
+                        "利用可能: 内蔵2件 / local-notes MCP 2件",
+                        size=10,
+                        color=MUTED,
+                    ),
                     self.tool_folder_text,
                     ft.Button(
                         "フォルダーを許可",
