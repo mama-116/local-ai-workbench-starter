@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 from typing import Any
 
 from local_llm_chat.domain.states import (
+    AgentPolicyDecision,
+    AgentRunState,
+    AgentStepState,
+    AgentToolEffect,
     CostClass,
+    DataClassification,
     Locality,
     MessageRole,
     MessageState,
@@ -362,6 +368,102 @@ class JobRun:
     attempt: int
     state: JobRunState
     retry_of_run_id: str | None
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionLimits:
+    max_cost_units: int = 5
+    max_steps: int = 5
+    max_duration_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_cost_units <= 5:
+            raise ValueError("max_cost_units must be between 1 and 5")
+        if not 1 <= self.max_steps <= 5:
+            raise ValueError("max_steps must be between 1 and 5")
+        if (
+            not math.isfinite(self.max_duration_seconds)
+            or not 0 < self.max_duration_seconds <= 60
+        ):
+            raise ValueError("max_duration_seconds must be between 0 and 60")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolDescriptor:
+    name: str
+    effect: AgentToolEffect
+    destination: Locality
+    cost_units: int = 1
+    cost_class: CostClass = CostClass.UNKNOWN
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("tool name must not be empty")
+        if self.cost_units < 1:
+            raise ValueError("cost_units must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStepRequest:
+    id: str
+    tool_name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentActionApproval:
+    id: str
+    action_hash: str
+    approved_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolExecution:
+    result_content: str
+    restore_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPolicyResult:
+    decision: AgentPolicyDecision
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRun:
+    id: str
+    conversation_id: str
+    objective: str
+    allowed_tools: tuple[str, ...]
+    limits: AgentExecutionLimits
+    state: AgentRunState
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStep:
+    id: str
+    run_id: str
+    ordinal: int
+    tool_name: str
+    arguments: dict[str, object]
+    action_hash: str
+    data_classification: DataClassification | None
+    effect: AgentToolEffect | None
+    destination: Locality | None
+    cost_class: CostClass | None
+    cost_units: int | None
+    state: AgentStepState
+    result_size_bytes: int | None
+    result_sha256: str | None
+    restore_token: str | None
     failure_reason: str | None
     created_at: datetime
     started_at: datetime | None = None

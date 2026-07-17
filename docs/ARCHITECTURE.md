@@ -29,6 +29,10 @@ flowchart LR
     T --> A{承認ゲート}
     A --> X[外部投稿・削除・課金]
     O -. Phase 7 .-> CU[ComputerUseCoordinator]
+    O -. Phase 7 .-> AE[AgentExecutionCoordinator]
+    AE --> F
+    AE --> T
+    AE --> CAP
     CU --> F
     CU --> OBS[画面 + UI Automation観測]
     CU --> CAP{操作Policy + 計画承認}
@@ -95,6 +99,7 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `documents` / `chunks`: RAG登録資料と断片
 - `telemetry_samples`: CPU、RAM、GPU、VRAM、速度
 - `scheduled_jobs` / `job_runs`: 定期処理と実行履歴
+- `agent_runs` / `agent_steps`: 許可ツール、予算、手数、時間、承認、復元を追記するAgent実行監査
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
 
@@ -117,6 +122,16 @@ Phase 6のSchedulerは、アプリに固定登録したハンドラーだけを�
 `tool_calls` はUUID、会話、run、許可、Provider、ツール名、入力、状態、結果、時刻、失敗理由、結果ハッシュを保持する。結果本文は上限付きPRIVATEデータとしてSQLiteだけへ保存し、通常ログへ重複出力しない。状態値は `pending`、`running`、`completed`、`failed`、`denied` とし、再実行は別レコードへ追記する。詳細上限、UI、受入基準は [ADR-0014](adr/0014-start-read-only-tools-in-control-desk.md) を正本とする。
 
 画面はApplication層の許可Serviceと監査読取Serviceだけを呼び、ProviderやSQLiteを直接参照しない。監査一覧用の読取結果からはPRIVATEな結果本文を除外し、件数、サイズ、SHA-256、失敗理由、開始・終了時刻だけを返す。
+
+## Agent実行境界
+
+`agent_runs` の状態は `pending`、`running`、`completed`、`failed`、`cancelled`、`denied` とする。`agent_steps` の状態は `proposed`、`running`、`completed`、`failed`、`denied`、`restored`、`restore_failed` とする。再実行は別runへ追記し、起動時に残った未完了run/stepは `failed` へ復旧して自動再開しない。同時に `running` にできるrunはSQLite制約で1件に限定する。
+
+`AgentExecutionCoordinator` は、run開始時に固定した許可ツールとアプリ同梱レジストリの積集合だけを扱う。既定値は総予算5単位、最大5手、最大60秒で、ツールの作用、送信先、予算単位、引数のデータ区分をモデルではなく固定Provider定義から検査する。送信先不明とPRIVATEのPC外送信は常に `DENY` とする。
+
+次手を生成する `AgentRequestSource` は同一PC上の `local` かつ `no_charge` に固定する。会話の目的と直前のツール結果はPRIVATEになりうるため、Sourceの区分を確認できない、LAN・Remote、無料枠・有料・不明のいずれかであれば、Sourceを呼ぶ前にrunを `denied` として監査する。
+
+ローカルの可逆書込み、外部投稿、外部削除は、会話、目的、ツール定義、データ区分、上限、許可リストを含む正規化済み1操作のSHA-256へ束縛した一回限り・30秒有効の承認を必要とする。課金と `no_charge` 以外のProviderは `strict_free` のため承認があっても拒否する。途中失敗または停止時は、完了済みの可逆操作を復元トークンで逆順に戻し、復元結果もstep状態として保存する。可逆Providerが作用後に失敗する場合は失敗とともに復元トークンを返し、トークンを確認できない失敗は `restore_failed` として実Providerの有効化を止める。Phase 7の共通基盤にはFake Providerだけを接続し、本物のOS入力、ファイル書込み、外部操作は各Issueの一方向ドア承認まで登録しない。詳細は [ADR-0019](adr/0019-bound-agent-execution-to-audited-local-plans.md) を参照する。
 
 ## Computer Use境界
 

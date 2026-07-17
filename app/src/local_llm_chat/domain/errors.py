@@ -20,6 +20,12 @@ class ToolUseUnavailable(AppError):
     pass
 
 
+class AgentToolFailure(AppError):
+    def __init__(self, message: str, restore_token: str | None = None) -> None:
+        super().__init__(message)
+        self.restore_token = restore_token
+
+
 class ModelUnavailable(AppError):
     pass
 

@@ -16,6 +16,9 @@ from local_llm_chat.domain.errors import (
     ValidationError,
 )
 from local_llm_chat.domain.models import (
+    AgentExecutionLimits,
+    AgentRun,
+    AgentStep,
     BranchInfo,
     CharacterVersion,
     Conversation,
@@ -42,6 +45,12 @@ from local_llm_chat.domain.models import (
     TranslationPreparation,
 )
 from local_llm_chat.domain.states import (
+    AgentRunState,
+    AgentStepState,
+    AgentToolEffect,
+    DataClassification,
+    CostClass,
+    Locality,
     MessageRole,
     MessageState,
     ContextSummaryState,
@@ -189,8 +198,261 @@ class SQLiteAppRepository:
                 """,
                 (now,),
             )
+            connection.execute(
+                """
+                UPDATE agent_steps
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('proposed', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
 
         await self._write(operation)
+
+    async def create_agent_run(self, run: AgentRun) -> AgentRun:
+        if run.state is not AgentRunState.RUNNING or run.started_at is None:
+            raise ValidationError("Agent runはrunning状態で開始してください。")
+        started_at = run.started_at
+        allowed_tools_json = json.dumps(
+            run.allowed_tools, ensure_ascii=False, separators=(",", ":")
+        )
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_runs(
+                        id, conversation_id, objective, allowed_tools_json,
+                        max_cost_units, max_steps, max_duration_seconds,
+                        state, failure_reason, created_at, started_at, completed_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run.id,
+                        run.conversation_id,
+                        run.objective,
+                        allowed_tools_json,
+                        run.limits.max_cost_units,
+                        run.limits.max_steps,
+                        run.limits.max_duration_seconds,
+                        run.state.value,
+                        run.failure_reason,
+                        _utc_iso(run.created_at),
+                        _utc_iso(started_at),
+                        None,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                if (
+                    "agent_runs.1" in str(error)
+                    or "uq_single_running_agent_run" in str(error)
+                ):
+                    raise ValidationError("別のAgent runが実行中です。") from error
+                raise
+            row = connection.execute(
+                "SELECT * FROM agent_runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Agent runを作成できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._agent_run_from_row(await self._write(operation))
+
+    async def get_agent_run(self, run_id: str) -> AgentRun:
+        row = await self._read(
+            lambda connection: connection.execute(
+                "SELECT * FROM agent_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        )
+        if row is None:
+            raise ValidationError("Agent runが見つかりません。")
+        return self._agent_run_from_row(cast(sqlite3.Row, row))
+
+    async def create_agent_step(self, step: AgentStep) -> AgentStep:
+        try:
+            arguments_json = json.dumps(
+                step.arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValidationError("Agent stepの引数はJSON形式にしてください。") from error
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            run = connection.execute(
+                "SELECT state FROM agent_runs WHERE id = ?", (step.run_id,)
+            ).fetchone()
+            if run is None or str(run["state"]) != AgentRunState.RUNNING.value:
+                raise ValidationError("実行中のAgent runにだけstepを追加できます。")
+            connection.execute(
+                """
+                INSERT INTO agent_steps(
+                    id, run_id, ordinal, tool_name, arguments_json, action_hash,
+                    data_classification, effect, destination, cost_class,
+                    cost_units, state,
+                    result_size_bytes, result_sha256, restore_token,
+                    failure_reason, created_at, started_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step.id,
+                    step.run_id,
+                    step.ordinal,
+                    step.tool_name,
+                    arguments_json,
+                    step.action_hash,
+                    (
+                        step.data_classification.value
+                        if step.data_classification is not None
+                        else None
+                    ),
+                    step.effect.value if step.effect is not None else None,
+                    (
+                        step.destination.value if step.destination is not None else None
+                    ),
+                    step.cost_class.value if step.cost_class is not None else None,
+                    step.cost_units,
+                    step.state.value,
+                    step.result_size_bytes,
+                    step.result_sha256,
+                    step.restore_token,
+                    step.failure_reason,
+                    _utc_iso(step.created_at),
+                    _utc_iso(step.started_at) if step.started_at is not None else None,
+                    (
+                        _utc_iso(step.completed_at)
+                        if step.completed_at is not None
+                        else None
+                    ),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM agent_steps WHERE id = ?", (step.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Agent stepを作成できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._agent_step_from_row(await self._write(operation))
+
+    async def finish_agent_step(self, step: AgentStep) -> AgentStep:
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            cursor = connection.execute(
+                """
+                UPDATE agent_steps
+                SET state = ?, result_size_bytes = ?, result_sha256 = ?,
+                    restore_token = ?, failure_reason = ?, started_at = ?, completed_at = ?
+                WHERE id = ? AND run_id = ?
+                """,
+                (
+                    step.state.value,
+                    step.result_size_bytes,
+                    step.result_sha256,
+                    step.restore_token,
+                    step.failure_reason,
+                    _utc_iso(step.started_at) if step.started_at is not None else None,
+                    (
+                        _utc_iso(step.completed_at)
+                        if step.completed_at is not None
+                        else None
+                    ),
+                    step.id,
+                    step.run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("Agent stepが見つかりません。")
+            row = connection.execute(
+                "SELECT * FROM agent_steps WHERE id = ?", (step.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Agent stepを更新できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._agent_step_from_row(await self._write(operation))
+
+    async def finish_agent_run(self, run: AgentRun) -> AgentRun:
+        if run.state not in {
+            AgentRunState.COMPLETED,
+            AgentRunState.FAILED,
+            AgentRunState.CANCELLED,
+            AgentRunState.DENIED,
+        }:
+            raise ValidationError("Agent runの終了状態が不正です。")
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET state = ?, failure_reason = ?, completed_at = ?
+                WHERE id = ? AND state = 'running'
+                """,
+                (
+                    run.state.value,
+                    run.failure_reason,
+                    _utc_iso(run.completed_at) if run.completed_at is not None else _now(),
+                    run.id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("実行中のAgent runが見つかりません。")
+            row = connection.execute(
+                "SELECT * FROM agent_runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Agent runを更新できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._agent_run_from_row(await self._write(operation))
+
+    async def list_agent_steps(self, run_id: str) -> list[AgentStep]:
+        rows = await self._read(
+            lambda connection: connection.execute(
+                """
+                SELECT * FROM agent_steps WHERE run_id = ?
+                ORDER BY ordinal
+                """,
+                (run_id,),
+            ).fetchall()
+        )
+        return [self._agent_step_from_row(row) for row in rows]
+
+    async def recover_interrupted_agent_runs(self, now: datetime) -> int:
+        value = _utc_iso(now)
+
+        def operation(connection: sqlite3.Connection) -> int:
+            connection.execute(
+                """
+                UPDATE agent_steps
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('proposed', 'running')
+                """,
+                (value,),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (value,),
+            )
+            return cursor.rowcount
+
+        return await self._write(operation)
 
     async def create_scheduled_job(
         self,
@@ -2077,6 +2339,80 @@ class SQLiteAppRepository:
             state=JobRunState(str(row["state"])),
             retry_of_run_id=(
                 str(row["retry_of_run_id"]) if row["retry_of_run_id"] else None
+            ),
+            failure_reason=(
+                str(row["failure_reason"]) if row["failure_reason"] else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
+        )
+
+    @staticmethod
+    def _agent_run_from_row(row: sqlite3.Row) -> AgentRun:
+        allowed_tools_value = json.loads(str(row["allowed_tools_json"]))
+        if not isinstance(allowed_tools_value, list) or not all(
+            isinstance(value, str) for value in allowed_tools_value
+        ):
+            raise PersistenceError("Agent runの許可ツールが壊れています。")
+        return AgentRun(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            objective=str(row["objective"]),
+            allowed_tools=tuple(allowed_tools_value),
+            limits=AgentExecutionLimits(
+                max_cost_units=int(row["max_cost_units"]),
+                max_steps=int(row["max_steps"]),
+                max_duration_seconds=float(row["max_duration_seconds"]),
+            ),
+            state=AgentRunState(str(row["state"])),
+            failure_reason=(
+                str(row["failure_reason"]) if row["failure_reason"] else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
+        )
+
+    @staticmethod
+    def _agent_step_from_row(row: sqlite3.Row) -> AgentStep:
+        arguments_value = json.loads(str(row["arguments_json"]))
+        if not isinstance(arguments_value, dict):
+            raise PersistenceError("Agent stepの引数が壊れています。")
+        arguments = {str(key): value for key, value in arguments_value.items()}
+        return AgentStep(
+            id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            ordinal=int(row["ordinal"]),
+            tool_name=str(row["tool_name"]),
+            arguments=arguments,
+            action_hash=str(row["action_hash"]),
+            data_classification=(
+                DataClassification(str(row["data_classification"]))
+                if row["data_classification"]
+                else None
+            ),
+            effect=(
+                AgentToolEffect(str(row["effect"])) if row["effect"] else None
+            ),
+            destination=(
+                Locality(str(row["destination"])) if row["destination"] else None
+            ),
+            cost_class=(
+                CostClass(str(row["cost_class"])) if row["cost_class"] else None
+            ),
+            cost_units=int(row["cost_units"]) if row["cost_units"] else None,
+            state=AgentStepState(str(row["state"])),
+            result_size_bytes=(
+                int(row["result_size_bytes"])
+                if row["result_size_bytes"] is not None
+                else None
+            ),
+            result_sha256=(
+                str(row["result_sha256"]) if row["result_sha256"] else None
+            ),
+            restore_token=(
+                str(row["restore_token"]) if row["restore_token"] else None
             ),
             failure_reason=(
                 str(row["failure_reason"]) if row["failure_reason"] else None
