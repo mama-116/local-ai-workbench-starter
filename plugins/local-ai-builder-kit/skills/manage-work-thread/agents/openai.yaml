@@ -1,0 +1,4 @@
+interface:
+  display_name: "スレッド案内"
+  short_description: "会話を続けるか分けるか判断し必要な引き継ぎ文を作成します"
+  default_prompt: "Use $manage-work-thread to decide whether this work should stay in this thread."

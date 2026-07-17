@@ -1,0 +1,32 @@
+# Local secrets and runtime data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated output
+dist/
+build/
+tmp/
+logs/
+data/
+.local-data/
+
+# Dependencies and caches
+node_modules/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.idea/
+.vscode/settings.json
+.DS_Store
+Thumbs.db

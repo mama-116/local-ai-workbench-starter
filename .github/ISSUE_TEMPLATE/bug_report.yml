@@ -1,0 +1,59 @@
+name: 不具合報告
+description: 再現できる不具合や予期しない動作を報告します
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告ありがとうございます。APIキー、会話本文、RAG資料、個人ログなどの秘密情報・個人情報は記載しないでください。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 不具合の概要
+      description: 何が起きたかを簡潔に説明してください。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      description: 問題を再現するための操作を順番に記載してください。
+      placeholder: |
+        1. ...を開く
+        2. ...を選ぶ
+        3. ...が表示される
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した動作
+      description: 本来どう動くと考えていたかを記載してください。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 利用環境
+      description: Windows、Python、Ollama、アプリのバージョンなど、分かる範囲で記載してください。
+      placeholder: |
+        - Windows:
+        - Python:
+        - Ollama:
+        - アプリ:
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: 補足
+      description: 秘密情報を除いたスクリーンショットなど、参考情報があれば記載してください。
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 公開情報の確認
+      options:
+        - label: 秘密情報や個人情報が含まれていないことを確認しました。
+          required: true

@@ -1,0 +1,4 @@
+interface:
+  display_name: "画面案を比較"
+  short_description: "理由の異なる三つの画面案とモックを並べて判断を支援します"
+  default_prompt: "Use $compare-ui-directions to show three UI directions with reasons and mockups."

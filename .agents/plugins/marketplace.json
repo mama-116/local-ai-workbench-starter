@@ -1,0 +1,20 @@
+{
+  "name": "local-ai-starter",
+  "interface": {
+    "displayName": "Local AI Starter"
+  },
+  "plugins": [
+    {
+      "name": "local-ai-builder-kit",
+      "source": {
+        "source": "local",
+        "path": "./plugins/local-ai-builder-kit"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

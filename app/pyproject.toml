@@ -1,0 +1,47 @@
+[project]
+name = "local-llm-chat"
+version = "0.1.0"
+description = "Strictly local, no-charge desktop chat for Ollama"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "flet>=0.28,<1",
+  "httpx>=0.28,<1",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+]
+
+[tool.flet]
+product = "Local LLM Chat"
+description = "Strictly local, no-charge desktop chat for Ollama"
+build_number = 1
+
+[tool.flet.app]
+path = "src"
+module = "main.py"
+
+[tool.flet.windows]
+artifact = "LocalLLMChat"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/local_llm_chat", "tests"]
+warn_unreachable = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_llm_chat"]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "独立レビュー"
+  short_description: "設計や実装を第三者の視点で攻撃し優先度と判定を提示します"
+  default_prompt: "Use $high-level-review to review this artifact and identify blocking risks."

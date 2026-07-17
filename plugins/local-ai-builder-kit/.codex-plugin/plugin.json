@@ -1,0 +1,22 @@
+{
+  "name": "local-ai-builder-kit",
+  "version": "0.1.0",
+  "description": "初心者がCodexとの会話でLocalLLMアプリを安全に設計・実装するための補助輪Plugin",
+  "author": {
+    "name": "Munehiro Soma"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Local AI Builder Kit",
+    "shortDescription": "会話、設計比較、スレッド管理でLocal AI開発を案内します。",
+    "longDescription": "一般ユーザーが専門的なGitやIssue管理を意識せず、ヒアリング、設計比較、モック選択、実装、検証を順番に進められるCodex Pluginです。",
+    "developerName": "Munehiro Soma",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "作りたいものを相談し、次の一手を1つ決めてください。",
+      "画面案を理由とモック付きで3案比較してください。",
+      "この作業を新しいスレッドへ分けるべきか判断してください。"
+    ]
+  }
+}

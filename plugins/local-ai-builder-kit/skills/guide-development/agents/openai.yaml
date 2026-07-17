@@ -1,0 +1,4 @@
+interface:
+  display_name: "開発ガイド"
+  short_description: "初心者との会話から現在の開発段階と安全な次の一手を案内します"
+  default_prompt: "Use $guide-development to turn my idea into one safe next development step."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "設計を議論"
+  short_description: "発散と収束を分けて選択肢を吟味し決定ログへ着地させます"
+  default_prompt: "Use $discussion to challenge this idea and reach a decision with a review condition."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "仕様と設計を書く"
+  short_description: "ヒアリングから要件と設計を作り未決事項と成功条件を残します"
+  default_prompt: "Use $spec-authoring to interview me and turn this idea into a reviewable design."

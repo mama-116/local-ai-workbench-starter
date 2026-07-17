@@ -1,0 +1,3 @@
+# Safe default for a novice-operated local project.
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"

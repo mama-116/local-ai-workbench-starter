@@ -1,0 +1,1511 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TypeVar
+from uuid import uuid4
+
+from local_llm_chat.domain.errors import (
+    ConversationNotFound,
+    PersistenceError,
+    ValidationError,
+)
+from local_llm_chat.domain.models import (
+    BranchInfo,
+    CharacterVersion,
+    Conversation,
+    DocumentChunk,
+    DocumentRecord,
+    LatestTelemetry,
+    Message,
+    MessageCitation,
+    MessageRagUsage,
+    ModelProfile,
+    RunRecord,
+    RunSession,
+    RagCitation,
+    RagSearchResult,
+    TelemetryMetric,
+    Translation,
+    TranslationPreparation,
+)
+from local_llm_chat.domain.states import (
+    MessageRole,
+    MessageState,
+    RunState,
+    TranslationState,
+)
+
+T = TypeVar("T")
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "あなたは親切で正確なローカルAIアシスタントです。"
+    "質問には直接答え、依頼文の言い換えだけで終わらせないでください。"
+    "ユーザーが言語、形式、内容を明示した場合は、その指定を優先してください。"
+    "言語指定がない場合は、自然な日本語で簡潔に回答してください。"
+    "実在を確認できない固有名詞を作らず、確信がなければ一般的な種類を提案してください。"
+)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+class SQLiteAppRepository:
+    def __init__(self, database_path: Path) -> None:
+        self._database_path = database_path
+        self._write_lock = asyncio.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._database_path, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    async def _read(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        def execute() -> T:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                result = operation(connection)
+                connection.commit()
+                return result
+            except sqlite3.Error as error:
+                raise PersistenceError(str(error)) from error
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        return await asyncio.to_thread(execute)
+
+    async def _write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        async with self._write_lock:
+            return await self._read(operation)
+
+    async def initialize(self) -> None:
+        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        migration_paths = sorted(Path(__file__).with_name("migrations").glob("*.sql"))
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            applied = {
+                int(row["version"])
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+            for migration_path in migration_paths:
+                version = int(migration_path.stem.split("_", maxsplit=1)[0])
+                if version in applied:
+                    continue
+                connection.executescript(migration_path.read_text(encoding="utf-8"))
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    (version, _now()),
+                )
+
+        await self._write(operation)
+
+    async def recover_interrupted_runs(self) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            now = _now()
+            connection.execute(
+                """
+                UPDATE messages
+                SET state = 'failed', completed_at = ?
+                WHERE state IN ('pending', 'streaming')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = 'failed', completed_at = ?, error_code = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE message_translations
+                SET state = 'failed', completed_at = ?, error_code = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
+
+        await self._write(operation)
+
+    async def ensure_default_character(self) -> CharacterVersion:
+        def operation(connection: sqlite3.Connection) -> CharacterVersion:
+            row = connection.execute(
+                """
+                SELECT cv.*, c.display_name
+                FROM character_versions cv
+                JOIN characters c ON c.id = cv.character_id
+                WHERE c.archived_at IS NULL
+                ORDER BY c.created_at, cv.version DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is not None:
+                return self._character_from_row(row)
+            now = _now()
+            character_id = str(uuid4())
+            version_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO characters(id, display_name, created_at) VALUES(?, ?, ?)",
+                (character_id, "アシスタント", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO character_versions(id, character_id, version, system_prompt, created_at)
+                VALUES(?, ?, 1, ?, ?)
+                """,
+                (
+                    version_id,
+                    character_id,
+                    _DEFAULT_SYSTEM_PROMPT,
+                    now,
+                ),
+            )
+            return CharacterVersion(
+                id=version_id,
+                character_id=character_id,
+                display_name="アシスタント",
+                version=1,
+                system_prompt=_DEFAULT_SYSTEM_PROMPT,
+                created_at=datetime.fromisoformat(now),
+            )
+
+        return await self._write(operation)
+
+    async def list_character_versions(self) -> list[CharacterVersion]:
+        def operation(connection: sqlite3.Connection) -> list[CharacterVersion]:
+            rows = connection.execute(
+                """
+                SELECT cv.*, c.display_name
+                FROM character_versions cv
+                JOIN characters c ON c.id = cv.character_id
+                JOIN (
+                    SELECT character_id, MAX(version) AS max_version
+                    FROM character_versions GROUP BY character_id
+                ) latest ON latest.character_id = cv.character_id AND latest.max_version = cv.version
+                WHERE c.archived_at IS NULL
+                ORDER BY c.display_name
+                """
+            ).fetchall()
+            return [self._character_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def create_character_version(
+        self,
+        display_name: str,
+        system_prompt: str,
+        character_id: str | None = None,
+    ) -> CharacterVersion:
+        if not display_name.strip() or not system_prompt.strip():
+            raise ValidationError("キャラクター名と指示文は必須です。")
+
+        def operation(connection: sqlite3.Connection) -> CharacterVersion:
+            now = _now()
+            target_id = character_id or str(uuid4())
+            if character_id is None:
+                connection.execute(
+                    "INSERT INTO characters(id, display_name, created_at) VALUES(?, ?, ?)",
+                    (target_id, display_name.strip(), now),
+                )
+                version = 1
+            else:
+                found = connection.execute(
+                    "SELECT id FROM characters WHERE id = ? AND archived_at IS NULL",
+                    (target_id,),
+                ).fetchone()
+                if found is None:
+                    raise ValidationError("更新対象のキャラクターが見つかりません。")
+                connection.execute(
+                    "UPDATE characters SET display_name = ? WHERE id = ?",
+                    (display_name.strip(), target_id),
+                )
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM character_versions WHERE character_id = ?",
+                    (target_id,),
+                ).fetchone()
+                version = int(row["version"])
+            version_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO character_versions(id, character_id, version, system_prompt, created_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (version_id, target_id, version, system_prompt.strip(), now),
+            )
+            return CharacterVersion(
+                id=version_id,
+                character_id=target_id,
+                display_name=display_name.strip(),
+                version=version,
+                system_prompt=system_prompt.strip(),
+                created_at=datetime.fromisoformat(now),
+            )
+
+        return await self._write(operation)
+
+    async def get_character_version(self, version_id: str) -> CharacterVersion:
+        def operation(connection: sqlite3.Connection) -> CharacterVersion:
+            row = connection.execute(
+                """
+                SELECT cv.*, c.display_name
+                FROM character_versions cv JOIN characters c ON c.id = cv.character_id
+                WHERE cv.id = ?
+                """,
+                (version_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("キャラクター設定が見つかりません。")
+            return self._character_from_row(row)
+
+        return await self._read(operation)
+
+    async def ensure_model_profile(
+        self,
+        provider: str,
+        model_name: str,
+        parameters: dict[str, Any],
+    ) -> ModelProfile:
+        def operation(connection: sqlite3.Connection) -> ModelProfile:
+            now = _now()
+            parameters_json = json.dumps(parameters, ensure_ascii=False, sort_keys=True)
+            row = connection.execute(
+                "SELECT * FROM model_profiles WHERE provider = ? AND model_name = ?",
+                (provider, model_name),
+            ).fetchone()
+            if row is None:
+                profile_id = str(uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO model_profiles(
+                        id, provider, model_name, parameters_json, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (profile_id, provider, model_name, parameters_json, now, now),
+                )
+            else:
+                profile_id = str(row["id"])
+                connection.execute(
+                    "UPDATE model_profiles SET parameters_json = ?, updated_at = ? WHERE id = ?",
+                    (parameters_json, now, profile_id),
+                )
+            return ModelProfile(profile_id, provider, model_name, dict(parameters))
+
+        return await self._write(operation)
+
+    async def get_model_profile(self, profile_id: str) -> ModelProfile:
+        def operation(connection: sqlite3.Connection) -> ModelProfile:
+            row = connection.execute(
+                "SELECT * FROM model_profiles WHERE id = ?", (profile_id,)
+            ).fetchone()
+            if row is None:
+                raise ValidationError("モデル設定が見つかりません。")
+            return self._profile_from_row(row)
+
+        return await self._read(operation)
+
+    async def create_conversation(
+        self,
+        title: str,
+        character_version_id: str,
+        model_profile_id: str,
+    ) -> Conversation:
+        def operation(connection: sqlite3.Connection) -> Conversation:
+            now = _now()
+            conversation_id = str(uuid4())
+            branch_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO conversations(
+                    id, title, character_version_id, model_profile_id, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    title.strip() or "新しい会話",
+                    character_version_id,
+                    model_profile_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO branches(id, conversation_id, created_at) VALUES(?, ?, ?)",
+                (branch_id, conversation_id, now),
+            )
+            connection.execute(
+                "UPDATE conversations SET active_branch_id = ? WHERE id = ?",
+                (branch_id, conversation_id),
+            )
+            return Conversation(
+                id=conversation_id,
+                title=title.strip() or "新しい会話",
+                active_branch_id=branch_id,
+                character_version_id=character_version_id,
+                model_profile_id=model_profile_id,
+                created_at=datetime.fromisoformat(now),
+                updated_at=datetime.fromisoformat(now),
+            )
+
+        return await self._write(operation)
+
+    async def list_conversations(self) -> list[Conversation]:
+        def operation(connection: sqlite3.Connection) -> list[Conversation]:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversations
+                WHERE archived_at IS NULL
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [self._conversation_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def list_archived_conversations(self) -> list[Conversation]:
+        def operation(connection: sqlite3.Connection) -> list[Conversation]:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversations
+                WHERE archived_at IS NOT NULL
+                ORDER BY archived_at DESC
+                """
+            ).fetchall()
+            return [self._conversation_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def get_conversation(self, conversation_id: str) -> Conversation:
+        def operation(connection: sqlite3.Connection) -> Conversation:
+            return self._require_conversation(connection, conversation_id)
+
+        return await self._read(operation)
+
+    async def update_conversation_selection(
+        self,
+        conversation_id: str,
+        character_version_id: str,
+        model_profile_id: str,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                """
+                UPDATE conversations
+                SET character_version_id = ?, model_profile_id = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                """,
+                (character_version_id, model_profile_id, _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationNotFound("会話が見つかりません。")
+
+        await self._write(operation)
+
+    async def archive_conversation(self, conversation_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                "UPDATE conversations SET archived_at = ?, updated_at = ? WHERE id = ?",
+                (_now(), _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationNotFound("会話が見つかりません。")
+
+        await self._write(operation)
+
+    async def restore_conversation(self, conversation_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                """
+                UPDATE conversations
+                SET archived_at = NULL, updated_at = ?
+                WHERE id = ? AND archived_at IS NOT NULL
+                """,
+                (_now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationNotFound("保管済みの会話が見つかりません。")
+
+        await self._write(operation)
+
+    async def list_active_messages(self, conversation_id: str) -> list[Message]:
+        def operation(connection: sqlite3.Connection) -> list[Message]:
+            conversation = self._require_conversation(connection, conversation_id)
+            return self._message_path(connection, conversation.active_branch_id)
+
+        return await self._read(operation)
+
+    async def get_message(self, message_id: str) -> Message:
+        return await self._read(
+            lambda connection: self._require_message(connection, message_id)
+        )
+
+    async def get_response_model(self, message_id: str) -> tuple[str, str]:
+        def operation(connection: sqlite3.Connection) -> tuple[str, str]:
+            row = connection.execute(
+                "SELECT provider, model FROM runs WHERE response_message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("この発言の生成モデルが見つかりません。")
+            return str(row["provider"]), str(row["model"])
+
+        return await self._read(operation)
+
+    async def prepare_translation(
+        self,
+        message_id: str,
+        target_language: str,
+        provider: str,
+        model: str,
+        force: bool,
+    ) -> TranslationPreparation:
+        def operation(connection: sqlite3.Connection) -> TranslationPreparation:
+            message = self._require_message(connection, message_id)
+            if (
+                message.role is not MessageRole.ASSISTANT
+                or message.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError("完了したAI回答だけを翻訳できます。")
+            source_hash = hashlib.sha256(message.content.encode("utf-8")).hexdigest()
+            if not force:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM message_translations
+                    WHERE message_id = ? AND source_hash = ? AND target_language = ?
+                      AND provider = ? AND model = ?
+                    ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (message_id, source_hash, target_language, provider, model),
+                ).fetchone()
+                if existing is not None:
+                    return TranslationPreparation(
+                        self._translation_from_row(existing), False
+                    )
+
+                cached = connection.execute(
+                    """
+                    SELECT * FROM message_translations
+                    WHERE source_hash = ? AND target_language = ?
+                      AND provider = ? AND model = ? AND state = 'completed'
+                    ORDER BY completed_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (source_hash, target_language, provider, model),
+                ).fetchone()
+                if cached is not None:
+                    translation_id = str(uuid4())
+                    now = _now()
+                    connection.execute(
+                        """
+                        INSERT INTO message_translations(
+                            id, message_id, source_hash, target_language, provider,
+                            model, content, state, reused_from_id, created_at, completed_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)
+                        """,
+                        (
+                            translation_id,
+                            message_id,
+                            source_hash,
+                            target_language,
+                            provider,
+                            model,
+                            str(cached["content"]),
+                            str(cached["id"]),
+                            now,
+                            now,
+                        ),
+                    )
+                    return TranslationPreparation(
+                        self._require_translation(connection, translation_id), False
+                    )
+
+            translation_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO message_translations(
+                    id, message_id, source_hash, target_language, provider,
+                    model, content, state, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, '', 'pending', ?)
+                """,
+                (
+                    translation_id,
+                    message_id,
+                    source_hash,
+                    target_language,
+                    provider,
+                    model,
+                    _now(),
+                ),
+            )
+            return TranslationPreparation(
+                self._require_translation(connection, translation_id), True
+            )
+
+        return await self._write(operation)
+
+    async def get_translation(self, translation_id: str) -> Translation:
+        return await self._read(
+            lambda connection: self._require_translation(connection, translation_id)
+        )
+
+    async def get_current_translation(self, message_id: str) -> Translation | None:
+        def operation(connection: sqlite3.Connection) -> Translation | None:
+            row = connection.execute(
+                """
+                SELECT * FROM message_translations
+                WHERE message_id = ? ORDER BY rowid DESC LIMIT 1
+                """,
+                (message_id,),
+            ).fetchone()
+            return self._translation_from_row(row) if row is not None else None
+
+        return await self._read(operation)
+
+    async def list_current_translations(
+        self, message_ids: list[str]
+    ) -> dict[str, Translation]:
+        if not message_ids:
+            return {}
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Translation]:
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = connection.execute(
+                f"""
+                SELECT current.*
+                FROM message_translations current
+                JOIN (
+                    SELECT message_id, MAX(rowid) AS latest_rowid
+                    FROM message_translations
+                    WHERE message_id IN ({placeholders})
+                    GROUP BY message_id
+                ) latest ON latest.latest_rowid = current.rowid
+                """,
+                tuple(message_ids),
+            ).fetchall()
+            return {
+                str(row["message_id"]): self._translation_from_row(row)
+                for row in rows
+            }
+
+        return await self._read(operation)
+
+    async def mark_translation_running(self, translation_id: str) -> Translation:
+        def operation(connection: sqlite3.Connection) -> Translation:
+            cursor = connection.execute(
+                """
+                UPDATE message_translations SET state = 'running'
+                WHERE id = ? AND state = 'pending'
+                """,
+                (translation_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("翻訳処理を開始できません。")
+            return self._require_translation(connection, translation_id)
+
+        return await self._write(operation)
+
+    async def finish_translation(
+        self,
+        translation_id: str,
+        content: str,
+        state: TranslationState,
+        error_code: str | None = None,
+    ) -> Translation:
+        if state not in (TranslationState.COMPLETED, TranslationState.FAILED):
+            raise ValidationError("翻訳の終了状態が不正です。")
+
+        def operation(connection: sqlite3.Connection) -> Translation:
+            cursor = connection.execute(
+                """
+                UPDATE message_translations
+                SET content = ?, state = ?, error_code = ?, completed_at = ?
+                WHERE id = ? AND state IN ('pending', 'running')
+                """,
+                (content, state.value, error_code, _now(), translation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("翻訳結果を保存できません。")
+            return self._require_translation(connection, translation_id)
+
+        return await self._write(operation)
+
+    async def list_branches(self, conversation_id: str) -> list[BranchInfo]:
+        def operation(connection: sqlite3.Connection) -> list[BranchInfo]:
+            rows = connection.execute(
+                "SELECT * FROM branches WHERE conversation_id = ? ORDER BY created_at",
+                (conversation_id,),
+            ).fetchall()
+            return [self._branch_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def activate_branch(self, conversation_id: str, branch_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            branch = connection.execute(
+                "SELECT id FROM branches WHERE id = ? AND conversation_id = ?",
+                (branch_id, conversation_id),
+            ).fetchone()
+            if branch is None:
+                raise ValidationError("会話の続きが見つかりません。")
+            connection.execute(
+                "UPDATE conversations SET active_branch_id = ?, updated_at = ? WHERE id = ?",
+                (branch_id, _now(), conversation_id),
+            )
+
+        await self._write(operation)
+
+    async def start_send(self, conversation_id: str, content: str) -> RunSession:
+        if not content.strip():
+            raise ValidationError("メッセージを入力してください。")
+
+        def operation(connection: sqlite3.Connection) -> RunSession:
+            conversation = self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, conversation.active_branch_id)
+            return self._insert_run_session(
+                connection=connection,
+                conversation=conversation,
+                branch_id=branch.id,
+                parent_message_id=branch.head_message_id,
+                user_content=content.strip(),
+                source_message_id=None,
+            )
+
+        return await self._write(operation)
+
+    async def start_rewrite(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        content: str,
+    ) -> RunSession:
+        if not content.strip():
+            raise ValidationError("書き直したメッセージを入力してください。")
+
+        def operation(connection: sqlite3.Connection) -> RunSession:
+            conversation = self._require_conversation(connection, conversation_id)
+            source = self._require_message(connection, source_message_id)
+            if source.conversation_id != conversation_id or source.role is not MessageRole.USER:
+                raise ValidationError("利用者の発言だけを書き直せます。")
+            branch_id = str(uuid4())
+            now = _now()
+            connection.execute(
+                """
+                INSERT INTO branches(
+                    id, conversation_id, parent_branch_id, forked_from_message_id, created_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    branch_id,
+                    conversation_id,
+                    conversation.active_branch_id,
+                    source_message_id,
+                    now,
+                ),
+            )
+            session = self._insert_run_session(
+                connection=connection,
+                conversation=conversation,
+                branch_id=branch_id,
+                parent_message_id=source.parent_message_id,
+                user_content=content.strip(),
+                source_message_id=source_message_id,
+            )
+            connection.execute(
+                "UPDATE conversations SET active_branch_id = ?, updated_at = ? WHERE id = ?",
+                (branch_id, now, conversation_id),
+            )
+            return session
+
+        return await self._write(operation)
+
+    async def start_regenerate(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+    ) -> RunSession:
+        def operation(connection: sqlite3.Connection) -> RunSession:
+            conversation = self._require_conversation(connection, conversation_id)
+            source = self._require_message(connection, source_message_id)
+            if source.conversation_id != conversation_id or source.role is not MessageRole.ASSISTANT:
+                raise ValidationError("AIの発言だけを再生成できます。")
+            if source.parent_message_id is None:
+                raise ValidationError("再生成元の利用者発言がありません。")
+            user_message = self._require_message(connection, source.parent_message_id)
+            branch_id = str(uuid4())
+            now = _now()
+            connection.execute(
+                """
+                INSERT INTO branches(
+                    id, conversation_id, parent_branch_id, forked_from_message_id, created_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    branch_id,
+                    conversation_id,
+                    conversation.active_branch_id,
+                    source_message_id,
+                    now,
+                ),
+            )
+            session = self._insert_run_session(
+                connection=connection,
+                conversation=conversation,
+                branch_id=branch_id,
+                parent_message_id=user_message.id,
+                user_content=None,
+                source_message_id=source_message_id,
+                existing_user=user_message,
+            )
+            connection.execute(
+                "UPDATE conversations SET active_branch_id = ?, updated_at = ? WHERE id = ?",
+                (branch_id, now, conversation_id),
+            )
+            return session
+
+        return await self._write(operation)
+
+    async def context_to_message(self, message_id: str) -> list[Message]:
+        def operation(connection: sqlite3.Connection) -> list[Message]:
+            rows = connection.execute(
+                """
+                WITH RECURSIVE path AS (
+                    SELECT *, 0 AS depth FROM messages WHERE id = ?
+                    UNION ALL
+                    SELECT parent.*, path.depth + 1
+                    FROM messages parent JOIN path ON path.parent_message_id = parent.id
+                )
+                SELECT * FROM path ORDER BY depth DESC
+                """,
+                (message_id,),
+            ).fetchall()
+            return [self._message_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def checkpoint_response(self, message_id: str, content: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            cursor = connection.execute(
+                """
+                UPDATE messages SET content = ?, state = 'streaming'
+                WHERE id = ? AND state IN ('pending', 'streaming')
+                """,
+                (content, message_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("生成中ではない発言を更新しようとしました。")
+            connection.execute(
+                "UPDATE runs SET state = 'running', started_at = COALESCE(started_at, ?) WHERE response_message_id = ?",
+                (_now(), message_id),
+            )
+
+        await self._write(operation)
+
+    async def finish_response(
+        self,
+        session: RunSession,
+        content: str,
+        state: MessageState,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_duration_ns: int | None = None,
+        generation_duration_ns: int | None = None,
+        response_duration_ms: int | None = None,
+        error_code: str | None = None,
+    ) -> Message:
+        terminal_states = {
+            MessageState.COMPLETED: RunState.COMPLETED,
+            MessageState.CANCELLED: RunState.CANCELLED,
+            MessageState.FAILED: RunState.FAILED,
+        }
+        if state not in terminal_states:
+            raise ValidationError("応答を終端状態にできません。")
+
+        def operation(connection: sqlite3.Connection) -> Message:
+            now = _now()
+            cursor = connection.execute(
+                """
+                UPDATE messages SET content = ?, state = ?, completed_at = ?
+                WHERE id = ? AND state IN ('pending', 'streaming')
+                """,
+                (content, state.value, now, session.assistant_message.id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("応答は既に終了しています。")
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, started_at = COALESCE(started_at, ?), completed_at = ?,
+                    prompt_tokens = ?, output_tokens = ?, total_duration_ns = ?,
+                    generation_duration_ns = ?, response_duration_ms = ?, error_code = ?
+                WHERE id = ?
+                """,
+                (
+                    terminal_states[state].value,
+                    now,
+                    now,
+                    prompt_tokens,
+                    output_tokens,
+                    total_duration_ns,
+                    generation_duration_ns,
+                    response_duration_ms,
+                    error_code,
+                    session.run.id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM messages WHERE id = ?", (session.assistant_message.id,)
+            ).fetchone()
+            assert row is not None
+            return self._message_from_row(row)
+
+        return await self._write(operation)
+
+    async def save_telemetry_metrics(
+        self, run_id: str, metrics: tuple[TelemetryMetric, ...]
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            captured_at = _now()
+            for metric in metrics:
+                connection.execute(
+                    """
+                    INSERT INTO telemetry_samples(
+                        id, run_id, metric_name, value, unit, source,
+                        unavailable_reason, captured_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        run_id,
+                        metric.name,
+                        metric.value,
+                        metric.unit,
+                        metric.source,
+                        metric.unavailable_reason,
+                        captured_at,
+                    ),
+                )
+
+        await self._write(operation)
+
+    async def save_document(
+        self, document: DocumentRecord, chunks: tuple[DocumentChunk, ...]
+    ) -> DocumentRecord:
+        def operation(connection: sqlite3.Connection) -> DocumentRecord:
+            existing = connection.execute(
+                "SELECT * FROM documents WHERE content_hash = ?",
+                (document.content_hash,),
+            ).fetchone()
+            if existing is not None:
+                return self._document_from_row(existing)
+            connection.execute(
+                """
+                INSERT INTO documents(
+                    id, title, media_type, content_text, content_hash, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document.id,
+                    document.title,
+                    document.media_type,
+                    document.content,
+                    document.content_hash,
+                    document.created_at.isoformat(),
+                ),
+            )
+            for chunk in chunks:
+                connection.execute(
+                    """
+                    INSERT INTO chunks(
+                        id, document_id, ordinal, content_text,
+                        start_offset, end_offset
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk.id,
+                        chunk.document_id,
+                        chunk.ordinal,
+                        chunk.content,
+                        chunk.start_offset,
+                        chunk.end_offset,
+                    ),
+                )
+            return document
+
+        return await self._write(operation)
+
+    async def search_chunks(
+        self,
+        query: str,
+        top_k: int,
+        document_ids: tuple[str, ...] | None = None,
+    ) -> list[RagSearchResult]:
+        def operation(connection: sqlite3.Connection) -> list[RagSearchResult]:
+            rows = connection.execute(
+                """
+                SELECT chunks.*, documents.title AS document_title
+                FROM chunks JOIN documents ON documents.id = chunks.document_id
+                ORDER BY documents.created_at, chunks.ordinal
+                """
+            ).fetchall()
+            normalized = query.casefold()
+            terms = list(dict.fromkeys([normalized, *normalized.split()]))
+            scored: list[RagSearchResult] = []
+            allowed_ids = set(document_ids) if document_ids is not None else None
+            for row in rows:
+                if allowed_ids is not None and str(row["document_id"]) not in allowed_ids:
+                    continue
+                content = str(row["content_text"])
+                folded = content.casefold()
+                score = float(sum(folded.count(term) for term in terms if term))
+                if score <= 0:
+                    continue
+                scored.append(
+                    RagSearchResult(
+                        content=content,
+                        citation=RagCitation(
+                            document_id=str(row["document_id"]),
+                            document_title=str(row["document_title"]),
+                            chunk_id=str(row["id"]),
+                            start_offset=int(row["start_offset"]),
+                            end_offset=int(row["end_offset"]),
+                        ),
+                        score=score,
+                    )
+                )
+            scored.sort(
+                key=lambda result: (
+                    -result.score,
+                    result.citation.document_title,
+                    result.citation.start_offset,
+                )
+            )
+            return scored[:top_k]
+
+        return await self._read(operation)
+
+    async def list_documents(self) -> list[DocumentRecord]:
+        def operation(connection: sqlite3.Connection) -> list[DocumentRecord]:
+            rows = connection.execute(
+                "SELECT * FROM documents ORDER BY title COLLATE NOCASE, created_at"
+            ).fetchall()
+            return [self._document_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def set_conversation_documents(
+        self, conversation_id: str, document_ids: tuple[str, ...]
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            self._require_conversation(connection, conversation_id)
+            for document_id in document_ids:
+                found = connection.execute(
+                    "SELECT id FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+                if found is None:
+                    raise ValidationError("選択した参照資料が見つかりません。")
+            connection.execute(
+                "DELETE FROM conversation_documents WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            selected_at = _now()
+            for document_id in document_ids:
+                connection.execute(
+                    """
+                    INSERT INTO conversation_documents(
+                        conversation_id, document_id, selected_at
+                    ) VALUES(?, ?, ?)
+                    """,
+                    (conversation_id, document_id, selected_at),
+                )
+
+        await self._write(operation)
+
+    async def list_conversation_documents(
+        self, conversation_id: str
+    ) -> list[DocumentRecord]:
+        def operation(connection: sqlite3.Connection) -> list[DocumentRecord]:
+            self._require_conversation(connection, conversation_id)
+            rows = connection.execute(
+                """
+                SELECT documents.* FROM documents
+                JOIN conversation_documents
+                  ON conversation_documents.document_id = documents.id
+                WHERE conversation_documents.conversation_id = ?
+                ORDER BY conversation_documents.selected_at, documents.title COLLATE NOCASE
+                """,
+                (conversation_id,),
+            ).fetchall()
+            return [self._document_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def save_run_rag_usage(
+        self,
+        run_id: str,
+        selected_document_count: int,
+        results: tuple[RagSearchResult, ...],
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            run = connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise ValidationError("参照元を関連付ける実行記録が見つかりません。")
+            connection.execute(
+                """
+                INSERT INTO run_rag_usage(run_id, selected_document_count)
+                VALUES(?, ?)
+                """,
+                (run_id, selected_document_count),
+            )
+            for rank, result in enumerate(results):
+                connection.execute(
+                    """
+                    INSERT INTO run_citations(run_id, chunk_id, rank, score)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (run_id, result.citation.chunk_id, rank, result.score),
+                )
+
+        await self._write(operation)
+
+    async def list_message_rag_usage(
+        self, message_ids: list[str]
+    ) -> dict[str, MessageRagUsage]:
+        if not message_ids:
+            return {}
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, MessageRagUsage]:
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = connection.execute(
+                f"""
+                SELECT runs.response_message_id,
+                       run_rag_usage.selected_document_count,
+                       documents.id AS document_id,
+                       documents.title AS document_title, chunks.id AS chunk_id,
+                       chunks.start_offset, chunks.end_offset, chunks.content_text
+                FROM runs
+                JOIN run_rag_usage ON run_rag_usage.run_id = runs.id
+                LEFT JOIN run_citations ON run_citations.run_id = runs.id
+                LEFT JOIN chunks ON chunks.id = run_citations.chunk_id
+                LEFT JOIN documents ON documents.id = chunks.document_id
+                WHERE runs.response_message_id IN ({placeholders})
+                ORDER BY runs.response_message_id, run_citations.rank
+                """,
+                tuple(message_ids),
+            ).fetchall()
+            grouped: dict[str, list[MessageCitation]] = {}
+            selected_counts: dict[str, int] = {}
+            for row in rows:
+                message_id = str(row["response_message_id"])
+                selected_counts[message_id] = int(row["selected_document_count"])
+                if row["chunk_id"] is None:
+                    continue
+                grouped.setdefault(message_id, []).append(
+                    MessageCitation(
+                        message_id=message_id,
+                        document_id=str(row["document_id"]),
+                        document_title=str(row["document_title"]),
+                        chunk_id=str(row["chunk_id"]),
+                        start_offset=int(row["start_offset"]),
+                        end_offset=int(row["end_offset"]),
+                        content=str(row["content_text"]),
+                    )
+                )
+            return {
+                message_id: MessageRagUsage(
+                    message_id=message_id,
+                    selected_document_count=selected_count,
+                    citations=tuple(grouped.get(message_id, [])),
+                )
+                for message_id, selected_count in selected_counts.items()
+            }
+
+        return await self._read(operation)
+
+    async def get_latest_telemetry(
+        self, conversation_id: str | None = None
+    ) -> LatestTelemetry | None:
+        def operation(connection: sqlite3.Connection) -> LatestTelemetry | None:
+            parameters: tuple[object, ...] = ()
+            where = "WHERE state = 'completed'"
+            if conversation_id is not None:
+                where += " AND conversation_id = ?"
+                parameters = (conversation_id,)
+            row = connection.execute(
+                f"SELECT * FROM runs {where} ORDER BY completed_at DESC LIMIT 1",
+                parameters,
+            ).fetchone()
+            if row is None:
+                return None
+            metric_rows = connection.execute(
+                """
+                SELECT metric_name, value, unit, source, unavailable_reason
+                FROM telemetry_samples WHERE run_id = ? ORDER BY captured_at, rowid
+                """,
+                (row["id"],),
+            ).fetchall()
+            metrics = tuple(
+                TelemetryMetric(
+                    name=str(metric["metric_name"]),
+                    value=(float(metric["value"]) if metric["value"] is not None else None),
+                    unit=str(metric["unit"]),
+                    source=str(metric["source"]),
+                    unavailable_reason=(
+                        str(metric["unavailable_reason"])
+                        if metric["unavailable_reason"] is not None
+                        else None
+                    ),
+                )
+                for metric in metric_rows
+            )
+            return LatestTelemetry(self._run_from_row(row), metrics)
+
+        return await self._read(operation)
+
+    async def log_event(
+        self,
+        level: str,
+        event_type: str,
+        details: dict[str, Any],
+        run_id: str | None = None,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO app_events(id, level, event_type, run_id, details_json, created_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    level,
+                    event_type,
+                    run_id,
+                    json.dumps(details, ensure_ascii=False, sort_keys=True),
+                    _now(),
+                ),
+            )
+
+        await self._write(operation)
+
+    def _insert_run_session(
+        self,
+        connection: sqlite3.Connection,
+        conversation: Conversation,
+        branch_id: str,
+        parent_message_id: str | None,
+        user_content: str | None,
+        source_message_id: str | None,
+        existing_user: Message | None = None,
+    ) -> RunSession:
+        now = _now()
+        if existing_user is None:
+            user = Message(
+                id=str(uuid4()),
+                conversation_id=conversation.id,
+                parent_message_id=parent_message_id,
+                source_message_id=source_message_id,
+                role=MessageRole.USER,
+                content=user_content or "",
+                state=MessageState.COMPLETED,
+                created_at=datetime.fromisoformat(now),
+                completed_at=datetime.fromisoformat(now),
+            )
+            connection.execute(
+                """
+                INSERT INTO messages(
+                    id, conversation_id, parent_message_id, source_message_id,
+                    role, content, state, created_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user.id,
+                    user.conversation_id,
+                    user.parent_message_id,
+                    user.source_message_id,
+                    user.role.value,
+                    user.content,
+                    user.state.value,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            user = existing_user
+        assistant = Message(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            parent_message_id=user.id,
+            source_message_id=source_message_id if existing_user is not None else None,
+            role=MessageRole.ASSISTANT,
+            content="",
+            state=MessageState.PENDING,
+            created_at=datetime.fromisoformat(now),
+        )
+        connection.execute(
+            """
+            INSERT INTO messages(
+                id, conversation_id, parent_message_id, source_message_id,
+                role, content, state, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                assistant.id,
+                assistant.conversation_id,
+                assistant.parent_message_id,
+                assistant.source_message_id,
+                assistant.role.value,
+                assistant.content,
+                assistant.state.value,
+                now,
+            ),
+        )
+        profile = self._profile_from_row(
+            connection.execute(
+                "SELECT * FROM model_profiles WHERE id = ?",
+                (conversation.model_profile_id,),
+            ).fetchone()
+        )
+        run = RunRecord(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            request_message_id=user.id,
+            response_message_id=assistant.id,
+            character_version_id=conversation.character_version_id,
+            provider=profile.provider,
+            model=profile.model_name,
+            parameters=profile.parameters,
+            state=RunState.PENDING,
+        )
+        connection.execute(
+            """
+            INSERT INTO runs(
+                id, conversation_id, request_message_id, response_message_id,
+                character_version_id, provider, model, parameters_json, state
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.id,
+                run.conversation_id,
+                run.request_message_id,
+                run.response_message_id,
+                run.character_version_id,
+                run.provider,
+                run.model,
+                json.dumps(run.parameters, ensure_ascii=False, sort_keys=True),
+                run.state.value,
+            ),
+        )
+        connection.execute(
+            "UPDATE branches SET head_message_id = ? WHERE id = ?",
+            (assistant.id, branch_id),
+        )
+        connection.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, conversation.id),
+        )
+        return RunSession(user, assistant, run, branch_id)
+
+    def _message_path(self, connection: sqlite3.Connection, branch_id: str) -> list[Message]:
+        rows = connection.execute(
+            """
+            WITH RECURSIVE path AS (
+                SELECT messages.*, 0 AS depth
+                FROM messages JOIN branches ON branches.head_message_id = messages.id
+                WHERE branches.id = ?
+                UNION ALL
+                SELECT parent.*, path.depth + 1
+                FROM messages parent JOIN path ON path.parent_message_id = parent.id
+            )
+            SELECT * FROM path ORDER BY depth DESC
+            """,
+            (branch_id,),
+        ).fetchall()
+        return [self._message_from_row(row) for row in rows]
+
+    def _require_conversation(
+        self, connection: sqlite3.Connection, conversation_id: str
+    ) -> Conversation:
+        row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ? AND archived_at IS NULL",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise ConversationNotFound("会話が見つかりません。")
+        return self._conversation_from_row(row)
+
+    def _require_branch(self, connection: sqlite3.Connection, branch_id: str) -> BranchInfo:
+        row = connection.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+        if row is None:
+            raise PersistenceError("会話の続きが見つかりません。")
+        return self._branch_from_row(row)
+
+    def _require_message(self, connection: sqlite3.Connection, message_id: str) -> Message:
+        row = connection.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row is None:
+            raise ValidationError("発言が見つかりません。")
+        return self._message_from_row(row)
+
+    def _require_translation(
+        self, connection: sqlite3.Connection, translation_id: str
+    ) -> Translation:
+        row = connection.execute(
+            "SELECT * FROM message_translations WHERE id = ?", (translation_id,)
+        ).fetchone()
+        if row is None:
+            raise ValidationError("翻訳結果が見つかりません。")
+        return self._translation_from_row(row)
+
+    @staticmethod
+    def _character_from_row(row: sqlite3.Row) -> CharacterVersion:
+        return CharacterVersion(
+            id=str(row["id"]),
+            character_id=str(row["character_id"]),
+            display_name=str(row["display_name"]),
+            version=int(row["version"]),
+            system_prompt=str(row["system_prompt"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _profile_from_row(row: sqlite3.Row | None) -> ModelProfile:
+        if row is None:
+            raise PersistenceError("モデル設定が見つかりません。")
+        parameters = json.loads(str(row["parameters_json"]))
+        if not isinstance(parameters, dict):
+            raise PersistenceError("モデル設定が壊れています。")
+        return ModelProfile(
+            id=str(row["id"]),
+            provider=str(row["provider"]),
+            model_name=str(row["model_name"]),
+            parameters=parameters,
+        )
+
+    @staticmethod
+    def _conversation_from_row(row: sqlite3.Row) -> Conversation:
+        active_branch_id = row["active_branch_id"]
+        if active_branch_id is None:
+            raise PersistenceError("会話の続きが設定されていません。")
+        return Conversation(
+            id=str(row["id"]),
+            title=str(row["title"]),
+            active_branch_id=str(active_branch_id),
+            character_version_id=str(row["character_version_id"]),
+            model_profile_id=str(row["model_profile_id"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            archived_at=_parse_time(row["archived_at"]),
+        )
+
+    @staticmethod
+    def _message_from_row(row: sqlite3.Row) -> Message:
+        return Message(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            parent_message_id=str(row["parent_message_id"]) if row["parent_message_id"] else None,
+            source_message_id=str(row["source_message_id"]) if row["source_message_id"] else None,
+            role=MessageRole(str(row["role"])),
+            content=str(row["content"]),
+            state=MessageState(str(row["state"])),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            completed_at=_parse_time(row["completed_at"]),
+        )
+
+    @staticmethod
+    def _translation_from_row(row: sqlite3.Row) -> Translation:
+        return Translation(
+            id=str(row["id"]),
+            message_id=str(row["message_id"]),
+            source_hash=str(row["source_hash"]),
+            target_language=str(row["target_language"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]),
+            content=str(row["content"]),
+            state=TranslationState(str(row["state"])),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            completed_at=_parse_time(row["completed_at"]),
+            error_code=str(row["error_code"]) if row["error_code"] else None,
+            reused_from_id=(
+                str(row["reused_from_id"]) if row["reused_from_id"] else None
+            ),
+        )
+
+    @staticmethod
+    def _run_from_row(row: sqlite3.Row) -> RunRecord:
+        parameters = json.loads(str(row["parameters_json"]))
+        if not isinstance(parameters, dict):
+            raise PersistenceError("実行記録が壊れています。")
+        return RunRecord(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            request_message_id=str(row["request_message_id"]),
+            response_message_id=str(row["response_message_id"]),
+            character_version_id=str(row["character_version_id"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]),
+            parameters=parameters,
+            state=RunState(str(row["state"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
+            prompt_tokens=(int(row["prompt_tokens"]) if row["prompt_tokens"] is not None else None),
+            output_tokens=(int(row["output_tokens"]) if row["output_tokens"] is not None else None),
+            total_duration_ns=(
+                int(row["total_duration_ns"]) if row["total_duration_ns"] is not None else None
+            ),
+            generation_duration_ns=(
+                int(row["generation_duration_ns"])
+                if row["generation_duration_ns"] is not None
+                else None
+            ),
+            response_duration_ms=(
+                int(row["response_duration_ms"])
+                if row["response_duration_ms"] is not None
+                else None
+            ),
+            error_code=str(row["error_code"]) if row["error_code"] else None,
+        )
+
+    @staticmethod
+    def _document_from_row(row: sqlite3.Row) -> DocumentRecord:
+        return DocumentRecord(
+            id=str(row["id"]),
+            title=str(row["title"]),
+            media_type=str(row["media_type"]),
+            content=str(row["content_text"]),
+            content_hash=str(row["content_hash"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _branch_from_row(row: sqlite3.Row) -> BranchInfo:
+        return BranchInfo(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            parent_branch_id=str(row["parent_branch_id"]) if row["parent_branch_id"] else None,
+            forked_from_message_id=(
+                str(row["forked_from_message_id"]) if row["forked_from_message_id"] else None
+            ),
+            head_message_id=str(row["head_message_id"]) if row["head_message_id"] else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
