@@ -33,6 +33,8 @@ flowchart LR
     CU --> OBS[画面 + UI Automation観測]
     CU --> CAP{操作Policy + 計画承認}
     CAP --> ACT[固定許可されたローカルUI操作]
+    CAP -. Phase 7B .-> FOP[許可フォルダーの可逆ファイル操作]
+    CAP -. Phase 7B .-> PSP[登録済みPowerShellレシピ]
     OBS --> DB
     ACT --> DB
     F -. 拒否 .-> CLD[Cloudモデル・有料API]
@@ -64,9 +66,9 @@ Ollamaは端末内・LAN内経由でもクラウドモデルを実行できる�
 | 区分 | 動作 | 初期値 |
 |---|---|---|
 | AUTO_READ | ローカル読取、Web検索、状態取得 | 自動 |
-| AUTO_WRITE | 許可ワークスペース内の作成・更新 | 自動、全件ログ |
+| AUTO_WRITE | アプリ内部の許可ワークスペース内の作成・更新 | 自動、全件ログ。Agentによるファイル整理には適用しない |
 | AUTO_LOCAL_UI | 利用者が登録した固定アプリ・固定操作・固定上限内のローカルUI操作 | 既定無効、10回連続成功後も利用者が明示有効化 |
-| PLAN_APPROVAL_REQUIRED | 起動、クリック、文字入力等の可逆なローカルUI操作 | 操作列、対象、入力全文、予算を一括承認。計画変更で失効 |
+| PLAN_APPROVAL_REQUIRED | 起動、クリック、文字入力、Phase 7Bのファイル整理、登録済みPowerShellレシピ | 操作列、対象、入力または展開済みコマンド、予算を一括承認。計画変更で失効 |
 | REVERSIBLE_DELETE | ローカルの退避・ゴミ箱移動 | 自動、Undo必須 |
 | APPROVAL_REQUIRED | 外部投稿、外部削除、課金、恒久削除 | 毎回承認 |
 | DENY | PRIVATEデータの外部送信、許可外パス操作、Cloudモデル、有料・費用不明Provider | 禁止 |
@@ -116,6 +118,14 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 操作計画はApplication層の `ComputerUseCoordinator` が `ActionPolicy` へ渡し、対象アプリ、操作型、前面状態、上限、承認を再検査してから1件ずつ実行する。実行直前と直後に画面とUI要素を再取得し、状態が変わった場合は入力せず停止する。UIからOS操作ProviderやSQLiteを直接呼ばない。
 
 スクリーンショット、UI構造、入力文、ウィンドウタイトルはPRIVATEとして利用者データ領域だけへ保存し、通常ログと配布物へ入れない。初回の上限、停止、受入基準は [ADR-0015](adr/0015-start-computer-use-with-approved-notepad-task.md) と [COMPUTER_USE_DESIGN.md](COMPUTER_USE_DESIGN.md) を正本とする。画像座標だけの操作、ゲーム、ブラウザ、外部送信は別ADRまで扱わない。
+
+Phase 7Bでは、`ComputerUseCoordinator` の予算、承認、逐次実行、停止、監査を再利用しつつ、UI操作と分離した `FileOperationProvider` と `PowerShellRecipeProvider` を設ける。Providerはモデルの自由形式出力を実行せず、`ActionPolicy` が検査した固定スキーマの要求1件だけを受け取る。UIは引き続きCoordinatorと監査読取Serviceだけを呼ぶ。
+
+`FileOperationProvider` は会話またはrunへ明示許可したフォルダー配下だけで、作成、コピー、名前変更、移動、ゴミ箱またはアプリ管理退避を扱う。正規化・リンク解決後の入力元と出力先が許可ルート内であることを直前にも再検査し、ジャンクション、シンボリックリンク、reparse point経由の逸脱、既存宛先への上書き、恒久削除を拒否する。変更前メタデータと復元ジャーナルを先に永続化し、復元可能性を検査できない計画は開始しない。
+
+`PowerShellRecipeProvider` はアプリ側で登録したレシピID、型付き引数、固定作業ディレクトリ、時間・出力・process tree上限だけを受け取る。レシピはアプリ同梱で書込み不能な、バージョンとSHA-256を固定した `.ps1` とし、`powershell.exe -File` の引数ベクターからPowerShellのパラメーター束縛で呼び出す。引数をコマンド文字列へ連結せず、`-Command`、`Invoke-Expression`、dot source、実行時のスクリプト生成を禁止する。実行前にレシピ名、型付き引数、対象、影響、上限を表示して計画承認へ束縛し、実行ファイル・引数・作業ディレクトリ・レシピ定義のSHA-256と開始・終了・終了コードを監査する。任意コマンド文字列、`-EncodedCommand`、昇格、公開ネットワーク通信、秘密情報候補へのアクセス、再帰的恒久削除、未登録の実行ファイル・子プロセスを拒否し、停止時は今回生成したprocess treeだけを終了する。
+
+Phase 7Bのファイル整理とPowerShellは常に `PLAN_APPROVAL_REQUIRED` とし、既存の `AUTO_WRITE` や `REVERSIBLE_DELETE` へ自動降格しない。任意PowerShellは `DENY` のままとし、20回連続成功かつ恒久消失、復元失敗、許可外アクセスが0件になった後も、別ADRなしには有効化しない。詳細と受入基準は [ADR-0016](adr/0016-stage-approved-file-and-powershell-operations.md) と [COMPUTER_USE_DESIGN.md](COMPUTER_USE_DESIGN.md) を参照する。
 
 ## 観測境界
 
