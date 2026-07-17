@@ -6,9 +6,14 @@ from pathlib import Path
 import pytest
 
 from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.context_budget import ContextWindowManager
 from local_llm_chat.application.services.tool_coordinator import ToolCoordinator
 from local_llm_chat.application.services.rag_service import RagService
-from local_llm_chat.domain.errors import FreeOperationBlocked, ToolUseUnavailable
+from local_llm_chat.domain.errors import (
+    FreeOperationBlocked,
+    OllamaUnavailable,
+    ToolUseUnavailable,
+)
 from local_llm_chat.domain.models import (
     ChatChunk,
     ChatRequest,
@@ -91,6 +96,35 @@ class FakeRegistry:
 
     async def close(self) -> None:
         return None
+
+
+class OneUnitCounter:
+    def count_text(self, value: str) -> int:
+        return 1 if value else 0
+
+    def count_message(self, value: object) -> int:
+        return 1
+
+    def count_tool(self, value: object) -> int:
+        return 1
+
+
+class CompressingProvider(FakeProvider):
+    def __init__(self, fail_summary: bool = False) -> None:
+        super().__init__()
+        self.fail_summary = fail_summary
+        self.requests: list[ChatRequest] = []
+
+    async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+        self.requests.append(request)
+        if "ローカル会話の圧縮器" in request.system_prompt:
+            if self.fail_summary:
+                raise OllamaUnavailable("Ollama stopped during summary")
+            yield ChatChunk(content="以前の決定🙂")
+            yield ChatChunk(done=True)
+            return
+        yield ChatChunk(content="継続回答")
+        yield ChatChunk(done=True)
 
 
 class FailingTranslationScheduler:
@@ -232,6 +266,18 @@ async def make_conversation(repository: SQLiteAppRepository) -> str:
     return conversation.id
 
 
+async def make_small_context_conversation(repository: SQLiteAppRepository) -> str:
+    await repository.initialize()
+    character = await repository.ensure_default_character()
+    profile = await repository.ensure_model_profile(
+        "ollama-local", "gemma4:12b", {"num_ctx": 4, "num_predict": 1}
+    )
+    conversation = await repository.create_conversation(
+        "短い上限", character.id, profile.id
+    )
+    return conversation.id
+
+
 @pytest.mark.asyncio
 async def test_streams_and_persists_completed_response(tmp_path: Path) -> None:
     repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
@@ -247,6 +293,75 @@ async def test_streams_and_persists_completed_response(tmp_path: Path) -> None:
     assert updates == ["回答", "回答です"]
     assert response.content == "回答です"
     assert response.state is MessageState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_chat_automatically_compresses_before_second_over_limit_send(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_small_context_conversation(repository)
+    registry = FakeRegistry()
+    provider = CompressingProvider()
+    registry.provider = provider
+    service = ChatService(
+        repository,
+        registry,
+        FreeOperationPolicy(),
+        context_window=ContextWindowManager(repository, OneUnitCounter()),
+    )
+    await service.send_message(conversation_id, "最初の質問🙂")
+    notices: list[tuple[str, bool]] = []
+
+    async def on_notice(message: str, warning: bool) -> None:
+        notices.append((message, warning))
+
+    response = await service.send_message(
+        conversation_id, "現在の質問", on_notice=on_notice
+    )
+
+    assert response.content == "継続回答"
+    assert any("ローカルで要約" in message and not warning for message, warning in notices)
+    assert len(provider.requests) == 3
+    assert provider.requests[-1].messages[0].content.startswith(
+        "[以前の会話のローカル要約]"
+    )
+    assert provider.requests[-1].messages[-1].content == "現在の質問"
+
+
+@pytest.mark.asyncio
+async def test_chat_warns_and_continues_when_ollama_summary_fails(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_small_context_conversation(repository)
+    registry = FakeRegistry()
+    provider = CompressingProvider(fail_summary=True)
+    registry.provider = provider
+    service = ChatService(
+        repository,
+        registry,
+        FreeOperationPolicy(),
+        context_window=ContextWindowManager(repository, OneUnitCounter()),
+    )
+    await service.send_message(conversation_id, "最初の質問🙂")
+    notices: list[tuple[str, bool]] = []
+
+    async def on_notice(message: str, warning: bool) -> None:
+        notices.append((message, warning))
+
+    response = await service.send_message(
+        conversation_id, "現在の質問", on_notice=on_notice
+    )
+
+    assert response.content == "継続回答"
+    assert any("直近メッセージ" in message and warning for message, warning in notices)
+    assert [message.content for message in await repository.list_active_messages(conversation_id)] == [
+        "最初の質問🙂",
+        "継続回答",
+        "現在の質問",
+        "継続回答",
+    ]
 
 
 @pytest.mark.asyncio

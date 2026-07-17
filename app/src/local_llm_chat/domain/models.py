@@ -13,6 +13,7 @@ from local_llm_chat.domain.states import (
     RunState,
     TranslationState,
     ToolCallState,
+    ContextSummaryState,
 )
 
 
@@ -242,6 +243,29 @@ class RunSession:
     assistant_message: Message
     run: RunRecord
     branch_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSummary:
+    id: str
+    conversation_id: str
+    branch_id: str
+    source_message_ids: tuple[str, ...]
+    source_hash: str
+    settings_hash: str
+    model: str
+    prompt_version: str
+    content: str
+    state: ContextSummaryState
+    created_at: datetime
+    completed_at: datetime | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSummaryPreparation:
+    summary: ContextSummary
+    should_generate: bool
 
 
 @dataclass(frozen=True, slots=True)

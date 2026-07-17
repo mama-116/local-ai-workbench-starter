@@ -19,6 +19,8 @@ from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
     Conversation,
+    ContextSummary,
+    ContextSummaryPreparation,
     DocumentChunk,
     DocumentRecord,
     LatestTelemetry,
@@ -40,6 +42,7 @@ from local_llm_chat.domain.models import (
 from local_llm_chat.domain.states import (
     MessageRole,
     MessageState,
+    ContextSummaryState,
     RunState,
     TranslationState,
     ToolCallState,
@@ -155,6 +158,14 @@ class SQLiteAppRepository:
             connection.execute(
                 """
                 UPDATE message_translations
+                SET state = 'failed', completed_at = ?, error_code = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE context_summaries
                 SET state = 'failed', completed_at = ?, error_code = 'previous_session_interrupted'
                 WHERE state IN ('pending', 'running')
                 """,
@@ -1008,6 +1019,152 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def prepare_context_summary(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        source_message_ids: tuple[str, ...],
+        source_hash: str,
+        settings_hash: str,
+        model: str,
+        prompt_version: str,
+    ) -> ContextSummaryPreparation:
+        if not source_message_ids:
+            raise ValidationError("要約対象の発言がありません。")
+
+        def operation(connection: sqlite3.Connection) -> ContextSummaryPreparation:
+            conversation = self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, branch_id)
+            if branch.conversation_id != conversation.id:
+                raise ValidationError("別の会話の分岐へ要約を保存できません。")
+            placeholders = ",".join("?" for _ in source_message_ids)
+            rows = connection.execute(
+                f"SELECT id, conversation_id FROM messages WHERE id IN ({placeholders})",
+                source_message_ids,
+            ).fetchall()
+            if len(rows) != len(source_message_ids) or any(
+                str(row["conversation_id"]) != conversation.id for row in rows
+            ):
+                raise ValidationError("別の会話の発言を要約できません。")
+            branch_path = self._message_path(connection, branch_id)
+            branch_prefix = tuple(
+                message.id for message in branch_path[: len(source_message_ids)]
+            )
+            if branch_prefix != source_message_ids:
+                raise ValidationError(
+                    "現在の分岐に属する古い連続区間だけを要約できます。"
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM context_summaries
+                WHERE conversation_id = ? AND branch_id = ? AND source_hash = ?
+                  AND settings_hash = ? AND prompt_version = ? AND state = 'completed'
+                  AND source_message_ids_json = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (
+                    conversation_id,
+                    branch_id,
+                    source_hash,
+                    settings_hash,
+                    prompt_version,
+                    json.dumps(source_message_ids, separators=(",", ":")),
+                ),
+            ).fetchone()
+            if existing is not None:
+                return ContextSummaryPreparation(
+                    self._context_summary_from_row(existing), False
+                )
+            summary_id = str(uuid4())
+            created_at = _now()
+            connection.execute(
+                """
+                INSERT INTO context_summaries(
+                    id, conversation_id, branch_id, source_message_ids_json,
+                    source_hash, settings_hash, model, prompt_version, content,
+                    state, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, '', 'pending', ?)
+                """,
+                (
+                    summary_id,
+                    conversation_id,
+                    branch_id,
+                    json.dumps(source_message_ids, separators=(",", ":")),
+                    source_hash,
+                    settings_hash,
+                    model,
+                    prompt_version,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM context_summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+            assert row is not None
+            return ContextSummaryPreparation(self._context_summary_from_row(row), True)
+
+        return await self._write(operation)
+
+    async def mark_context_summary_running(self, summary_id: str) -> ContextSummary:
+        def operation(connection: sqlite3.Connection) -> ContextSummary:
+            cursor = connection.execute(
+                "UPDATE context_summaries SET state = 'running' WHERE id = ? AND state = 'pending'",
+                (summary_id,),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("要約試行を開始できません。")
+            row = connection.execute(
+                "SELECT * FROM context_summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+            assert row is not None
+            return self._context_summary_from_row(row)
+
+        return await self._write(operation)
+
+    async def finish_context_summary(
+        self,
+        summary_id: str,
+        content: str,
+        state: ContextSummaryState,
+        error_code: str | None = None,
+    ) -> ContextSummary:
+        if state not in {ContextSummaryState.COMPLETED, ContextSummaryState.FAILED}:
+            raise ValidationError("要約を終端状態にできません。")
+
+        def operation(connection: sqlite3.Connection) -> ContextSummary:
+            cursor = connection.execute(
+                """
+                UPDATE context_summaries
+                SET content = ?, state = ?, error_code = ?, completed_at = ?
+                WHERE id = ? AND state IN ('pending', 'running')
+                """,
+                (content, state.value, error_code, _now(), summary_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("要約試行は既に終了しています。")
+            row = connection.execute(
+                "SELECT * FROM context_summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+            assert row is not None
+            return self._context_summary_from_row(row)
+
+        return await self._write(operation)
+
+    async def list_context_summaries(
+        self, conversation_id: str
+    ) -> list[ContextSummary]:
+        def operation(connection: sqlite3.Connection) -> list[ContextSummary]:
+            rows = connection.execute(
+                """
+                SELECT * FROM context_summaries
+                WHERE conversation_id = ? ORDER BY created_at
+                """,
+                (conversation_id,),
+            ).fetchall()
+            return [self._context_summary_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
     async def checkpoint_response(self, message_id: str, content: str) -> None:
         def operation(connection: sqlite3.Connection) -> None:
             cursor = connection.execute(
@@ -1654,6 +1811,29 @@ class SQLiteAppRepository:
             reused_from_id=(
                 str(row["reused_from_id"]) if row["reused_from_id"] else None
             ),
+        )
+
+    @staticmethod
+    def _context_summary_from_row(row: sqlite3.Row) -> ContextSummary:
+        source_message_ids = json.loads(str(row["source_message_ids_json"]))
+        if not isinstance(source_message_ids, list) or not all(
+            isinstance(value, str) for value in source_message_ids
+        ):
+            raise PersistenceError("要約の対象発言が壊れています。")
+        return ContextSummary(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            branch_id=str(row["branch_id"]),
+            source_message_ids=tuple(source_message_ids),
+            source_hash=str(row["source_hash"]),
+            settings_hash=str(row["settings_hash"]),
+            model=str(row["model"]),
+            prompt_version=str(row["prompt_version"]),
+            content=str(row["content"]),
+            state=ContextSummaryState(str(row["state"])),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            completed_at=_parse_time(row["completed_at"]),
+            error_code=str(row["error_code"]) if row["error_code"] else None,
         )
 
     @staticmethod

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from local_llm_chat.application.services.translation_service import (
     TranslationScheduler,
 )
+from local_llm_chat.application.services.context_budget import ContextWindowManager
 from local_llm_chat.application.services.telemetry_service import TelemetryService
 from local_llm_chat.application.services.rag_service import RagService
 from local_llm_chat.application.services.tool_coordinator import ToolCoordinator
@@ -30,10 +31,15 @@ from local_llm_chat.domain.ports.repositories import AppRepository
 from local_llm_chat.domain.states import MessageRole, MessageState
 
 StreamCallback = Callable[[str], Awaitable[None]]
+NoticeCallback = Callable[[str, bool], Awaitable[None]]
 _READ_TOOL_NAME = "read_allowed_text"
 
 
 async def _no_update(_: str) -> None:
+    return None
+
+
+async def _no_notice(_: str, __: bool) -> None:
     return None
 
 
@@ -47,6 +53,7 @@ class ChatService:
         telemetry: TelemetryService | None = None,
         rag: RagService | None = None,
         tools: ToolCoordinator | None = None,
+        context_window: ContextWindowManager | None = None,
     ) -> None:
         self._repository = repository
         self._providers = providers
@@ -55,16 +62,18 @@ class ChatService:
         self._telemetry = telemetry
         self._rag = rag
         self._tools = tools
+        self._context_window = context_window or ContextWindowManager(repository)
 
     async def send_message(
         self,
         conversation_id: str,
         content: str,
         on_update: StreamCallback = _no_update,
+        on_notice: NoticeCallback = _no_notice,
     ) -> Message:
         conversation, provider = await self._preflight(conversation_id)
         session = await self._repository.start_send(conversation_id, content)
-        return await self._execute(conversation, session, provider, on_update)
+        return await self._execute(conversation, session, provider, on_update, on_notice)
 
     async def rewrite_message(
         self,
@@ -72,24 +81,26 @@ class ChatService:
         source_message_id: str,
         content: str,
         on_update: StreamCallback = _no_update,
+        on_notice: NoticeCallback = _no_notice,
     ) -> Message:
         conversation, provider = await self._preflight(conversation_id)
         session = await self._repository.start_rewrite(
             conversation_id, source_message_id, content
         )
-        return await self._execute(conversation, session, provider, on_update)
+        return await self._execute(conversation, session, provider, on_update, on_notice)
 
     async def regenerate_message(
         self,
         conversation_id: str,
         source_message_id: str,
         on_update: StreamCallback = _no_update,
+        on_notice: NoticeCallback = _no_notice,
     ) -> Message:
         conversation, provider = await self._preflight(conversation_id)
         session = await self._repository.start_regenerate(
             conversation_id, source_message_id
         )
-        return await self._execute(conversation, session, provider, on_update)
+        return await self._execute(conversation, session, provider, on_update, on_notice)
 
     async def _preflight(
         self, conversation_id: str
@@ -111,6 +122,7 @@ class ChatService:
         session: RunSession,
         provider: LLMProvider,
         on_update: StreamCallback,
+        on_notice: NoticeCallback,
     ) -> Message:
         profile = await self._repository.get_model_profile(conversation.model_profile_id)
         character = await self._repository.get_character_version(
@@ -118,6 +130,7 @@ class ChatService:
         )
         context = await self._repository.context_to_message(session.user_message.id)
         system_prompt = character.system_prompt
+        rag_context = ""
         if self._rag is not None:
             selected_document_count, rag_results = await self._rag.prepare_for_conversation(
                 conversation.id, session.user_message.content
@@ -126,9 +139,7 @@ class ChatService:
                 session.run.id, selected_document_count, rag_results
             )
             if rag_results:
-                system_prompt = (
-                    f"{system_prompt}\n\n{self._rag.prompt_context(rag_results)}"
-                )
+                rag_context = self._rag.prompt_context(rag_results)
         base_messages = tuple(
             ChatMessageInput(message.role, message.content)
             for message in context
@@ -147,6 +158,45 @@ class ChatService:
             options=dict(profile.parameters),
             tools=definitions,
         )
+        try:
+            prepared = await self._context_window.prepare(
+                request,
+                base_system_prompt=system_prompt,
+                rag_context=rag_context,
+                conversation_id=conversation.id,
+                branch_id=session.branch_id,
+                profile=profile,
+                provider=provider,
+                source_messages=tuple(message for message in context if message.content),
+                run_id=session.run.id,
+            )
+        except asyncio.CancelledError:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.CANCELLED,
+                error_code="cancelled_by_user",
+            )
+            raise
+        except AppError as error:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.FAILED,
+                error_code=type(error).__name__,
+            )
+            raise
+        except Exception as error:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.FAILED,
+                error_code=type(error).__name__,
+            )
+            raise
+        request = prepared.request
+        if prepared.notice is not None:
+            await on_notice(prepared.notice, prepared.notice_is_warning)
         content = ""
         checkpoint_content_length = 0
         last_checkpoint = time.monotonic()
@@ -207,7 +257,7 @@ class ChatService:
             read_item_count = 0
             calls_used = 0
             result_bytes_used = 0
-            accumulated_messages = list(base_messages)
+            accumulated_messages = list(request.messages)
             current_content = initial_content
             while (
                 tool_calls
@@ -254,6 +304,20 @@ class ChatService:
                         else ()
                     ),
                 )
+                follow_up = await self._context_window.prepare(
+                    follow_up_request,
+                    base_system_prompt=system_prompt,
+                    rag_context=rag_context,
+                    conversation_id=conversation.id,
+                    branch_id=session.branch_id,
+                    profile=profile,
+                    provider=provider,
+                    run_id=session.run.id,
+                )
+                follow_up_request = follow_up.request
+                accumulated_messages = list(follow_up_request.messages)
+                if follow_up.notice is not None:
+                    await on_notice(follow_up.notice, follow_up.notice_is_warning)
                 current_content, tool_calls = await consume(follow_up_request)
             content = current_content
             if read_item_count:

@@ -882,7 +882,7 @@ class LocalChatApp:
 
         async def action(on_update: Callable[[str], Awaitable[None]]) -> Message:
             return await self.container.chat.send_message(
-                conversation_id, content, on_update
+                conversation_id, content, on_update, self._context_notice
             )
 
         await self._run_generation(conversation_id, action, content)
@@ -1103,7 +1103,7 @@ class LocalChatApp:
 
         async def action(on_update: Callable[[str], Awaitable[None]]) -> Message:
             return await self.container.chat.regenerate_message(
-                conversation_id, source.id, on_update
+                conversation_id, source.id, on_update, self._context_notice
             )
 
         await self._run_generation(conversation_id, action)
@@ -1387,7 +1387,11 @@ class LocalChatApp:
 
             async def action(on_update: Callable[[str], Awaitable[None]]) -> Message:
                 return await self.container.chat.rewrite_message(
-                    conversation_id, source.id, replacement, on_update
+                    conversation_id,
+                    source.id,
+                    replacement,
+                    on_update,
+                    self._context_notice,
                 )
 
             await self._run_generation(conversation_id, action)
@@ -1520,6 +1524,9 @@ class LocalChatApp:
                 show_close_icon=True,
             )
         )
+
+    async def _context_notice(self, message: str, is_warning: bool) -> None:
+        self._toast(message, ERROR if is_warning else ACCENT)
 
     def _close_dialog(self) -> None:
         self.page.pop_dialog()
