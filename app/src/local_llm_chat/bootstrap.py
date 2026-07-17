@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.builtin_tool_provider import (
+    BuiltInToolProvider,
+    ToolAccessService,
+)
+from local_llm_chat.application.services.tool_coordinator import ToolCoordinator
 from local_llm_chat.application.services.conversation_service import ConversationService
 from local_llm_chat.application.services.profile_service import ProfileService
 from local_llm_chat.application.services.rag_service import RagService
@@ -39,6 +44,7 @@ class AppContainer:
     translations: TranslationService
     telemetry: TelemetryService
     chat: ChatService
+    tool_access: ToolAccessService
 
     async def close(self) -> None:
         await self.translations.close()
@@ -68,6 +74,10 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         repository, [WindowsSystemCollector(), NvidiaSmiCollector()]
     )
     rag = RagService(repository)
+    tool_access = ToolAccessService(repository)
+    tool_coordinator = ToolCoordinator(
+        repository, (BuiltInToolProvider(repository),), on_change=tool_access.notify
+    )
 
     return AppContainer(
         paths=paths,
@@ -79,6 +89,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         conversations=ConversationService(repository, providers, policy),
         translations=translations,
         telemetry=telemetry,
+        tool_access=tool_access,
         chat=ChatService(
             repository,
             providers,
@@ -86,5 +97,6 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
             translations,
             telemetry,
             rag,
+            tool_coordinator,
         ),
     )

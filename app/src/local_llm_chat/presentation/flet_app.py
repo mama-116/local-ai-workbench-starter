@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -25,6 +26,8 @@ from local_llm_chat.domain.models import (
     ProviderConnection,
     Translation,
     TelemetryMetric,
+    ToolCallAudit,
+    ToolFolderGrant,
     utc_now,
 )
 from local_llm_chat.domain.states import MessageRole, MessageState
@@ -38,6 +41,10 @@ PANEL_ALT = "#1D1D1B"
 TEXT = "#E8E4DC"
 MUTED = "#969188"
 ERROR = "#D87866"
+
+
+def _latest_tool_audit(audits: list[ToolCallAudit]) -> ToolCallAudit | None:
+    return audits[0] if audits else None
 
 
 class WindowCloser(Protocol):
@@ -58,6 +65,8 @@ class LocalChatApp:
         self.rag_documents: list[DocumentRecord] = []
         self.selected_rag_documents: list[DocumentRecord] = []
         self.latest_telemetry: LatestTelemetry | None = None
+        self.tool_folder_grant: ToolFolderGrant | None = None
+        self.tool_audits: list[ToolCallAudit] = []
         self.selected_conversation_id: str | None = None
         self.guard_error: str | None = None
         self.selected_provider_name: str | None = None
@@ -194,6 +203,59 @@ class LocalChatApp:
                 spacing=8,
             ),
         )
+        self.tool_folder_text = ft.Text(
+            "未許可", size=10, color=MUTED, selectable=True
+        )
+        self.tool_running_text = ft.Text("実行中: 0件", size=10, color=MUTED)
+        self.tool_recent_text = ft.Text(
+            "直近結果: なし", size=10, color=MUTED
+        )
+        self.tool_revoke_button = ft.Button(
+            "許可を取り消す",
+            icon=ft.Icons.BLOCK_ROUNDED,
+            color=ERROR,
+            bgcolor="#292925",
+            on_click=self.revoke_tool_folder,
+            disabled=True,
+        )
+        self.tool_history_button = ft.Button(
+            "監査履歴を開く",
+            icon=ft.Icons.HISTORY_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_tool_audit_dialog,
+            disabled=True,
+        )
+        self.tool_card = ft.Container(
+            bgcolor="#242421",
+            border_radius=14,
+            padding=12,
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.HANDYMAN_ROUNDED, size=16, color=ACCENT),
+                            ft.Text("内蔵TOOLS", size=11, weight=ft.FontWeight.W_600),
+                        ],
+                        spacing=6,
+                    ),
+                    ft.Text("利用可能: フォルダー検索 / テキスト読取り", size=10, color=MUTED),
+                    self.tool_folder_text,
+                    ft.Button(
+                        "フォルダーを許可",
+                        icon=ft.Icons.FOLDER_OPEN_ROUNDED,
+                        color="#17120D",
+                        bgcolor=ACCENT,
+                        on_click=self.choose_tool_folder,
+                    ),
+                    self.tool_revoke_button,
+                    self.tool_running_text,
+                    self.tool_recent_text,
+                    self.tool_history_button,
+                ],
+                spacing=7,
+            ),
+        )
         self.character_dropdown = self._dropdown("キャラクター")
         self.character_dropdown.on_select = self.update_selection
         self.connection_dropdown = self._dropdown("Ollama接続先")
@@ -221,6 +283,7 @@ class LocalChatApp:
         )
         self.container.translations.subscribe(self._on_translation_update)
         self.container.telemetry.subscribe(self._on_telemetry_update)
+        self.container.tool_access.subscribe(self._on_tool_update)
 
     async def initialize(self) -> None:
         self._configure_page()
@@ -327,6 +390,7 @@ class LocalChatApp:
                     self.guard_badge,
                     self.guard_detail,
                     self.telemetry_card,
+                    self.tool_card,
                     ft.Button(
                         "状態を再確認",
                         icon=ft.Icons.REFRESH_ROUNDED,
@@ -396,7 +460,47 @@ class LocalChatApp:
         self._render_options()
         await self._refresh_selected_conversation()
         await self._refresh_telemetry()
+        await self._refresh_tools()
         self.page.update()
+
+    async def _refresh_tools(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            self.tool_folder_grant = None
+            self.tool_audits = []
+        else:
+            self.tool_folder_grant = await self.container.tool_access.grant(
+                conversation_id
+            )
+            self.tool_audits = await self.container.tool_access.audits(conversation_id)
+        self.tool_folder_text.value = (
+            f"許可フォルダー: {self.tool_folder_grant.root_path}"
+            if self.tool_folder_grant is not None
+            else "許可フォルダー: 未設定"
+        )
+        self.tool_revoke_button.disabled = self.tool_folder_grant is None
+        running = sum(audit.state.value == "running" for audit in self.tool_audits)
+        self.tool_running_text.value = f"実行中: {running}件"
+        latest = _latest_tool_audit(self.tool_audits)
+        if latest is None:
+            self.tool_recent_text.value = "直近結果: なし"
+        elif latest.failure_reason:
+            self.tool_recent_text.value = (
+                f"直近結果: {latest.state.value} · {latest.failure_reason}"
+            )
+        else:
+            size = latest.result_size_bytes or 0
+            count = latest.result_item_count or 0
+            self.tool_recent_text.value = (
+                f"直近結果: {latest.state.value} · {count}件 · {size} bytes"
+            )
+        self.tool_history_button.disabled = not self.tool_audits
+
+    async def _on_tool_update(self, conversation_id: str) -> None:
+        if conversation_id != self.selected_conversation_id:
+            return
+        await self._refresh_tools()
+        self.page.update(self.tool_card)
 
     async def _refresh_telemetry(self) -> None:
         self.latest_telemetry = await self.container.telemetry.latest(
@@ -527,6 +631,7 @@ class LocalChatApp:
         self._render_conversations()
         await self._refresh_selected_conversation()
         await self._refresh_telemetry()
+        await self._refresh_tools()
         self.page.update()
 
     async def _refresh_selected_conversation(self) -> None:
@@ -781,6 +886,97 @@ class LocalChatApp:
             )
 
         await self._run_generation(conversation_id, action, content)
+
+    async def choose_tool_folder(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            self._toast("会話を選択してからフォルダーを許可してください。", ERROR)
+            return
+        folder = await self.file_picker.get_directory_path(
+            dialog_title="この会話で読取りを許可するフォルダー"
+        )
+        if not folder:
+            return
+        try:
+            await self.container.tool_access.grant_folder(conversation_id, folder)
+        except AppError as error:
+            self._toast(str(error), ERROR)
+            return
+        await self._refresh_tools()
+        self.page.update(self.tool_card)
+        self._toast("この会話にフォルダーの読取りを許可しました。", MINT)
+
+    async def revoke_tool_folder(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            return
+        await self.container.tool_access.revoke_folder(conversation_id)
+        await self._refresh_tools()
+        self.page.update(self.tool_card)
+        self._toast("フォルダーの許可を取り消しました。", MINT)
+
+    async def show_tool_audit_dialog(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            return
+        self.tool_audits = await self.container.tool_access.audits(conversation_id)
+        rows: list[ft.Control] = []
+        for audit in reversed(self.tool_audits):
+            details = [
+                f"状態: {audit.state.value}",
+                f"入力: {json.dumps(audit.input_arguments, ensure_ascii=False)}",
+            ]
+            if audit.result_size_bytes is not None:
+                details.append(
+                    f"結果: {audit.result_item_count or 0}件 / "
+                    f"{audit.result_size_bytes} bytes / SHA-256 {audit.result_sha256}"
+                )
+            if audit.failure_reason:
+                details.append(f"理由: {audit.failure_reason}")
+            details.append(
+                "開始: "
+                + (
+                    audit.started_at.astimezone().strftime("%Y/%m/%d %H:%M:%S")
+                    if audit.started_at
+                    else "未開始"
+                )
+            )
+            details.append(
+                "終了: "
+                + (
+                    audit.completed_at.astimezone().strftime("%Y/%m/%d %H:%M:%S")
+                    if audit.completed_at
+                    else "未終了"
+                )
+            )
+            rows.append(
+                ft.Container(
+                    bgcolor="#2A2925",
+                    border_radius=10,
+                    padding=10,
+                    content=ft.Column(
+                        [
+                            ft.Text(audit.tool_name, size=12, color=TEXT),
+                            *[ft.Text(line, size=9, color=MUTED, selectable=True) for line in details],
+                        ],
+                        spacing=2,
+                    ),
+                )
+            )
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="内蔵ツール監査履歴",
+                bgcolor="#24231F",
+                content=ft.ListView(
+                    rows or [ft.Text("監査履歴はありません。", color=MUTED)],
+                    spacing=7,
+                    width=560,
+                    height=420,
+                ),
+                actions=[ft.Button("閉じる", on_click=self._close_dialog)],
+            )
+        )
 
     async def show_rag_dialog(self) -> None:
         conversation_id = self.selected_conversation_id

@@ -8,12 +8,12 @@
 - `main` は常に、検証済みで配布可能な状態を保つ。
 - `main` へ直接commitまたはpushしない。小さな修正や緊急修正もPull Requestを経由する。
 - 1ブランチと1Pull Requestには、原則として1つの目的だけを含める。
-- Issueは内部台帳として使う。利用者にIssue番号やGit操作の入力を要求しない。
+- Issueは内部台帳として使う。要否、重複確認、外部投稿承認は [Issue判断と教育的説明の規約](../plugins/local-ai-builder-kit/skills/guide-development/references/issue-and-explanation-policy.md) を正本とし、利用者にIssue番号やGit操作の入力を要求しない。
 - PRIVATEデータ、APIキー、トークン、`.env`、DB、個人ログをGitへ追加しない。
 
 ## 作業の流れ
 
-1. 既存Issueを確認し、なければ目的と完了条件を持つIssueを作る。
+1. Issue規約に従って要否を判定し、必要なら既存Issueを検索して、重複がない場合だけ目的と完了条件を持つIssueを作る。
 2. 最新の `main` から作業ブランチを作る。
 3. 契約、壊れるシナリオのテスト、実装の順で進める。
 4. 完了条件単位で、対象ファイルだけをcommitする。

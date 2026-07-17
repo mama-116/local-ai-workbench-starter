@@ -10,6 +10,8 @@
 - 意見が分かれる判断は、推奨案だけでなく最も強い反論と見直し条件を示す。
 - UIを決めるときは、理由の異なる3案を提示し、可能なら各案のモックを生成する。選択前に本実装を始めない。
 - GitHub Issueは内部台帳として扱える。利用者にIssue操作を強制しない。
+- 変更、設計判断、バックログ、PRを伴う依頼では、正本に従ってIssue要否と重複を実装前に判定する。GitHubへの投稿は現在の依頼で明示されていなければ投稿直前に承認を得る。
+- 推奨・非推奨Actionを示すときは、利用者の目的への影響、具体的理由、強い反論、見直し条件を必要な場面で短く説明する。
 - ゴールが変わる、独立した成果物へ移る、または引き継ぎなしでは文脈維持が難しい場合にだけ新しいスレッドを提案する。
 
 ## 正本
@@ -18,6 +20,7 @@
 - アーキテクチャと境界: `docs/ARCHITECTURE.md`
 - 意思決定: `docs/adr/`
 - 会話引き継ぎ: `docs/templates/HANDOFF_TEMPLATE.md`
+- Issue判断と教育的説明: `plugins/local-ai-builder-kit/skills/guide-development/references/issue-and-explanation-policy.md`
 
 同じ定義を複数文書へコピーしない。状態値、承認区分、データ境界は `docs/ARCHITECTURE.md` を正本とする。
 

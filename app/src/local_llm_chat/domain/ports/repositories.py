@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
 from local_llm_chat.domain.models import (
@@ -13,14 +14,50 @@ from local_llm_chat.domain.models import (
     Translation,
     TranslationPreparation,
     TelemetryMetric,
+    ToolCallAudit,
+    ToolCallRequest,
+    ToolFolderGrant,
 )
-from local_llm_chat.domain.states import MessageState, TranslationState
+from local_llm_chat.domain.states import MessageState, ToolCallState, TranslationState
 
 
 class AppRepository(Protocol):
     async def initialize(self) -> None: ...
 
     async def recover_interrupted_runs(self) -> None: ...
+
+    async def set_tool_folder_grant(
+        self, conversation_id: str, root_path: Path
+    ) -> ToolFolderGrant: ...
+
+    async def get_tool_folder_grant(
+        self, conversation_id: str
+    ) -> ToolFolderGrant | None: ...
+
+    async def revoke_tool_folder_grant(self, conversation_id: str) -> None: ...
+
+    async def create_tool_call(
+        self,
+        conversation_id: str,
+        run_id: str | None,
+        provider: str,
+        request: ToolCallRequest,
+    ) -> ToolCallAudit: ...
+
+    async def mark_tool_call_running(self, call_id: str) -> None: ...
+
+    async def finish_tool_call(
+        self,
+        call_id: str,
+        state: ToolCallState,
+        result_content: str | None = None,
+        result_item_count: int | None = None,
+        failure_reason: str | None = None,
+    ) -> None: ...
+
+    async def list_tool_calls(
+        self, conversation_id: str, limit: int = 100
+    ) -> list[ToolCallAudit]: ...
 
     async def ensure_default_character(self) -> CharacterVersion: ...
 

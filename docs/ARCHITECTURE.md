@@ -93,6 +93,8 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 `tool_calls` はUUID、会話、run、許可、Provider、ツール名、入力、状態、結果、時刻、失敗理由、結果ハッシュを保持する。結果本文は上限付きPRIVATEデータとしてSQLiteだけへ保存し、通常ログへ重複出力しない。状態値は `pending`、`running`、`completed`、`failed`、`denied` とし、再実行は別レコードへ追記する。詳細上限、UI、受入基準は [ADR-0014](adr/0014-start-read-only-tools-in-control-desk.md) を正本とする。
 
+画面はApplication層の許可Serviceと監査読取Serviceだけを呼び、ProviderやSQLiteを直接参照しない。監査一覧用の読取結果からはPRIVATEな結果本文を除外し、件数、サイズ、SHA-256、失敗理由、開始・終了時刻だけを返す。
+
 ## 観測境界
 
 観測Serviceは会話runの開始・生成中・終了を受け取り、取得部品へ問い合わせる。取得部品はOllama実行情報、WindowsのCPU・RAM、NVIDIAのGPU・VRAM、将来のLAN端末観測を同じ結果形式へ変換する。値には取得元端末と取得時刻を必ず付ける。

@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 from local_llm_chat.domain.errors import (
@@ -31,6 +31,9 @@ from local_llm_chat.domain.models import (
     RagCitation,
     RagSearchResult,
     TelemetryMetric,
+    ToolCallAudit,
+    ToolCallRequest,
+    ToolFolderGrant,
     Translation,
     TranslationPreparation,
 )
@@ -39,6 +42,7 @@ from local_llm_chat.domain.states import (
     MessageState,
     RunState,
     TranslationState,
+    ToolCallState,
 )
 
 T = TypeVar("T")
@@ -133,6 +137,15 @@ class SQLiteAppRepository:
             )
             connection.execute(
                 """
+                UPDATE tool_calls
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = '前回のアプリ終了時に中断されました。'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
                 UPDATE runs
                 SET state = 'failed', completed_at = ?, error_code = 'previous_session_interrupted'
                 WHERE state IN ('pending', 'running')
@@ -149,6 +162,198 @@ class SQLiteAppRepository:
             )
 
         await self._write(operation)
+
+    async def set_tool_folder_grant(
+        self, conversation_id: str, root_path: Path
+    ) -> ToolFolderGrant:
+        resolved = Path(root_path).resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValidationError("許可するフォルダーが見つかりません。")
+        granted_at = _now()
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO conversation_tool_folder_grants(
+                    conversation_id, root_path, granted_at, revoked_at
+                ) VALUES(?, ?, ?, NULL)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    root_path = excluded.root_path,
+                    granted_at = excluded.granted_at,
+                    revoked_at = NULL
+                """,
+                (conversation_id, str(resolved), granted_at),
+            )
+
+        await self._write(operation)
+        return ToolFolderGrant(
+            conversation_id, resolved, datetime.fromisoformat(granted_at)
+        )
+
+    async def get_tool_folder_grant(
+        self, conversation_id: str
+    ) -> ToolFolderGrant | None:
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row | None:
+            row = connection.execute(
+                """
+                SELECT conversation_id, root_path, granted_at
+                FROM conversation_tool_folder_grants
+                WHERE conversation_id = ? AND revoked_at IS NULL
+                """,
+                (conversation_id,),
+            ).fetchone()
+            return cast(sqlite3.Row | None, row)
+
+        row = await self._read(operation)
+        if row is None:
+            return None
+        return ToolFolderGrant(
+            str(row["conversation_id"]),
+            Path(str(row["root_path"])),
+            datetime.fromisoformat(str(row["granted_at"])),
+        )
+
+    async def revoke_tool_folder_grant(self, conversation_id: str) -> None:
+        await self._write(
+            lambda connection: connection.execute(
+                """
+                UPDATE conversation_tool_folder_grants
+                SET revoked_at = ?
+                WHERE conversation_id = ? AND revoked_at IS NULL
+                """,
+                (_now(), conversation_id),
+            )
+        )
+
+    async def create_tool_call(
+        self,
+        conversation_id: str,
+        run_id: str | None,
+        provider: str,
+        request: ToolCallRequest,
+    ) -> ToolCallAudit:
+        # Ollama call IDs are only correlation tokens and may repeat across turns.
+        # The audit trail needs an application-owned UUID for every attempt.
+        call_id = str(uuid4())
+        created_at = _now()
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO tool_calls(
+                    id, conversation_id, run_id, provider, tool_name,
+                    input_json, state, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    call_id,
+                    conversation_id,
+                    run_id,
+                    provider,
+                    request.name,
+                    json.dumps(request.arguments, ensure_ascii=False, sort_keys=True),
+                    created_at,
+                ),
+            )
+
+        await self._write(operation)
+        return ToolCallAudit(
+            call_id,
+            conversation_id,
+            run_id,
+            provider,
+            request.name,
+            request.arguments,
+            ToolCallState.PENDING,
+            None,
+            None,
+            None,
+            None,
+            None,
+            datetime.fromisoformat(created_at),
+        )
+
+    async def mark_tool_call_running(self, call_id: str) -> None:
+        await self._write(
+            lambda connection: connection.execute(
+                """
+                UPDATE tool_calls SET state = 'running', started_at = ?
+                WHERE id = ? AND state = 'pending'
+                """,
+                (_now(), call_id),
+            )
+        )
+
+    async def finish_tool_call(
+        self,
+        call_id: str,
+        state: ToolCallState,
+        result_content: str | None = None,
+        result_item_count: int | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        payload = result_content.encode("utf-8") if result_content is not None else None
+        await self._write(
+            lambda connection: connection.execute(
+                """
+                UPDATE tool_calls SET
+                    state = ?, result_content = ?, result_item_count = ?,
+                    result_size_bytes = ?, result_sha256 = ?, failure_reason = ?,
+                    completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state.value,
+                    result_content,
+                    result_item_count,
+                    len(payload) if payload is not None else None,
+                    hashlib.sha256(payload).hexdigest() if payload is not None else None,
+                    failure_reason,
+                    _now(),
+                    call_id,
+                ),
+            )
+        )
+
+    async def list_tool_calls(
+        self, conversation_id: str, limit: int = 100
+    ) -> list[ToolCallAudit]:
+        def operation(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+            rows = connection.execute(
+                """
+                SELECT id, conversation_id, run_id, provider, tool_name,
+                       input_json, state, result_item_count, result_size_bytes,
+                       result_sha256, failure_reason, created_at, started_at,
+                       completed_at
+                FROM tool_calls WHERE conversation_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (conversation_id, max(1, min(limit, 100))),
+            ).fetchall()
+            rows.reverse()
+            return rows
+
+        rows = await self._read(operation)
+        return [
+            ToolCallAudit(
+                id=str(row["id"]),
+                conversation_id=str(row["conversation_id"]),
+                run_id=str(row["run_id"]) if row["run_id"] is not None else None,
+                provider=str(row["provider"]),
+                tool_name=str(row["tool_name"]),
+                input_arguments=json.loads(str(row["input_json"])),
+                state=ToolCallState(str(row["state"])),
+                result_content=None,
+                result_item_count=row["result_item_count"],
+                result_size_bytes=row["result_size_bytes"],
+                result_sha256=row["result_sha256"],
+                failure_reason=row["failure_reason"],
+                created_at=datetime.fromisoformat(str(row["created_at"])),
+                started_at=_parse_time(row["started_at"]),
+                completed_at=_parse_time(row["completed_at"]),
+            )
+            for row in rows
+        ]
 
     async def ensure_default_character(self) -> CharacterVersion:
         def operation(connection: sqlite3.Connection) -> CharacterVersion:

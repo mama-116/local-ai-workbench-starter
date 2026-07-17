@@ -6,12 +6,17 @@ from typing import Any
 
 import httpx
 
-from local_llm_chat.domain.errors import ModelUnavailable, OllamaUnavailable
+from local_llm_chat.domain.errors import (
+    ModelUnavailable,
+    OllamaUnavailable,
+    ToolUseUnavailable,
+)
 from local_llm_chat.domain.models import (
     ChatChunk,
     ChatRequest,
     ModelInfo,
     ProviderMetadata,
+    ToolCallRequest,
 )
 from local_llm_chat.domain.states import CostClass, Locality
 
@@ -87,19 +92,48 @@ class OllamaProvider:
         )
 
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
-        body = {
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": request.system_prompt}
+        ]
+        for message in request.messages:
+            item: dict[str, object] = {
+                "role": message.role.value,
+                "content": message.content,
+            }
+            if message.tool_name is not None:
+                item["tool_name"] = message.tool_name
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
+                    }
+                    for call in message.tool_calls
+                ]
+            messages.append(item)
+        body: dict[str, object] = {
             "model": request.model,
-            "messages": [
-                {"role": "system", "content": request.system_prompt},
-                *[
-                    {"role": message.role.value, "content": message.content}
-                    for message in request.messages
-                ],
-            ],
+            "messages": messages,
             "stream": True,
             "think": False,
             "options": request.options,
         }
+        if request.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+                for tool in request.tools
+            ]
         try:
             async with self._client.stream("POST", "/api/chat", json=body) as response:
                 response.raise_for_status()
@@ -115,6 +149,10 @@ class OllamaProvider:
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 404:
                 raise ModelUnavailable("選択したモデルが見つかりません。") from error
+            if request.tools and error.response.status_code == 400:
+                raise ToolUseUnavailable(
+                    "選択したモデルはツール呼出しに対応していません。"
+                ) from error
             raise OllamaUnavailable(
                 f"Ollamaがエラーを返しました ({error.response.status_code})。"
             ) from error
@@ -165,6 +203,7 @@ class OllamaProvider:
             raise OllamaUnavailable(str(payload["error"]))
         message = payload.get("message", {})
         content = str(message.get("content", "")) if isinstance(message, dict) else ""
+        tool_calls = OllamaProvider._parse_tool_calls(message)
         return ChatChunk(
             content=content,
             done=bool(payload.get("done", False)),
@@ -172,7 +211,38 @@ class OllamaProvider:
             output_tokens=_optional_int(payload.get("eval_count")),
             total_duration_ns=_optional_int(payload.get("total_duration")),
             generation_duration_ns=_optional_int(payload.get("eval_duration")),
+            tool_calls=tool_calls,
         )
+
+    @staticmethod
+    def _parse_tool_calls(message: object) -> tuple[ToolCallRequest, ...]:
+        if not isinstance(message, dict):
+            return ()
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return ()
+        calls: list[ToolCallRequest] = []
+        for index, raw_call in enumerate(raw_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {"__invalid_arguments__": True}
+            call_id = raw_call.get("id")
+            calls.append(
+                ToolCallRequest(
+                    str(call_id) if isinstance(call_id, str) else f"ollama-{index}",
+                    name,
+                    arguments,
+                )
+            )
+        return tuple(calls)
 
 
 def _optional_int(value: object) -> int | None:
