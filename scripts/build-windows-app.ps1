@@ -54,6 +54,9 @@ if (-not $physicalBuildRoot.StartsWith($approvedBuildRoot + [System.IO.Path]::Di
 }
 $stagedApp = Join-Path $physicalBuildRoot 'app'
 $buildOutput = Join-Path $physicalBuildRoot 'output'
+$mcpDist = Join-Path $physicalBuildRoot 'mcp-dist'
+$mcpWork = Join-Path $physicalBuildRoot 'mcp-work'
+$mcpSpec = Join-Path $physicalBuildRoot 'mcp-spec'
 $previousCl = $env:CL
 
 New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -91,7 +94,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $appRoot 'README.md') -Destination $stagedApp -Force
     Copy-Item -LiteralPath (Join-Path $appRoot 'src') -Destination $stagedApp -Recurse -Force
 
-    & uv run --project $appRoot flet build windows $stagedApp `
+    & uv run --frozen --project $appRoot flet build windows $stagedApp `
         --output $buildOutput `
         --project local_llm_chat `
         --artifact LocalLLMChat `
@@ -105,6 +108,22 @@ try {
         throw "flet build windows failed with exit code $LASTEXITCODE."
     }
 
+    $mcpEntry = Join-Path $stagedApp 'src\local_llm_chat\infrastructure\mcp\local_notes_entry.py'
+    & uv run --frozen --project $appRoot pyinstaller `
+        --noconfirm `
+        --clean `
+        --onefile `
+        --console `
+        --name LocalNotesMCP `
+        --distpath $mcpDist `
+        --workpath $mcpWork `
+        --specpath $mcpSpec `
+        --paths (Join-Path $stagedApp 'src') `
+        $mcpEntry
+    if ($LASTEXITCODE -ne 0) {
+        throw "LocalNotesMCP build failed with exit code $LASTEXITCODE."
+    }
+
     $executable = Join-Path $buildOutput 'LocalLLMChat.exe'
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "Windows executable was not created: $executable"
@@ -114,6 +133,11 @@ try {
     Get-ChildItem -LiteralPath $buildOutput -Force | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $stageRoot -Recurse -Force
     }
+    $mcpExecutable = Join-Path $mcpDist 'LocalNotesMCP.exe'
+    if (-not (Test-Path -LiteralPath $mcpExecutable -PathType Leaf)) {
+        throw "Bundled MCP executable was not created: $mcpExecutable"
+    }
+    Copy-Item -LiteralPath $mcpExecutable -Destination $stageRoot -Force
     Copy-Item -LiteralPath (Join-Path $appRoot 'WINDOWS_PORTABLE_README.txt') -Destination (Join-Path $stageRoot 'はじめに.txt') -Force
     Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination $stageRoot -Force
 

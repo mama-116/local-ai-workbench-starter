@@ -39,10 +39,11 @@
 - 1発言3回、逐次実行、1回10秒、結果合計64KiBを強制する `ToolCoordinator`
 - Ollamaツール要求の実行と結果返却、最終回答生成、ツール非対応モデルの通常会話フォールバック
 - `CONTROL DESK` A案の許可フォルダー、取消し、利用可能ツール、実行中、直近結果、本文非表示の監査履歴導線
+- 固定コマンド・引数・SHA-256・Tools-only能力を検査し、会話ごとのMCP Rootsだけを読む同梱 `local-notes MCP`
 
 ## 検証済み
 
-- `pytest`: 110件成功
+- `pytest`: 140件成功
 - `mypy --strict`: エラー0件
 - Phase 5内蔵Toolsを実Ollamaの `qwen3.5:9b` で画面確認し、異なる2件の検索・読取り・確認コード回答・読取件数、`CONTROL DESK` の `実行中: 1件` から完了への遷移、入力・件数・サイズ・SHA-256・開始終了時刻、監査本文の非表示を確認
 - Windows上のFletネイティブ画面起動と3カラム表示
@@ -53,6 +54,7 @@
 - `CONTROL DESK` の再起動ボタンで新プロセスへ切り替わり、会話データが保持されることを利用者が画面確認
 - WindowsポータブルZIP 31.6 MiB、1267エントリ、EXE同梱、禁止ファイル0件、SHA-256一致
 - 配布版 `LocalLLMChat.exe` が12秒以上起動を維持し、検査終了後に対象プロセスだけを停止
+- 配布版 `LocalNotesMCP.exe` へ実stdio接続し、Tools-only能力、MCP Roots、UTF-8検索・読取り、正常終了を確認
 - 別のWindows 11 PCでZIPを展開し、`LocalLLMChat.exe` が起動することを利用者が確認
 - 別のWindows 11 PCでOllama会話が動作し、アプリ再起動後も会話履歴が保持されることを利用者が確認
 - 未署名EXEの初回起動時にMicrosoft Defender SmartScreenの発行元警告が表示されることを利用者が確認
@@ -64,7 +66,6 @@
 
 ## 初版後へ送るもの
 
-- Tools/MCP Phase 5のローカルMCP `stdio` 接続（内蔵ツール部分は実装済み）
 - Phase 7Aの承認付きメモ帳操作（設計済み、未実装）
 - Phase 7Bの許可フォルダー内の可逆なファイル整理と登録済みPowerShellレシピ（安全境界のみ決定、未実装。Phase 7A受入後に着手）
 - 意味検索が必要になった場合のローカル埋め込みモデル比較
