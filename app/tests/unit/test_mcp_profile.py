@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -49,6 +50,28 @@ def test_packaged_profile_uses_dedicated_console_server(
     assert profile.command == server_executable
     assert profile.arguments == ()
     assert profile.executable_sha256 == hashlib.sha256(b"stdio server").hexdigest()
+    McpProfilePolicy().require_trusted(profile)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows symlinks require privileges")
+def test_development_profile_preserves_virtualenv_python_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "python3.12"
+    launcher = tmp_path / "venv" / "bin" / "python"
+    runtime.write_bytes(b"base runtime")
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(runtime)
+    monkeypatch.setattr(sys, "executable", str(launcher))
+
+    profile = local_notes_profile()
+
+    assert profile.command == launcher
+    assert profile.arguments == (
+        "-m",
+        "local_llm_chat.infrastructure.mcp.local_notes_server",
+    )
+    assert profile.executable_sha256 == hashlib.sha256(b"base runtime").hexdigest()
     McpProfilePolicy().require_trusted(profile)
 
 

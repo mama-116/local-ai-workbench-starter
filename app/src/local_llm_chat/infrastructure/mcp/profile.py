@@ -49,11 +49,15 @@ class McpProfilePolicy:
 
     def require_trusted(self, profile: TrustedMcpProfile) -> None:
         command = Path(profile.command)
+        development_arguments = ("-m", _LOCAL_NOTES_MODULE)
         if command.name.casefold() in _SHELL_NAMES:
             raise ValidationError("MCPプロファイルはシェル経由で起動できません。")
         if not command.is_absolute():
             raise ValidationError("MCP実行ファイルは絶対パスで固定してください。")
-        if self._is_link_or_reparse_point(command):
+        if (
+            self._is_link_or_reparse_point(command)
+            and profile.arguments != development_arguments
+        ):
             raise ValidationError("MCP実行ファイルにリンクは使用できません。")
         try:
             resolved = command.resolve(strict=True)
@@ -89,7 +93,8 @@ class McpProfilePolicy:
 
 
 def local_notes_profile() -> TrustedMcpProfile:
-    runtime = Path(sys.executable).resolve(strict=True)
+    runtime = Path(sys.executable).absolute()
+    runtime.resolve(strict=True)
     bundled_server = runtime.with_name(_BUNDLED_SERVER_NAME)
     command = bundled_server.resolve(strict=True) if bundled_server.is_file() else runtime
     arguments = () if command == bundled_server else ("-m", _LOCAL_NOTES_MODULE)
@@ -97,7 +102,9 @@ def local_notes_profile() -> TrustedMcpProfile:
         name="local-notes",
         command=command,
         arguments=arguments,
-        executable_sha256=hashlib.sha256(command.read_bytes()).hexdigest(),
+        executable_sha256=hashlib.sha256(
+            command.resolve(strict=True).read_bytes()
+        ).hexdigest(),
         allowed_tools=_LOCAL_NOTES_TOOLS,
         environment=(),
         network_enabled=False,
