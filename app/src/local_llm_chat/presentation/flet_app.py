@@ -815,7 +815,7 @@ class LocalChatApp:
                     bgcolor="#2A2925" if selected else None,
                     border_radius=12,
                     padding=ft.Padding(12, 9, 12, 9),
-                    on_click=lambda cid=conversation.id: self.page.run_task(
+                    on_click=lambda _, cid=conversation.id: self.page.run_task(
                         self.select_conversation, cid
                     ),
                 )
