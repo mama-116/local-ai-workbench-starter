@@ -14,8 +14,8 @@ flowchart LR
     P -. Phase 7 .-> VL[vLLM on WSL2]
     O --> DB[(SQLiteログ)]
     O --> M[観測Service]
-    M --> C[交換可能な取得部品]
-    C --> DB
+    M --> COL[交換可能な取得部品]
+    COL --> DB
     O --> Q[上限付き翻訳Queue]
     Q --> F
     Q --> DB
@@ -28,14 +28,21 @@ flowchart LR
     T -. 明示設定 .-> D[DuckDuckGo]
     T --> A{承認ゲート}
     A --> X[外部投稿・削除・課金]
-    F -. 拒否 .-> C[Cloudモデル・有料API]
+    O -. Phase 7 .-> CU[ComputerUseCoordinator]
+    CU --> F
+    CU --> OBS[画面 + UI Automation観測]
+    CU --> CAP{操作Policy + 計画承認}
+    CAP --> ACT[固定許可されたローカルUI操作]
+    OBS --> DB
+    ACT --> DB
+    F -. 拒否 .-> CLD[Cloudモデル・有料API]
 ```
 
 ## データ区分
 
 | 区分 | 例 | 外部送信 |
 |---|---|---|
-| PRIVATE | 会話本文、RAG資料、プロンプト、個人ログ | 禁止 |
+| PRIVATE | 会話本文、RAG資料、プロンプト、個人ログ、スクリーンショット、UI構造、入力文 | 禁止 |
 | LOCAL_OPERATIONAL | モデル名、速度、CPU/GPU使用率 | 禁止 |
 | SEARCH_QUERY | PRIVATEから分離・短縮した検索語 | SearXNGへ送信可 |
 | PUBLIC_RESULT | 公開Web検索結果 | ローカル保存可 |
@@ -58,6 +65,8 @@ Ollamaは端末内・LAN内経由でもクラウドモデルを実行できる�
 |---|---|---|
 | AUTO_READ | ローカル読取、Web検索、状態取得 | 自動 |
 | AUTO_WRITE | 許可ワークスペース内の作成・更新 | 自動、全件ログ |
+| AUTO_LOCAL_UI | 利用者が登録した固定アプリ・固定操作・固定上限内のローカルUI操作 | 既定無効、10回連続成功後も利用者が明示有効化 |
+| PLAN_APPROVAL_REQUIRED | 起動、クリック、文字入力等の可逆なローカルUI操作 | 操作列、対象、入力全文、予算を一括承認。計画変更で失効 |
 | REVERSIBLE_DELETE | ローカルの退避・ゴミ箱移動 | 自動、Undo必須 |
 | APPROVAL_REQUIRED | 外部投稿、外部削除、課金、恒久削除 | 毎回承認 |
 | DENY | PRIVATEデータの外部送信、許可外パス操作、Cloudモデル、有料・費用不明Provider | 禁止 |
@@ -75,6 +84,9 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `model_profiles`: Provider、モデル、推論設定
 - `prompt_profiles`: system、character、task promptの版
 - `tool_calls`: 入力、結果、承認、失敗
+- `computer_use_runs`: 画面操作の目的、計画ハッシュ、承認、予算、状態
+- `computer_observations`: 前面アプリ、UI構造、スクリーンショットの相対パスとハッシュ
+- `computer_actions`: 操作型、対象、引数、リスク、前後観測、状態、失敗
 - `artifacts`: 設計書、ADR、コード、モック
 - `tasks`: 利用者に見せる次の一手と内部Issue参照
 - `documents` / `chunks`: RAG登録資料と断片
@@ -94,6 +106,16 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 `tool_calls` はUUID、会話、run、許可、Provider、ツール名、入力、状態、結果、時刻、失敗理由、結果ハッシュを保持する。結果本文は上限付きPRIVATEデータとしてSQLiteだけへ保存し、通常ログへ重複出力しない。状態値は `pending`、`running`、`completed`、`failed`、`denied` とし、再実行は別レコードへ追記する。詳細上限、UI、受入基準は [ADR-0014](adr/0014-start-read-only-tools-in-control-desk.md) を正本とする。
 
 画面はApplication層の許可Serviceと監査読取Serviceだけを呼び、ProviderやSQLiteを直接参照しない。監査一覧用の読取結果からはPRIVATEな結果本文を除外し、件数、サイズ、SHA-256、失敗理由、開始・終了時刻だけを返す。
+
+## Computer Use境界
+
+`computer_use_runs` の状態は `pending`、`awaiting_approval`、`running`、`completed`、`failed`、`cancelled`、`denied` とする。`computer_actions` の状態は `proposed`、`approved`、`running`、`completed`、`failed`、`cancelled`、`denied` とする。再実行は別runへ追記し、起動時に残った `running` は `failed` へ復旧して自動再開しない。
+
+初回のComputer Useは、固定されたメモ帳起動プロファイル、UI Automationで検証した要素へのクリック、200文字以内の通常文字入力だけを扱う。モデルは実行ファイル、パス、引数、任意座標、自由なキー列を指定できない。スクリーンショットと画面内文字は信頼できないPRIVATEな観測データであり、利用者の目的、固定許可、承認、予算を変更できない。
+
+操作計画はApplication層の `ComputerUseCoordinator` が `ActionPolicy` へ渡し、対象アプリ、操作型、前面状態、上限、承認を再検査してから1件ずつ実行する。実行直前と直後に画面とUI要素を再取得し、状態が変わった場合は入力せず停止する。UIからOS操作ProviderやSQLiteを直接呼ばない。
+
+スクリーンショット、UI構造、入力文、ウィンドウタイトルはPRIVATEとして利用者データ領域だけへ保存し、通常ログと配布物へ入れない。初回の上限、停止、受入基準は [ADR-0015](adr/0015-start-computer-use-with-approved-notepad-task.md) と [COMPUTER_USE_DESIGN.md](COMPUTER_USE_DESIGN.md) を正本とする。画像座標だけの操作、ゲーム、ブラウザ、外部送信は別ADRまで扱わない。
 
 ## 観測境界
 
