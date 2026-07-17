@@ -1,6 +1,6 @@
 {
   "name": "local-ai-builder-kit",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260717083623",
   "description": "初心者がCodexとの会話でLocalLLMアプリを安全に設計・実装するための補助輪Plugin",
   "author": {
     "name": "Munehiro Soma"
