@@ -46,7 +46,8 @@
 
 ## 検証済み
 
-- `pytest`: 184件成功（Windows固有条件により1件skip）
+- [S-01〜S-09受入記録](acceptance/S01-S09-2026-07-17.md)（独立展開したPhase 0診断と各基準の試験手順・実績）
+- `pytest`: 187件成功（Windows固有条件により1件skip）
 - `mypy --strict`: エラー0件
 - Phase 5内蔵Toolsを実Ollamaの `qwen3.5:9b` で画面確認し、異なる2件の検索・読取り・確認コード回答・読取件数、`CONTROL DESK` の `実行中: 1件` から完了への遷移、入力・件数・サイズ・SHA-256・開始終了時刻、監査本文の非表示を確認
 - Windows上のFletネイティブ画面起動と3カラム表示
