@@ -52,6 +52,46 @@ class JobRunState(StrEnum):
     FAILED = "failed"
 
 
+class AgentRunState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    DENIED = "denied"
+
+
+class AgentStepState(StrEnum):
+    PROPOSED = "proposed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
+    RESTORED = "restored"
+    RESTORE_FAILED = "restore_failed"
+
+
+class AgentToolEffect(StrEnum):
+    READ = "read"
+    REVERSIBLE_WRITE = "reversible_write"
+    EXTERNAL_POST = "external_post"
+    EXTERNAL_DELETE = "external_delete"
+    BILLING = "billing"
+
+
+class DataClassification(StrEnum):
+    PRIVATE = "private"
+    LOCAL_OPERATIONAL = "local_operational"
+    SEARCH_QUERY = "search_query"
+    PUBLIC_RESULT = "public_result"
+
+
+class AgentPolicyDecision(StrEnum):
+    ALLOW = "allow"
+    REQUIRE_APPROVAL = "require_approval"
+    DENY = "deny"
+
+
 class Locality(StrEnum):
     LOCAL = "local"
     LAN = "lan"

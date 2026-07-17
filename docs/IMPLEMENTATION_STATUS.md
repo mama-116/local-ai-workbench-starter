@@ -41,10 +41,12 @@
 - `CONTROL DESK` A案の許可フォルダー、取消し、利用可能ツール、実行中、直近結果、本文非表示の監査履歴導線
 - 固定コマンド・引数・SHA-256・Tools-only能力を検査し、会話ごとのMCP Rootsだけを読む同梱 `local-notes MCP`
 - SQLite transactionと一意制約で重複claimを防ぎ、失敗・再実行・起動復旧・停止を追記監査するPhase 6 Scheduler
+- 総予算5単位・最大5手・最大60秒・固定許可ツールを強制し、PRIVATE外部送信、許可外操作、承認再利用を拒否するPhase 7 Agent実行契約
+- Fake Providerの可逆操作を途中失敗時に逆順復元し、run/step、結果ハッシュ、拒否・復元理由をSQLiteへ追記するAgent監査
 
 ## 検証済み
 
-- `pytest`: 146件成功（Windows固有条件により1件skip）
+- `pytest`: 184件成功（Windows固有条件により1件skip）
 - `mypy --strict`: エラー0件
 - Phase 5内蔵Toolsを実Ollamaの `qwen3.5:9b` で画面確認し、異なる2件の検索・読取り・確認コード回答・読取件数、`CONTROL DESK` の `実行中: 1件` から完了への遷移、入力・件数・サイズ・SHA-256・開始終了時刻、監査本文の非表示を確認
 - Windows上のFletネイティブ画面起動と3カラム表示
