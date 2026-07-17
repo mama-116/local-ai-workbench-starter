@@ -45,6 +45,13 @@ class ContextSummaryState(StrEnum):
     FAILED = "failed"
 
 
+class JobRunState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Locality(StrEnum):
     LOCAL = "local"
     LAN = "lan"

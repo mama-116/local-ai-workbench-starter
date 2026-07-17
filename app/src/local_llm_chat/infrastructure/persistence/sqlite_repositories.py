@@ -5,7 +5,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from uuid import uuid4
@@ -24,12 +24,14 @@ from local_llm_chat.domain.models import (
     DocumentChunk,
     DocumentRecord,
     LatestTelemetry,
+    JobRun,
     Message,
     MessageCitation,
     MessageRagUsage,
     ModelProfile,
     RunRecord,
     RunSession,
+    ScheduledJob,
     RagCitation,
     RagSearchResult,
     TelemetryMetric,
@@ -43,6 +45,7 @@ from local_llm_chat.domain.states import (
     MessageRole,
     MessageState,
     ContextSummaryState,
+    JobRunState,
     RunState,
     TranslationState,
     ToolCallState,
@@ -65,6 +68,12 @@ def _now() -> str:
 
 def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValidationError("時刻にはtimezoneが必要です。")
+    return value.astimezone(UTC).isoformat()
 
 
 class SQLiteAppRepository:
@@ -171,8 +180,216 @@ class SQLiteAppRepository:
                 """,
                 (now,),
             )
+            connection.execute(
+                """
+                UPDATE job_runs
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
 
         await self._write(operation)
+
+    async def create_scheduled_job(
+        self,
+        job_id: str,
+        handler_name: str,
+        interval_seconds: int,
+        first_due_at: datetime,
+        payload: dict[str, object],
+    ) -> ScheduledJob:
+        if not job_id.strip() or not handler_name.strip():
+            raise ValidationError("ジョブIDとハンドラー名が必要です。")
+        if interval_seconds < 1:
+            raise ValidationError("実行間隔は1秒以上にしてください。")
+        due = _utc_iso(first_due_at)
+        created = _now()
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO scheduled_jobs(
+                    id, handler_name, interval_seconds, first_due_at,
+                    payload_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id.strip(),
+                    handler_name.strip(),
+                    interval_seconds,
+                    due,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    created,
+                ),
+            )
+
+        await self._write(operation)
+        return ScheduledJob(
+            job_id.strip(),
+            handler_name.strip(),
+            interval_seconds,
+            datetime.fromisoformat(due),
+            dict(payload),
+            datetime.fromisoformat(created),
+        )
+
+    async def claim_due_job(
+        self, now: datetime
+    ) -> tuple[ScheduledJob, JobRun] | None:
+        now_value = _utc_iso(now)
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[sqlite3.Row, sqlite3.Row] | None:
+            connection.execute("BEGIN IMMEDIATE")
+            candidates = connection.execute(
+                """
+                SELECT jobs.*,
+                    (
+                        SELECT scheduled_for FROM job_runs
+                        WHERE job_id = jobs.id AND attempt = 1
+                        ORDER BY scheduled_for DESC LIMIT 1
+                    ) AS last_scheduled_for
+                FROM scheduled_jobs jobs
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM job_runs running
+                    WHERE running.job_id = jobs.id AND running.state = 'running'
+                )
+                ORDER BY jobs.first_due_at, jobs.id
+                """
+            ).fetchall()
+            selected: tuple[sqlite3.Row, datetime] | None = None
+            now_time = datetime.fromisoformat(now_value)
+            for row in candidates:
+                last_value = row["last_scheduled_for"]
+                due_time = (
+                    datetime.fromisoformat(str(row["first_due_at"]))
+                    if last_value is None
+                    else datetime.fromisoformat(str(last_value))
+                    + timedelta(seconds=int(row["interval_seconds"]))
+                )
+                if due_time <= now_time and (
+                    selected is None or due_time < selected[1]
+                ):
+                    selected = (row, due_time)
+            if selected is None:
+                return None
+            job_row, due_time = selected
+            run_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO job_runs(
+                    id, job_id, scheduled_for, attempt, state,
+                    retry_of_run_id, created_at, started_at
+                ) VALUES(?, ?, ?, 1, 'running', NULL, ?, ?)
+                """,
+                (run_id, str(job_row["id"]), due_time.isoformat(), now_value, now_value),
+            )
+            run_row = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:  # pragma: no cover
+                raise PersistenceError("実行記録を作成できませんでした。")
+            return job_row, run_row
+
+        result = await self._write(operation)
+        if result is None:
+            return None
+        return self._scheduled_job_from_row(result[0]), self._job_run_from_row(result[1])
+
+    async def create_job_retry(
+        self, run_id: str, now: datetime
+    ) -> tuple[ScheduledJob, JobRun]:
+        now_value = _utc_iso(now)
+
+        def operation(connection: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3.Row]:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if source is None or str(source["state"]) != JobRunState.FAILED.value:
+                raise ValidationError("失敗した実行だけを再実行できます。")
+            attempt_row = connection.execute(
+                """
+                SELECT MAX(attempt) AS value FROM job_runs
+                WHERE job_id = ? AND scheduled_for = ?
+                """,
+                (source["job_id"], source["scheduled_for"]),
+            ).fetchone()
+            attempt = int(attempt_row["value"]) + 1
+            retry_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO job_runs(
+                    id, job_id, scheduled_for, attempt, state,
+                    retry_of_run_id, created_at, started_at
+                ) VALUES(?, ?, ?, ?, 'running', ?, ?, ?)
+                """,
+                (
+                    retry_id,
+                    source["job_id"],
+                    source["scheduled_for"],
+                    attempt,
+                    run_id,
+                    now_value,
+                    now_value,
+                ),
+            )
+            job_row = connection.execute(
+                "SELECT * FROM scheduled_jobs WHERE id = ?", (source["job_id"],)
+            ).fetchone()
+            run_row = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (retry_id,)
+            ).fetchone()
+            if job_row is None or run_row is None:  # pragma: no cover
+                raise PersistenceError("再実行記録を作成できませんでした。")
+            return job_row, run_row
+
+        job_row, run_row = await self._write(operation)
+        return self._scheduled_job_from_row(job_row), self._job_run_from_row(run_row)
+
+    async def finish_job_run(
+        self,
+        run_id: str,
+        state: JobRunState,
+        failure_reason: str | None = None,
+    ) -> JobRun:
+        if state not in {JobRunState.COMPLETED, JobRunState.FAILED}:
+            raise ValidationError("終了状態が不正です。")
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                SET state = ?, failure_reason = ?, completed_at = ?
+                WHERE id = ? AND state = 'running'
+                """,
+                (state.value, failure_reason, _now(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("実行中のジョブが見つかりません。")
+            row = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("実行記録が見つかりません。")
+            return row
+
+        return self._job_run_from_row(await self._write(operation))
+
+    async def list_job_runs(self, job_id: str) -> list[JobRun]:
+        rows = await self._read(
+            lambda connection: connection.execute(
+                """
+                SELECT * FROM job_runs WHERE job_id = ?
+                ORDER BY scheduled_for, attempt
+                """,
+                (job_id,),
+            ).fetchall()
+        )
+        return [self._job_run_from_row(row) for row in rows]
 
     async def set_tool_folder_grant(
         self, conversation_id: str, root_path: Path
@@ -1834,6 +2051,39 @@ class SQLiteAppRepository:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             completed_at=_parse_time(row["completed_at"]),
             error_code=str(row["error_code"]) if row["error_code"] else None,
+        )
+
+    @staticmethod
+    def _scheduled_job_from_row(row: sqlite3.Row) -> ScheduledJob:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise PersistenceError("定期ジョブの入力が壊れています。")
+        return ScheduledJob(
+            id=str(row["id"]),
+            handler_name=str(row["handler_name"]),
+            interval_seconds=int(row["interval_seconds"]),
+            first_due_at=datetime.fromisoformat(str(row["first_due_at"])),
+            payload=cast(dict[str, object], payload),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _job_run_from_row(row: sqlite3.Row) -> JobRun:
+        return JobRun(
+            id=str(row["id"]),
+            job_id=str(row["job_id"]),
+            scheduled_for=datetime.fromisoformat(str(row["scheduled_for"])),
+            attempt=int(row["attempt"]),
+            state=JobRunState(str(row["state"])),
+            retry_of_run_id=(
+                str(row["retry_of_run_id"]) if row["retry_of_run_id"] else None
+            ),
+            failure_reason=(
+                str(row["failure_reason"]) if row["failure_reason"] else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
         )
 
     @staticmethod
