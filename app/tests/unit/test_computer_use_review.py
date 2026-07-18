@@ -138,3 +138,21 @@ def test_focus_review_never_displays_more_than_contract_approval_timeout() -> No
 
     assert "承認期限まで 30秒" in copy
     assert "999秒" not in copy
+
+
+def test_focus_review_allows_fake_execution_without_claiming_host_isolation() -> None:
+    dialog = ComputerUseReviewDialog(
+        fixed_plan(),
+        safe_context(),
+        isolation_ready=False,
+        fake_only=True,
+    )
+
+    copy = "\n".join(_texts(dialog))
+
+    assert dialog.approve_button.disabled is False
+    assert dialog.approve_button.content == "Fakeで承認・実行"
+    assert "OS入力は0件" in copy
+    assert "隔離環境" not in copy
+    assert "固定メモ帳を起動" not in copy
+    assert "起動要求を検査" in copy

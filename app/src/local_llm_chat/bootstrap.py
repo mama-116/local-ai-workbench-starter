@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.computer_use_access_service import (
+    ComputerUseAccessService,
+)
+from local_llm_chat.application.services.computer_use_service import (
+    ComputerUseCoordinator,
+)
 from local_llm_chat.application.services.builtin_tool_provider import (
     BuiltInToolProvider,
     ToolAccessService,
@@ -20,6 +26,9 @@ from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.infrastructure.llm.ollama_registry import (
     LOCAL_PROVIDER_NAME,
     OllamaProviderRegistry,
+)
+from local_llm_chat.infrastructure.computer_use.fake_action_broker import (
+    FakeDesktopActionBroker,
 )
 from local_llm_chat.infrastructure.mcp.profile import local_notes_profile
 from local_llm_chat.infrastructure.mcp.tool_provider import TrustedMcpToolProvider
@@ -49,6 +58,7 @@ class AppContainer:
     chat: ChatService
     tool_access: ToolAccessService
     scheduler: SchedulerService
+    computer_use: ComputerUseAccessService
 
     async def close(self) -> None:
         await self.scheduler.close()
@@ -90,6 +100,10 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     )
     scheduler = SchedulerService(repository, {})
     scheduler.start()
+    computer_use = ComputerUseAccessService(
+        repository,
+        ComputerUseCoordinator(FakeDesktopActionBroker(repository)),
+    )
 
     return AppContainer(
         paths=paths,
@@ -103,6 +117,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         telemetry=telemetry,
         tool_access=tool_access,
         scheduler=scheduler,
+        computer_use=computer_use,
         chat=ChatService(
             repository,
             providers,

@@ -534,6 +534,23 @@ class SQLiteAppRepository:
             raise ValidationError("Computer Use runが見つかりません。")
         return self._computer_use_run_from_row(cast(sqlite3.Row, row))
 
+    async def list_computer_use_runs(
+        self, conversation_id: str, limit: int = 50
+    ) -> list[ComputerUseRun]:
+        if not 1 <= limit <= 100:
+            raise ValidationError("Computer Use履歴の件数は1〜100で指定してください。")
+        rows = await self._read(
+            lambda connection: connection.execute(
+                """
+                SELECT * FROM computer_use_runs
+                WHERE conversation_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (conversation_id, limit),
+            ).fetchall()
+        )
+        return [self._computer_use_run_from_row(row) for row in rows]
+
     async def create_computer_action(
         self, action: ComputerActionAudit
     ) -> ComputerActionAudit:

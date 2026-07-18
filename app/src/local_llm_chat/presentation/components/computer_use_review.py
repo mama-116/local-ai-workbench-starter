@@ -23,6 +23,7 @@ class ComputerUseReviewDialog(ft.AlertDialog):
         context: DesktopSecurityContext,
         *,
         isolation_ready: bool,
+        fake_only: bool = False,
         isolation_label: str = "未選定",
         remaining_seconds: int = 30,
         on_approve: Callable[[Any], Any] | None = None,
@@ -36,7 +37,11 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             0,
             min(remaining_seconds, int(plan.limits.approval_timeout_seconds)),
         )
-        can_approve = plan_allowed and isolation_ready and displayed_seconds > 0
+        can_approve = (
+            plan_allowed
+            and (isolation_ready or fake_only)
+            and displayed_seconds > 0
+        )
         type_action = next(
             (
                 action
@@ -77,6 +82,12 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             ),
             "✓ 保存・削除・設定変更なし",
         ]
+        if fake_only:
+            status_lines = [
+                "✓ Fake Brokerのみ — OS入力は0件",
+                "✓ 固定3操作の契約検査だけを実行",
+                "✓ 保存・削除・設定変更なし",
+            ]
         if not plan_allowed:
             status_lines.append(
                 f"✕ 安全検査: {policy_result.reason or 'plan_denied'}"
@@ -85,7 +96,7 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             status_lines.append("✕ 承認期限切れ")
 
         self.approve_button = ft.Button(
-            "この計画を承認",
+            "Fakeで承認・実行" if fake_only else "この計画を承認",
             bgcolor="#F2A65A" if can_approve else "#34332F",
             color="#17120D" if can_approve else "#77736B",
             disabled=not can_approve,
@@ -119,15 +130,25 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             content=ft.Column(
                 [
                     ft.Text(
-                        f"{isolation_label} / メモ帳",
+                        (
+                            "Fake安全シミュレーション / メモ帳"
+                            if fake_only
+                            else f"{isolation_label} / メモ帳"
+                        ),
                         size=14,
                         weight=ft.FontWeight.W_600,
                         color="#F3F0E8",
                     ),
                     ft.Text(
-                        "1. 固定メモ帳を起動\n"
-                        "2. UI Automationで編集領域を一意確認\n"
-                        "3. 入力後、保存せず停止",
+                        (
+                            "1. 固定メモ帳の起動要求を検査\n"
+                            "2. 固定UIA対象のクリック要求を検査\n"
+                            "3. 文字入力要求を検査（実入力なし）"
+                            if fake_only
+                            else "1. 固定メモ帳を起動\n"
+                            "2. UI Automationで編集領域を一意確認\n"
+                            "3. 入力後、保存せず停止"
+                        ),
                         size=11,
                         color="#AAA69D",
                     ),

@@ -17,6 +17,7 @@ from local_llm_chat.domain.errors import AppError
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
+    ComputerUseRun,
     Conversation,
     DocumentRecord,
     LatestTelemetry,
@@ -28,9 +29,17 @@ from local_llm_chat.domain.models import (
     TelemetryMetric,
     ToolCallAudit,
     ToolFolderGrant,
+    DesktopSecurityContext,
     utc_now,
 )
-from local_llm_chat.domain.states import MessageRole, MessageState
+from local_llm_chat.domain.states import (
+    DesktopIntegrityLevel,
+    MessageRole,
+    MessageState,
+)
+from local_llm_chat.presentation.components.computer_use_review import (
+    ComputerUseReviewDialog,
+)
 from local_llm_chat.presentation.components.message_bubble import MessageBubble
 
 ACCENT = "#F2A65A"
@@ -67,6 +76,7 @@ class LocalChatApp:
         self.latest_telemetry: LatestTelemetry | None = None
         self.tool_folder_grant: ToolFolderGrant | None = None
         self.tool_audits: list[ToolCallAudit] = []
+        self.computer_use_runs: list[ComputerUseRun] = []
         self.selected_conversation_id: str | None = None
         self.guard_error: str | None = None
         self.selected_provider_name: str | None = None
@@ -260,6 +270,54 @@ class LocalChatApp:
                 spacing=7,
             ),
         )
+        self.computer_use_recent_text = ft.Text(
+            "直近結果: なし", size=10, color=MUTED
+        )
+        self.computer_use_start_button = ft.Button(
+            "Fake安全テスト",
+            icon=ft.Icons.PREVIEW_ROUNDED,
+            color="#17120D",
+            bgcolor=ACCENT,
+            on_click=self.show_computer_use_review,
+            disabled=True,
+        )
+        self.computer_use_history_button = ft.Button(
+            "監査履歴を開く",
+            icon=ft.Icons.HISTORY_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_computer_use_audit_dialog,
+            disabled=True,
+        )
+        self.computer_use_card = ft.Container(
+            bgcolor="#242421",
+            border_radius=14,
+            padding=12,
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.COMPUTER_ROUNDED, size=16, color=ACCENT),
+                            ft.Text(
+                                "COMPUTER USE",
+                                size=11,
+                                weight=ft.FontWeight.W_600,
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                    ft.Text(
+                        "Fake Brokerのみ。マウス・キーボード入力は送信しません。",
+                        size=10,
+                        color=MUTED,
+                    ),
+                    self.computer_use_recent_text,
+                    self.computer_use_start_button,
+                    self.computer_use_history_button,
+                ],
+                spacing=7,
+            ),
+        )
         self.character_dropdown = self._dropdown("キャラクター")
         self.character_dropdown.on_select = self.update_selection
         self.connection_dropdown = self._dropdown("Ollama接続先")
@@ -395,6 +453,7 @@ class LocalChatApp:
                     self.guard_detail,
                     self.telemetry_card,
                     self.tool_card,
+                    self.computer_use_card,
                     ft.Button(
                         "状態を再確認",
                         icon=ft.Icons.REFRESH_ROUNDED,
@@ -465,7 +524,26 @@ class LocalChatApp:
         await self._refresh_selected_conversation()
         await self._refresh_telemetry()
         await self._refresh_tools()
+        await self._refresh_computer_use()
         self.page.update()
+
+    async def _refresh_computer_use(self) -> None:
+        conversation_id = self.selected_conversation_id
+        self.computer_use_runs = (
+            await self.container.computer_use.history(conversation_id)
+            if conversation_id is not None
+            else []
+        )
+        self.computer_use_start_button.disabled = conversation_id is None
+        self.computer_use_history_button.disabled = not self.computer_use_runs
+        if not self.computer_use_runs:
+            self.computer_use_recent_text.value = "直近結果: なし"
+            return
+        latest = self.computer_use_runs[0]
+        reason = f" · {latest.failure_reason}" if latest.failure_reason else ""
+        self.computer_use_recent_text.value = (
+            f"直近結果: {latest.state.value}{reason} · OS入力0件"
+        )
 
     async def _refresh_tools(self) -> None:
         conversation_id = self.selected_conversation_id
@@ -918,6 +996,135 @@ class LocalChatApp:
         await self._refresh_tools()
         self.page.update(self.tool_card)
         self._toast("フォルダーの許可を取り消しました。", MINT)
+
+    async def show_computer_use_review(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            self._toast("先に会話を選択してください。", ERROR)
+            return
+        try:
+            plan, run = await self.container.computer_use.stage_fake_notepad_plan(
+                conversation_id, "安全なFake実行🙂"
+            )
+        except AppError as error:
+            self._toast(str(error), ERROR)
+            return
+
+        async def approve(_event: Any = None) -> None:
+            try:
+                completed = (
+                    await self.container.computer_use.approve_and_execute_fake(
+                        run.id, plan, self._fake_security_context()
+                    )
+                )
+            except AppError as error:
+                self._toast(str(error), ERROR)
+                return
+            self.page.pop_dialog()
+            await self._refresh_computer_use()
+            self.page.update(self.computer_use_card)
+            if completed.failure_reason:
+                self._toast(
+                    f"Fake安全テスト: {completed.state.value} "
+                    f"({completed.failure_reason})",
+                    ERROR,
+                )
+            else:
+                self._toast("Fake安全テスト完了。OS入力は0件です。", MINT)
+
+        async def cancel(_event: Any = None) -> None:
+            try:
+                await self.container.computer_use.cancel(run.id)
+            except AppError as error:
+                self._toast(str(error), ERROR)
+                return
+            self.page.pop_dialog()
+            await self._refresh_computer_use()
+            self.page.update(self.computer_use_card)
+            self._toast("Fake計画を取り消しました。OS入力は0件です。", MUTED)
+
+        self.page.show_dialog(
+            ComputerUseReviewDialog(
+                plan,
+                self._fake_security_context(),
+                isolation_ready=False,
+                fake_only=True,
+                on_approve=approve,
+                on_cancel=cancel,
+            )
+        )
+
+    async def show_computer_use_audit_dialog(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None:
+            return
+        self.computer_use_runs = await self.container.computer_use.history(
+            conversation_id
+        )
+        items: list[ft.Control] = []
+        for run in self.computer_use_runs:
+            actions = await self.container.computer_use.actions(run.id)
+            action_lines = "\n".join(
+                f"{action.ordinal}. {action.request.action_type.value}: "
+                f"{action.state.value}"
+                for action in actions
+            )
+            completed = (
+                run.completed_at.astimezone().strftime("%Y/%m/%d %H:%M:%S")
+                if run.completed_at is not None
+                else "未完了"
+            )
+            reason = f"\n理由: {run.failure_reason}" if run.failure_reason else ""
+            items.append(
+                ft.Container(
+                    bgcolor="#2A2925",
+                    border_radius=12,
+                    padding=12,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"{run.state.value} · OS入力0件",
+                                size=12,
+                                color=MINT if not run.failure_reason else ERROR,
+                                weight=ft.FontWeight.W_600,
+                            ),
+                            ft.Text(
+                                f"{run.objective}\n{action_lines}\n完了: {completed}"
+                                f"{reason}",
+                                size=10,
+                                color=MUTED,
+                                selectable=True,
+                            ),
+                        ],
+                        spacing=5,
+                    ),
+                )
+            )
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="Computer Use監査（Fakeのみ）",
+                bgcolor="#24231F",
+                content=ft.ListView(items, spacing=8, width=560, height=420),
+                actions=[ft.Button("閉じる", on_click=self._close_dialog)],
+            )
+        )
+
+    @staticmethod
+    def _fake_security_context() -> DesktopSecurityContext:
+        # These are contract-test values, not observations of the host OS.
+        return DesktopSecurityContext(
+            "fake-standard-user",
+            "fake-standard-user",
+            1,
+            1,
+            DesktopIntegrityLevel.MEDIUM,
+            DesktopIntegrityLevel.MEDIUM,
+            False,
+            False,
+            False,
+            False,
+        )
 
     async def show_tool_audit_dialog(self) -> None:
         conversation_id = self.selected_conversation_id
