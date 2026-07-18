@@ -762,22 +762,43 @@ class SQLiteAppRepository:
         await self._write(operation)
 
     async def verify_and_consume(
-        self, approval: ComputerPlanApproval, plan_hash: str
+        self,
+        approval: ComputerPlanApproval,
+        plan_hash: str,
+        verified_at: datetime | None = None,
     ) -> bool:
         approved_at = _utc_iso(approval.approved_at)
+        verified_time: datetime | None = None
+        if verified_at is not None:
+            _utc_iso(verified_at)
+            verified_time = verified_at.astimezone(UTC)
 
         def operation(connection: sqlite3.Connection) -> bool:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT run_id FROM computer_plan_approvals
-                WHERE id = ? AND plan_hash = ? AND approved_at = ?
-                  AND consumed_at IS NULL
+                SELECT approvals.run_id, runs.created_at,
+                       runs.approval_timeout_seconds
+                FROM computer_plan_approvals approvals
+                JOIN computer_use_runs runs ON runs.id = approvals.run_id
+                WHERE approvals.id = ? AND approvals.plan_hash = ?
+                  AND approvals.approved_at = ?
+                  AND approvals.consumed_at IS NULL
                 """,
                 (approval.id, plan_hash, approved_at),
             ).fetchone()
             if row is None:
                 return False
+            if verified_time is not None:
+                created_at = datetime.fromisoformat(str(row["created_at"]))
+                deadline = created_at + timedelta(
+                    seconds=float(row["approval_timeout_seconds"])
+                )
+                approval_time = approval.approved_at.astimezone(UTC)
+                if not (
+                    created_at <= approval_time <= verified_time < deadline
+                ):
+                    return False
             run_id = str(row["run_id"])
             audit = connection.execute(
                 """

@@ -36,7 +36,10 @@ class OneTimeApprovalVerifier:
         self.consumed: set[str] = set()
 
     async def verify_and_consume(
-        self, approval: ComputerPlanApproval, plan_hash: str
+        self,
+        approval: ComputerPlanApproval,
+        plan_hash: str,
+        _verified_at: datetime,
     ) -> bool:
         if (
             approval.id not in self.valid_ids
@@ -285,7 +288,10 @@ class BlockingApprovalVerifier:
         self.release = asyncio.Event()
 
     async def verify_and_consume(
-        self, _approval: ComputerPlanApproval, _plan_hash: str
+        self,
+        _approval: ComputerPlanApproval,
+        _plan_hash: str,
+        _verified_at: datetime,
     ) -> bool:
         self.entered.set()
         await self.release.wait()

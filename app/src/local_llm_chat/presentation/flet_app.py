@@ -82,6 +82,7 @@ class LocalChatApp:
         self.selected_provider_name: str | None = None
         self._generation_task: asyncio.Task[Any] | None = None
         self._generation_conversation_id: str | None = None
+        self._computer_use_approval_task: asyncio.Task[None] | None = None
 
         self.conversation_list = ft.ListView(expand=True, spacing=5, padding=0)
         self.message_list = ft.ListView(
@@ -1011,6 +1012,7 @@ class LocalChatApp:
             return
 
         async def approve(_event: Any = None) -> None:
+            self._cancel_computer_use_approval_timer()
             try:
                 completed = (
                     await self.container.computer_use.approve_and_execute_fake(
@@ -1018,6 +1020,8 @@ class LocalChatApp:
                     )
                 )
             except AppError as error:
+                dialog.set_remaining_seconds(0)
+                self.page.update(dialog)
                 self._toast(str(error), ERROR)
                 return
             self.page.pop_dialog()
@@ -1033,6 +1037,7 @@ class LocalChatApp:
                 self._toast("Fake安全テスト完了。OS入力は0件です。", MINT)
 
         async def cancel(_event: Any = None) -> None:
+            self._cancel_computer_use_approval_timer()
             try:
                 await self.container.computer_use.cancel(run.id)
             except AppError as error:
@@ -1043,16 +1048,57 @@ class LocalChatApp:
             self.page.update(self.computer_use_card)
             self._toast("Fake計画を取り消しました。OS入力は0件です。", MUTED)
 
-        self.page.show_dialog(
-            ComputerUseReviewDialog(
-                plan,
-                self._fake_security_context(),
-                isolation_ready=False,
-                fake_only=True,
-                on_approve=approve,
-                on_cancel=cancel,
-            )
+        dialog = ComputerUseReviewDialog(
+            plan,
+            self._fake_security_context(),
+            isolation_ready=False,
+            fake_only=True,
+            on_approve=approve,
+            on_cancel=cancel,
         )
+        self.page.show_dialog(dialog)
+        self._computer_use_approval_task = asyncio.create_task(
+            self._watch_computer_use_approval(run.id, dialog)
+        )
+
+    async def _watch_computer_use_approval(
+        self, run_id: str, dialog: ComputerUseReviewDialog
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                remaining = (
+                    await self.container.computer_use.approval_remaining_seconds(
+                        run_id
+                    )
+                )
+                dialog.set_remaining_seconds(remaining)
+                self.page.update(dialog)
+                if remaining <= 0:
+                    await self.container.computer_use.expire(run_id)
+                    self.page.pop_dialog()
+                    await self._refresh_computer_use()
+                    self.page.update(self.computer_use_card)
+                    self._toast(
+                        "承認期限が切れました。Fake実行は開始していません。",
+                        ERROR,
+                    )
+                    return
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            return
+        except AppError as error:
+            dialog.set_remaining_seconds(0)
+            self.page.update(dialog)
+            self._toast(str(error), ERROR)
+        finally:
+            if self._computer_use_approval_task is current_task:
+                self._computer_use_approval_task = None
+
+    def _cancel_computer_use_approval_timer(self) -> None:
+        if self._computer_use_approval_task is not None:
+            self._computer_use_approval_task.cancel()
+            self._computer_use_approval_task = None
 
     async def show_computer_use_audit_dialog(self) -> None:
         conversation_id = self.selected_conversation_id
@@ -1820,6 +1866,7 @@ class LocalChatApp:
         )
 
     async def close(self) -> None:
+        self._cancel_computer_use_approval_timer()
         if self._generation_task is not None:
             self._generation_task.cancel()
         await self.container.close()

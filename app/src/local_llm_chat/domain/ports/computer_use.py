@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from local_llm_chat.domain.models import (
@@ -14,7 +15,10 @@ from local_llm_chat.domain.models import (
 
 class ComputerPlanApprovalVerifier(Protocol):
     async def verify_and_consume(
-        self, approval: ComputerPlanApproval, plan_hash: str
+        self,
+        approval: ComputerPlanApproval,
+        plan_hash: str,
+        verified_at: datetime,
     ) -> bool: ...
 
 

@@ -37,11 +37,11 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             0,
             min(remaining_seconds, int(plan.limits.approval_timeout_seconds)),
         )
-        can_approve = (
+        can_approve_when_fresh = (
             plan_allowed
             and (isolation_ready or fake_only)
-            and displayed_seconds > 0
         )
+        can_approve = can_approve_when_fresh and displayed_seconds > 0
         type_action = next(
             (
                 action
@@ -92,8 +92,19 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             status_lines.append(
                 f"✕ 安全検査: {policy_result.reason or 'plan_denied'}"
             )
-        if displayed_seconds <= 0:
-            status_lines.append("✕ 承認期限切れ")
+        self._status_lines = tuple(status_lines)
+        self._can_approve_when_fresh = can_approve_when_fresh
+        self._max_remaining_seconds = int(plan.limits.approval_timeout_seconds)
+        self.deadline_text = ft.Text(
+            f"承認期限まで {displayed_seconds}秒",
+            size=11,
+            color="#F2A65A",
+        )
+        self.status_text = ft.Text(
+            "\n".join(status_lines),
+            size=11,
+            color="#55C2A3" if can_approve else "#D87866",
+        )
 
         self.approve_button = ft.Button(
             "Fakeで承認・実行" if fake_only else "この計画を承認",
@@ -119,11 +130,7 @@ class ComputerUseReviewDialog(ft.AlertDialog):
                         weight=ft.FontWeight.W_700,
                         color="#F3F0E8",
                     ),
-                    ft.Text(
-                        f"承認期限まで {displayed_seconds}秒",
-                        size=11,
-                        color="#F2A65A",
-                    ),
+                    self.deadline_text,
                 ],
                 spacing=3,
             ),
@@ -163,11 +170,7 @@ class ComputerUseReviewDialog(ft.AlertDialog):
                         border_radius=10,
                         padding=12,
                     ),
-                    ft.Text(
-                        "\n".join(status_lines),
-                        size=11,
-                        color="#55C2A3" if can_approve else "#D87866",
-                    ),
+                    self.status_text,
                     ft.Container(
                         content=ft.Text(
                             "計画が1文字でも変わると承認は失効します。"
@@ -187,3 +190,21 @@ class ComputerUseReviewDialog(ft.AlertDialog):
             ),
             actions=[self.cancel_button, self.approve_button],
         )
+        self.set_remaining_seconds(displayed_seconds)
+
+    def set_remaining_seconds(self, remaining_seconds: int) -> None:
+        displayed_seconds = max(
+            0, min(remaining_seconds, self._max_remaining_seconds)
+        )
+        fresh = displayed_seconds > 0
+        can_approve = self._can_approve_when_fresh and fresh
+        self.deadline_text.value = f"承認期限まで {displayed_seconds}秒"
+        self.deadline_text.color = "#F2A65A" if fresh else "#D87866"
+        lines = list(self._status_lines)
+        if not fresh:
+            lines.append("✕ 承認期限切れ")
+        self.status_text.value = "\n".join(lines)
+        self.status_text.color = "#55C2A3" if can_approve else "#D87866"
+        self.approve_button.disabled = not can_approve
+        self.approve_button.bgcolor = "#F2A65A" if can_approve else "#34332F"
+        self.approve_button.color = "#17120D" if can_approve else "#77736B"

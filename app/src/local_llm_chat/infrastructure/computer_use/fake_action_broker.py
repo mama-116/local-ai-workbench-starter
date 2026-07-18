@@ -50,16 +50,17 @@ class FakeDesktopActionBroker:
             if result.decision is ComputerPolicyDecision.DENY:
                 raise ComputerActionDenied(result.reason or "plan_denied")
             plan_hash = computer_plan_hash(plan)
+            verified_at = self._clock()
             if (
                 approval is None
                 or not approval.id
                 or approval.plan_hash != plan_hash
-                or not self._approval_is_fresh(plan, approval)
+                or not self._approval_is_fresh(plan, approval, verified_at)
             ):
                 raise ComputerActionDenied("plan_approval_required")
             try:
                 approved = await self._approval_verifier.verify_and_consume(
-                    approval, plan_hash
+                    approval, plan_hash, verified_at
                 )
             except Exception:
                 approved = False
@@ -83,12 +84,14 @@ class FakeDesktopActionBroker:
         self.stop_calls += 1
 
     def _approval_is_fresh(
-        self, plan: ComputerPlan, approval: ComputerPlanApproval
+        self,
+        plan: ComputerPlan,
+        approval: ComputerPlanApproval,
+        now: datetime,
     ) -> bool:
         approved_at = approval.approved_at
         if approved_at.tzinfo is None or approved_at.utcoffset() is None:
             return False
-        now = self._clock()
         if now.tzinfo is None or now.utcoffset() is None:
             return False
         age_seconds = (

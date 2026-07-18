@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -109,7 +110,11 @@ class ComputerUseAccessService:
             or run.conversation_id != plan.conversation_id
         ):
             raise ValidationError("承認対象のFake計画が一致しません。")
-        approval = ComputerPlanApproval(str(uuid4()), plan_hash, self._aware_now())
+        now = self._aware_now()
+        if self._remaining_seconds(run, now) <= 0:
+            await self._cancel_with_reason(run, "approval_expired", now)
+            raise ValidationError("承認期限が切れました。")
+        approval = ComputerPlanApproval(str(uuid4()), plan_hash, now)
         await self._repository.create_computer_plan_approval(run.id, approval)
         execution = await self._coordinator.execute(plan, context, approval)
         now = self._aware_now()
@@ -172,15 +177,36 @@ class ComputerUseAccessService:
         run = await self._repository.get_computer_use_run(run_id)
         if run.state is not ComputerUseRunState.AWAITING_APPROVAL:
             raise ValidationError("承認待ちのFake計画だけを取り消せます。")
+        return await self._cancel_with_reason(
+            run, "user_cancelled", self._aware_now()
+        )
+
+    async def expire(self, run_id: str) -> ComputerUseRun:
+        run = await self._repository.get_computer_use_run(run_id)
+        if run.state is not ComputerUseRunState.AWAITING_APPROVAL:
+            return run
         now = self._aware_now()
+        if self._remaining_seconds(run, now) > 0:
+            raise ValidationError("承認期限はまだ切れていません。")
+        return await self._cancel_with_reason(run, "approval_expired", now)
+
+    async def approval_remaining_seconds(self, run_id: str) -> int:
+        run = await self._repository.get_computer_use_run(run_id)
+        if run.state is not ComputerUseRunState.AWAITING_APPROVAL:
+            return 0
+        return self._remaining_seconds(run, self._aware_now())
+
+    async def _cancel_with_reason(
+        self, run: ComputerUseRun, reason: str, now: datetime
+    ) -> ComputerUseRun:
         await self._finish_actions(
-            run.id, ComputerActionState.CANCELLED, "user_cancelled", now
+            run.id, ComputerActionState.CANCELLED, reason, now
         )
         return await self._repository.finish_computer_use_run(
             replace(
                 run,
                 state=ComputerUseRunState.CANCELLED,
-                failure_reason="user_cancelled",
+                failure_reason=reason,
                 completed_at=now,
             )
         )
@@ -220,3 +246,11 @@ class ComputerUseAccessService:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return now
+
+    @staticmethod
+    def _remaining_seconds(run: ComputerUseRun, now: datetime) -> int:
+        age = (now.astimezone(UTC) - run.created_at.astimezone(UTC)).total_seconds()
+        if age < 0:
+            return 0
+        remaining = run.limits.approval_timeout_seconds - age
+        return max(0, math.ceil(remaining))

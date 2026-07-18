@@ -156,3 +156,16 @@ def test_focus_review_allows_fake_execution_without_claiming_host_isolation() ->
     assert "隔離環境" not in copy
     assert "固定メモ帳を起動" not in copy
     assert "起動要求を検査" in copy
+
+
+def test_focus_review_disables_approval_when_live_deadline_expires() -> None:
+    dialog = ComputerUseReviewDialog(
+        fixed_plan(), safe_context(), isolation_ready=False, fake_only=True
+    )
+
+    dialog.set_remaining_seconds(0)
+
+    copy = "\n".join(_texts(dialog))
+    assert dialog.approve_button.disabled is True
+    assert "承認期限まで 0秒" in copy
+    assert "承認期限切れ" in copy
