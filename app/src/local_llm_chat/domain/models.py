@@ -22,6 +22,7 @@ from local_llm_chat.domain.states import (
     ContextSummaryState,
     JobRunState,
     ComputerActionType,
+    ComputerActionState,
     ComputerPolicyDecision,
     ComputerUseRunState,
     DesktopIntegrityLevel,
@@ -556,3 +557,32 @@ class ComputerUseExecution:
     state: ComputerUseRunState
     failure_reason: str | None
     completed_action_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerUseRun:
+    id: str
+    conversation_id: str
+    objective: str
+    observation_id: str
+    plan_hash: str
+    limits: ComputerUseLimits
+    planned_action_count: int
+    state: ComputerUseRunState
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerActionAudit:
+    id: str
+    run_id: str
+    ordinal: int
+    request: ComputerActionRequest
+    state: ComputerActionState
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None

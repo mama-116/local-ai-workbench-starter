@@ -122,6 +122,16 @@ class ComputerUseRunState(StrEnum):
     DENIED = "denied"
 
 
+class ComputerActionState(StrEnum):
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    DENIED = "denied"
+
+
 class ComputerPolicyDecision(StrEnum):
     ALLOW = "allow"
     REQUIRE_APPROVAL = "require_approval"

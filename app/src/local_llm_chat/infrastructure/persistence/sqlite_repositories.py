@@ -19,6 +19,11 @@ from local_llm_chat.domain.models import (
     AgentExecutionLimits,
     AgentRun,
     AgentStep,
+    ComputerActionAudit,
+    ComputerActionRequest,
+    ComputerPlanApproval,
+    ComputerUseLimits,
+    ComputerUseRun,
     BranchInfo,
     CharacterVersion,
     Conversation,
@@ -47,6 +52,9 @@ from local_llm_chat.domain.models import (
 from local_llm_chat.domain.states import (
     AgentRunState,
     AgentStepState,
+    ComputerActionState,
+    ComputerActionType,
+    ComputerUseRunState,
     AgentToolEffect,
     DataClassification,
     CostClass,
@@ -213,6 +221,24 @@ class SQLiteAppRepository:
                 SET state = 'failed', completed_at = ?,
                     failure_reason = 'previous_session_interrupted'
                 WHERE state IN ('pending', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE computer_actions
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('proposed', 'approved', 'running')
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE computer_use_runs
+                SET state = 'failed', completed_at = ?,
+                    failure_reason = 'previous_session_interrupted'
+                WHERE state IN ('pending', 'awaiting_approval', 'running')
                 """,
                 (now,),
             )
@@ -451,6 +477,333 @@ class SQLiteAppRepository:
                 (value,),
             )
             return cursor.rowcount
+
+        return await self._write(operation)
+
+    async def create_computer_use_run(
+        self, run: ComputerUseRun
+    ) -> ComputerUseRun:
+        if run.state is not ComputerUseRunState.AWAITING_APPROVAL:
+            raise ValidationError(
+                "Computer Use runはawaiting_approval状態で開始してください。"
+            )
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            connection.execute(
+                """
+                INSERT INTO computer_use_runs(
+                    id, conversation_id, objective, observation_id, plan_hash,
+                    max_actions, max_duration_seconds, approval_timeout_seconds,
+                    planned_action_count, state, failure_reason,
+                    created_at, started_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.id,
+                    run.conversation_id,
+                    run.objective,
+                    run.observation_id,
+                    run.plan_hash,
+                    run.limits.max_actions,
+                    run.limits.max_duration_seconds,
+                    run.limits.approval_timeout_seconds,
+                    run.planned_action_count,
+                    run.state.value,
+                    run.failure_reason,
+                    _utc_iso(run.created_at),
+                    None,
+                    None,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM computer_use_runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Computer Use runを作成できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._computer_use_run_from_row(await self._write(operation))
+
+    async def get_computer_use_run(self, run_id: str) -> ComputerUseRun:
+        row = await self._read(
+            lambda connection: connection.execute(
+                "SELECT * FROM computer_use_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        )
+        if row is None:
+            raise ValidationError("Computer Use runが見つかりません。")
+        return self._computer_use_run_from_row(cast(sqlite3.Row, row))
+
+    async def create_computer_action(
+        self, action: ComputerActionAudit
+    ) -> ComputerActionAudit:
+        if action.state is not ComputerActionState.PROPOSED:
+            raise ValidationError("Computer actionはproposed状態で作成してください。")
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            run = connection.execute(
+                "SELECT state FROM computer_use_runs WHERE id = ?",
+                (action.run_id,),
+            ).fetchone()
+            if (
+                run is None
+                or str(run["state"])
+                != ComputerUseRunState.AWAITING_APPROVAL.value
+            ):
+                raise ValidationError("承認前のComputer Use runへだけ追加できます。")
+            connection.execute(
+                """
+                INSERT INTO computer_actions(
+                    id, run_id, ordinal, request_id, action_type,
+                    target_profile_id, input_text, state, failure_reason,
+                    created_at, started_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action.id,
+                    action.run_id,
+                    action.ordinal,
+                    action.request.id,
+                    action.request.action_type.value,
+                    action.request.target_profile_id,
+                    action.request.text,
+                    action.state.value,
+                    action.failure_reason,
+                    _utc_iso(action.created_at),
+                    None,
+                    None,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM computer_actions WHERE id = ?", (action.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Computer actionを作成できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._computer_action_from_row(await self._write(operation))
+
+    async def list_computer_actions(
+        self, run_id: str
+    ) -> list[ComputerActionAudit]:
+        rows = await self._read(
+            lambda connection: connection.execute(
+                """
+                SELECT * FROM computer_actions
+                WHERE run_id = ? ORDER BY ordinal
+                """,
+                (run_id,),
+            ).fetchall()
+        )
+        return [self._computer_action_from_row(row) for row in rows]
+
+    async def update_computer_action(
+        self, action: ComputerActionAudit
+    ) -> ComputerActionAudit:
+        transitions = {
+            ComputerActionState.PROPOSED: {
+                ComputerActionState.APPROVED,
+                ComputerActionState.DENIED,
+                ComputerActionState.FAILED,
+                ComputerActionState.CANCELLED,
+            },
+            ComputerActionState.APPROVED: {
+                ComputerActionState.RUNNING,
+                ComputerActionState.FAILED,
+                ComputerActionState.CANCELLED,
+            },
+            ComputerActionState.RUNNING: {
+                ComputerActionState.COMPLETED,
+                ComputerActionState.FAILED,
+                ComputerActionState.CANCELLED,
+            },
+        }
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            current = connection.execute(
+                "SELECT state FROM computer_actions WHERE id = ? AND run_id = ?",
+                (action.id, action.run_id),
+            ).fetchone()
+            if current is None:
+                raise ValidationError("Computer actionが見つかりません。")
+            current_state = ComputerActionState(str(current["state"]))
+            if action.state not in transitions.get(current_state, set()):
+                raise ValidationError("Computer actionの状態遷移が不正です。")
+            connection.execute(
+                """
+                UPDATE computer_actions
+                SET state = ?, failure_reason = ?, started_at = ?, completed_at = ?
+                WHERE id = ? AND run_id = ?
+                """,
+                (
+                    action.state.value,
+                    action.failure_reason,
+                    _utc_iso(action.started_at) if action.started_at else None,
+                    _utc_iso(action.completed_at) if action.completed_at else None,
+                    action.id,
+                    action.run_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM computer_actions WHERE id = ?", (action.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Computer actionを更新できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._computer_action_from_row(await self._write(operation))
+
+    async def finish_computer_use_run(
+        self, run: ComputerUseRun
+    ) -> ComputerUseRun:
+        if run.state not in {
+            ComputerUseRunState.COMPLETED,
+            ComputerUseRunState.FAILED,
+            ComputerUseRunState.CANCELLED,
+            ComputerUseRunState.DENIED,
+        }:
+            raise ValidationError("Computer Use runの終了状態が不正です。")
+
+        def operation(connection: sqlite3.Connection) -> sqlite3.Row:
+            if run.state is ComputerUseRunState.COMPLETED:
+                audit = connection.execute(
+                    """
+                    SELECT runs.planned_action_count,
+                           COUNT(actions.id) AS action_count,
+                           SUM(CASE WHEN actions.state = 'completed' THEN 1 ELSE 0 END)
+                               AS completed_count
+                    FROM computer_use_runs runs
+                    LEFT JOIN computer_actions actions ON actions.run_id = runs.id
+                    WHERE runs.id = ?
+                    GROUP BY runs.id
+                    """,
+                    (run.id,),
+                ).fetchone()
+                if (
+                    audit is None
+                    or int(audit["action_count"])
+                    != int(audit["planned_action_count"])
+                    or int(audit["completed_count"] or 0)
+                    != int(audit["planned_action_count"])
+                ):
+                    raise ValidationError(
+                        "全Computer action完了後だけrunを完了できます。"
+                    )
+            cursor = connection.execute(
+                """
+                UPDATE computer_use_runs
+                SET state = ?, failure_reason = ?, completed_at = ?
+                WHERE id = ? AND state IN ('awaiting_approval', 'running')
+                """,
+                (
+                    run.state.value,
+                    run.failure_reason,
+                    _utc_iso(run.completed_at) if run.completed_at else _now(),
+                    run.id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("終了可能なComputer Use runがありません。")
+            row = connection.execute(
+                "SELECT * FROM computer_use_runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover
+                raise PersistenceError("Computer Use runを更新できませんでした。")
+            return cast(sqlite3.Row, row)
+
+        return self._computer_use_run_from_row(await self._write(operation))
+
+    async def create_computer_plan_approval(
+        self, run_id: str, approval: ComputerPlanApproval
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            run = connection.execute(
+                "SELECT plan_hash, state FROM computer_use_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if (
+                run is None
+                or str(run["state"])
+                != ComputerUseRunState.AWAITING_APPROVAL.value
+                or str(run["plan_hash"]) != approval.plan_hash
+            ):
+                raise ValidationError("承認対象の計画が一致しません。")
+            connection.execute(
+                """
+                INSERT INTO computer_plan_approvals(
+                    id, run_id, plan_hash, approved_at, consumed_at
+                ) VALUES(?, ?, ?, ?, NULL)
+                """,
+                (
+                    approval.id,
+                    run_id,
+                    approval.plan_hash,
+                    _utc_iso(approval.approved_at),
+                ),
+            )
+
+        await self._write(operation)
+
+    async def verify_and_consume(
+        self, approval: ComputerPlanApproval, plan_hash: str
+    ) -> bool:
+        approved_at = _utc_iso(approval.approved_at)
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT run_id FROM computer_plan_approvals
+                WHERE id = ? AND plan_hash = ? AND approved_at = ?
+                  AND consumed_at IS NULL
+                """,
+                (approval.id, plan_hash, approved_at),
+            ).fetchone()
+            if row is None:
+                return False
+            run_id = str(row["run_id"])
+            audit = connection.execute(
+                """
+                SELECT runs.planned_action_count,
+                       COUNT(actions.id) AS action_count,
+                       SUM(CASE WHEN actions.state = 'proposed' THEN 1 ELSE 0 END)
+                           AS proposed_count
+                FROM computer_use_runs runs
+                LEFT JOIN computer_actions actions ON actions.run_id = runs.id
+                WHERE runs.id = ?
+                GROUP BY runs.id
+                """,
+                (run_id,),
+            ).fetchone()
+            if (
+                audit is None
+                or int(audit["action_count"])
+                != int(audit["planned_action_count"])
+                or int(audit["proposed_count"] or 0)
+                != int(audit["planned_action_count"])
+            ):
+                return False
+            try:
+                run_cursor = connection.execute(
+                    """
+                    UPDATE computer_use_runs
+                    SET state = 'running', started_at = ?
+                    WHERE id = ? AND plan_hash = ? AND state = 'awaiting_approval'
+                    """,
+                    (_now(), run_id, plan_hash),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            if run_cursor.rowcount != 1:
+                return False
+            approval_cursor = connection.execute(
+                """
+                UPDATE computer_plan_approvals SET consumed_at = ?
+                WHERE id = ? AND consumed_at IS NULL
+                """,
+                (_now(), approval.id),
+            )
+            return approval_cursor.rowcount == 1
 
         return await self._write(operation)
 
@@ -2414,6 +2767,50 @@ class SQLiteAppRepository:
             restore_token=(
                 str(row["restore_token"]) if row["restore_token"] else None
             ),
+            failure_reason=(
+                str(row["failure_reason"]) if row["failure_reason"] else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
+        )
+
+    @staticmethod
+    def _computer_use_run_from_row(row: sqlite3.Row) -> ComputerUseRun:
+        return ComputerUseRun(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            objective=str(row["objective"]),
+            observation_id=str(row["observation_id"]),
+            plan_hash=str(row["plan_hash"]),
+            limits=ComputerUseLimits(
+                max_actions=int(row["max_actions"]),
+                max_duration_seconds=float(row["max_duration_seconds"]),
+                approval_timeout_seconds=float(row["approval_timeout_seconds"]),
+            ),
+            planned_action_count=int(row["planned_action_count"]),
+            state=ComputerUseRunState(str(row["state"])),
+            failure_reason=(
+                str(row["failure_reason"]) if row["failure_reason"] else None
+            ),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            started_at=_parse_time(row["started_at"]),
+            completed_at=_parse_time(row["completed_at"]),
+        )
+
+    @staticmethod
+    def _computer_action_from_row(row: sqlite3.Row) -> ComputerActionAudit:
+        return ComputerActionAudit(
+            id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            ordinal=int(row["ordinal"]),
+            request=ComputerActionRequest(
+                id=str(row["request_id"]),
+                action_type=ComputerActionType(str(row["action_type"])),
+                target_profile_id=str(row["target_profile_id"]),
+                text=str(row["input_text"]) if row["input_text"] is not None else None,
+            ),
+            state=ComputerActionState(str(row["state"])),
             failure_reason=(
                 str(row["failure_reason"]) if row["failure_reason"] else None
             ),
