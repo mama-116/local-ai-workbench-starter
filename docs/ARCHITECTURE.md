@@ -141,7 +141,13 @@ Phase 6のSchedulerは、アプリに固定登録したハンドラーだけを�
 
 操作計画はApplication層の `ComputerUseCoordinator` が `ActionPolicy` へ渡し、対象アプリ、操作型、前面状態、上限、承認を再検査してから1件ずつ実行する。実行直前と直後に画面とUI要素を再取得し、状態が変わった場合は入力せず停止する。UIからOS操作ProviderやSQLiteを直接呼ばない。
 
-スクリーンショット、UI構造、入力文、ウィンドウタイトルはPRIVATEとして利用者データ領域だけへ保存し、通常ログと配布物へ入れない。初回の上限、停止、受入基準は [ADR-0015](adr/0015-start-computer-use-with-approved-notepad-task.md) と [COMPUTER_USE_DESIGN.md](COMPUTER_USE_DESIGN.md) を正本とする。画像座標だけの操作、ゲーム、ブラウザ、外部送信は別ADRまで扱わない。
+実OS入力を扱う `DesktopActionBroker` は、Planner、MCP、Web通信、SQLiteから分離した最小プロセスとし、認証済みローカルIPCで固定スキーマの1操作だけを受け取る。Brokerはネットワーク待受、公開ネットワーク通信、シェル、任意プロセス起動、ファイル書込みAPIを持たず、固定プロファイル以外の要求を独立して拒否する。Coordinatorが侵害されても、Brokerの許可範囲を拡張できる設定や自由形式入力をIPCへ設けない。
+
+Computer Useは `asInvoker` かつ `uiAccess=false` でだけ動作する。Controllerと操作対象のアクセストークンから、ユーザーSID、対話セッションID、昇格状態、整合性レベルを実行開始時と各操作直前に取得し、同一ユーザー・同一対話セッション・同一の中整合性レベルでなければ拒否する。Controllerまたは対象が管理者、高整合性、SYSTEM、別ユーザー、別セッション、secure desktop、UAC画面の場合は入力を送らない。RDP、サービス、スケジュールタスク、`uiAccess=true`、権限昇格へのフォールバックは初回禁止する。
+
+初回の実入力試験は、破棄可能でHostから分離したWindows環境を利用者が選択した後にだけ行う。隔離環境はネットワーク、クリップボード、音声・映像入力、プリンター、vGPUを無効化し、搬入元を秘密情報のない専用ステージング領域へ限定する。現在の開発PCはWindows 11 HomeでWindows Sandboxを利用できず、別のWindows VMも未導入のため、隔離先は未決であり実入力を有効化しない。隔離環境へ実入力を送ることとHostへ実入力を送ることは別の一方向ドアとする。
+
+スクリーンショット、UI構造、入力文、ウィンドウタイトルはPRIVATEとして利用者データ領域だけへ保存し、通常ログと配布物へ入れない。初回の上限、停止、受入基準は [ADR-0015](adr/0015-start-computer-use-with-approved-notepad-task.md) と [COMPUTER_USE_DESIGN.md](COMPUTER_USE_DESIGN.md) を正本とする。画像座標だけの操作、ゲーム、ブラウザ、外部送信は別ADRまで扱わない。モデルの提案は安全判断ではなく、固定Policy、Broker、Windowsの権限境界を緩和できない。
 
 Phase 7Bでは、`ComputerUseCoordinator` の予算、承認、逐次実行、停止、監査を再利用しつつ、UI操作と分離した `FileOperationProvider` と `PowerShellRecipeProvider` を設ける。Providerはモデルの自由形式出力を実行せず、`ActionPolicy` が検査した固定スキーマの要求1件だけを受け取る。UIは引き続きCoordinatorと監査読取Serviceだけを呼ぶ。
 
