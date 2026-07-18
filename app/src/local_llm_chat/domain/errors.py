@@ -26,6 +26,14 @@ class AgentToolFailure(AppError):
         self.restore_token = restore_token
 
 
+class ComputerActionDenied(AppError):
+    """A fail-closed rejection raised before any desktop action is performed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class ModelUnavailable(AppError):
     pass
 
