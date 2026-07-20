@@ -6,6 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from collections.abc import Awaitable, Callable
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID, uuid5
 
@@ -41,13 +42,23 @@ class MemoryCaptureRequest:
 class MemoryCaptureResult:
     candidates: tuple[MemoryCandidate, ...]
     persisted_event_ids: tuple[str, ...]
+    extractor_unavailable: bool = False
+
+
+class MemoryCaptureState(StrEnum):
+    PROCESSING = "processing"
+    SAVED = "saved"
+    NO_CANDIDATES = "no_candidates"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryCaptureUpdate:
     conversation_id: str
     branch_id: str
-    persisted_event_ids: tuple[str, ...]
+    source_message_id: str
+    state: MemoryCaptureState
+    persisted_event_ids: tuple[str, ...] = ()
 
 
 MemoryCaptureSubscriber = Callable[[MemoryCaptureUpdate], Awaitable[None]]
@@ -78,7 +89,7 @@ class MemoryCaptureService:
             request.branch_id,
             request.source_message_id,
         )
-        candidates = await self._candidate_service.generate(
+        generation = await self._candidate_service.generate_with_status(
             MemoryCandidateRequest(
                 conversation_id=request.conversation_id,
                 branch_id=request.branch_id,
@@ -93,6 +104,7 @@ class MemoryCaptureService:
                 known_by_character_ids=request.known_by_character_ids,
             )
         )
+        candidates = generation.candidates
         events_by_id: dict[str, CanonicalMemoryEvent] = {}
         for candidate in candidates:
             event = self._to_event(candidate, source.created_at)
@@ -102,7 +114,9 @@ class MemoryCaptureService:
         persisted_event_ids = await self._repository.append_captured_memory_events(
             events
         )
-        return MemoryCaptureResult(candidates, persisted_event_ids)
+        return MemoryCaptureResult(
+            candidates, persisted_event_ids, generation.extractor_unavailable
+        )
 
     @staticmethod
     def _to_event(
@@ -186,11 +200,31 @@ class QueuedMemoryCaptureScheduler:
         if self._closing:
             return
         self._ensure_worker()
+        await self._notify(
+            MemoryCaptureUpdate(
+                request.conversation_id,
+                request.branch_id,
+                request.source_message_id,
+                MemoryCaptureState.PROCESSING,
+                (),
+            ),
+            run_id,
+        )
         try:
             self._queue.put_nowait((request, run_id))
         except asyncio.QueueFull:
             await self._log_best_effort(
                 "warning", "memory_capture_queue_full", {}, run_id
+            )
+            await self._notify(
+                MemoryCaptureUpdate(
+                    request.conversation_id,
+                    request.branch_id,
+                    request.source_message_id,
+                    MemoryCaptureState.FAILED,
+                    (),
+                ),
+                run_id,
             )
 
     async def wait_until_idle(self) -> None:
@@ -219,15 +253,28 @@ class QueuedMemoryCaptureScheduler:
             request, run_id = await self._queue.get()
             try:
                 result = await self._runner.capture(request)
-                if result.persisted_event_ids:
-                    await self._notify(
-                        MemoryCaptureUpdate(
-                            request.conversation_id,
-                            request.branch_id,
-                            result.persisted_event_ids,
-                        ),
+                if result.extractor_unavailable:
+                    await self._log_best_effort(
+                        "warning",
+                        "memory_capture_fallback_used",
+                        {"error_type": "OllamaUnavailable"},
                         run_id,
                     )
+                state = (
+                    MemoryCaptureState.SAVED
+                    if result.persisted_event_ids
+                    else MemoryCaptureState.NO_CANDIDATES
+                )
+                await self._notify(
+                    MemoryCaptureUpdate(
+                        request.conversation_id,
+                        request.branch_id,
+                        request.source_message_id,
+                        state,
+                        result.persisted_event_ids,
+                    ),
+                    run_id,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -235,6 +282,16 @@ class QueuedMemoryCaptureScheduler:
                     "error",
                     "memory_capture_failed",
                     {"error_type": type(error).__name__},
+                    run_id,
+                )
+                await self._notify(
+                    MemoryCaptureUpdate(
+                        request.conversation_id,
+                        request.branch_id,
+                        request.source_message_id,
+                        MemoryCaptureState.FAILED,
+                        (),
+                    ),
                     run_id,
                 )
             finally:

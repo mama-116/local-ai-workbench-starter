@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import OllamaUnavailable, ValidationError
 from local_llm_chat.domain.memory_candidates import (
     MAX_MEMORY_CANDIDATES_PER_MESSAGE,
     MemoryCandidate,
@@ -28,6 +29,12 @@ MAX_MEMORY_VALUE_CHARACTERS = 200
 MAX_MEMORY_SOURCE_CHARACTERS = 4_000
 _MEMORY_CLAUSE_PATTERN = re.compile(r"[^。！？!?\r\n]+")
 
+
+@dataclass(frozen=True, slots=True)
+class MemoryCandidateGeneration:
+    candidates: tuple[MemoryCandidate, ...]
+    extractor_unavailable: bool = False
+
 DEFAULT_MEMORY_TEMPLATES = (
     MemoryTemplate(
         MemoryKind.PREFERENCE,
@@ -45,7 +52,11 @@ DEFAULT_MEMORY_TEMPLATES = (
         "liked_food",
         MemoryCardinality.MULTIPLE,
         requires_confirmation=False,
-        evidence_patterns=(r"{value}\s*が好き", r"好きなのは\s*{value}"),
+        evidence_patterns=(
+            r"{value}\s*が好き",
+            r"好きなのは\s*{value}",
+            r"アイスは\s*{value}\s*が好き",
+        ),
     ),
     MemoryTemplate(
         MemoryKind.SAFETY_CONSTRAINT,
@@ -99,13 +110,27 @@ class MemoryCandidateService:
     async def generate(
         self, request: MemoryCandidateRequest
     ) -> tuple[MemoryCandidate, ...]:
+        return (await self.generate_with_status(request)).candidates
+
+    async def generate_with_status(
+        self, request: MemoryCandidateRequest
+    ) -> MemoryCandidateGeneration:
         self._validate_request(request)
         if not request.content.strip():
-            return ()
+            return MemoryCandidateGeneration(())
         self._free_policy.require_cloud_disabled(self._extractor.cloud_is_disabled)
         self._free_policy.require_provider(self._extractor.metadata)
         self._free_policy.require_loopback_endpoint(self._extractor.metadata.endpoint)
-        drafts = await self._extractor.extract(request)
+        try:
+            drafts = await self._extractor.extract(request)
+        except OllamaUnavailable:
+            fallback_candidates = tuple(
+                self._classify(request, draft)
+                for draft in self._match_registered_explicit_forms(request)
+            )[:MAX_MEMORY_CANDIDATES_PER_MESSAGE]
+            if fallback_candidates:
+                return MemoryCandidateGeneration(fallback_candidates, True)
+            raise
         if len(drafts) > MAX_MEMORY_CANDIDATES_PER_MESSAGE:
             raise ValidationError("1発言の記憶候補は8件までです。")
         candidates = [self._classify(request, draft) for draft in drafts]
@@ -142,7 +167,7 @@ class MemoryCandidateService:
                 candidates[blocked_index] = fallback
             elif len(candidates) < MAX_MEMORY_CANDIDATES_PER_MESSAGE:
                 candidates.append(fallback)
-        return tuple(candidates)
+        return MemoryCandidateGeneration(tuple(candidates))
 
     @staticmethod
     def _evidence_overlaps(

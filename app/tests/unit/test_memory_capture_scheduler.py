@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from local_llm_chat.application.services.memory_capture_service import (
+    MemoryCaptureState,
     MemoryCaptureUpdate,
     MemoryCaptureRequest,
     MemoryCaptureResult,
@@ -21,16 +22,20 @@ class RecordingCaptureRunner:
         self,
         error: Exception | None = None,
         persisted_event_ids: tuple[str, ...] = (),
+        extractor_unavailable: bool = False,
     ) -> None:
         self.error = error
         self.persisted_event_ids = persisted_event_ids
+        self.extractor_unavailable = extractor_unavailable
         self.requests: list[MemoryCaptureRequest] = []
 
     async def capture(self, request: MemoryCaptureRequest) -> MemoryCaptureResult:
         self.requests.append(request)
         if self.error is not None:
             raise self.error
-        return MemoryCaptureResult((), self.persisted_event_ids)
+        return MemoryCaptureResult(
+            (), self.persisted_event_ids, self.extractor_unavailable
+        )
 
 
 def capture_request(
@@ -91,6 +96,12 @@ async def test_capture_failure_is_logged_without_private_error_text(
     request, run_id = await make_capture_context(repository)
     runner = RecordingCaptureRunner(RuntimeError("PRIVATE USER CONTENT"))
     scheduler = QueuedMemoryCaptureScheduler(runner, repository)
+    updates: list[MemoryCaptureUpdate] = []
+
+    async def record(update: MemoryCaptureUpdate) -> None:
+        updates.append(update)
+
+    scheduler.subscribe(record)
 
     await scheduler.request_capture(request, run_id)
     await scheduler.wait_until_idle()
@@ -106,6 +117,11 @@ async def test_capture_failure_is_logged_without_private_error_text(
         run_id,
         '{"error_type": "RuntimeError"}',
     )
+    assert [update.state for update in updates] == [
+        MemoryCaptureState.PROCESSING,
+        MemoryCaptureState.FAILED,
+    ]
+    assert all(not update.persisted_event_ids for update in updates)
 
 
 @pytest.mark.asyncio
@@ -164,9 +180,70 @@ async def test_scheduler_notifies_with_ids_after_persistence_and_isolates_subscr
         MemoryCaptureUpdate(
             request.conversation_id,
             request.branch_id,
+            request.source_message_id,
+            MemoryCaptureState.PROCESSING,
+        ),
+        MemoryCaptureUpdate(
+            request.conversation_id,
+            request.branch_id,
+            request.source_message_id,
+            MemoryCaptureState.SAVED,
             ("memory-1",),
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_notifies_when_capture_has_no_persistable_memory(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    request, run_id = await make_capture_context(repository)
+    scheduler = QueuedMemoryCaptureScheduler(RecordingCaptureRunner(), repository)
+    updates: list[MemoryCaptureUpdate] = []
+
+    async def record(update: MemoryCaptureUpdate) -> None:
+        updates.append(update)
+
+    scheduler.subscribe(record)
+
+    await scheduler.request_capture(request, run_id)
+    await scheduler.wait_until_idle()
+    await scheduler.close()
+
+    assert [update.state for update in updates] == [
+        MemoryCaptureState.PROCESSING,
+        MemoryCaptureState.NO_CANDIDATES,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_audits_local_extractor_fallback_without_private_text(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    request, run_id = await make_capture_context(repository)
+    scheduler = QueuedMemoryCaptureScheduler(
+        RecordingCaptureRunner(
+            persisted_event_ids=("memory-1",), extractor_unavailable=True
+        ),
+        repository,
+    )
+
+    await scheduler.request_capture(request, run_id)
+    await scheduler.wait_until_idle()
+    await scheduler.close()
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT event_type, details_json FROM app_events "
+            "WHERE event_type = 'memory_capture_fallback_used'"
+        ).fetchone()
+    assert row == (
+        "memory_capture_fallback_used",
+        '{"error_type": "OllamaUnavailable"}',
+    )
 
 
 @pytest.mark.asyncio
