@@ -134,6 +134,8 @@ class OllamaProvider:
                 }
                 for tool in request.tools
             ]
+        if request.response_format is not None:
+            body["format"] = request.response_format
         try:
             async with self._client.stream("POST", "/api/chat", json=body) as response:
                 response.raise_for_status()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -92,6 +93,19 @@ class EmptyTranslationProvider(TranslationProvider):
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
         self.requests.append(request)
         yield ChatChunk(done=True)
+
+
+class WaitingTranslationProvider(TranslationProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+        self.requests.append(request)
+        self.started.set()
+        await self.release.wait()
+        yield ChatChunk(content="translated", done=True)
 
 
 async def make_response(
@@ -214,3 +228,48 @@ async def test_translation_failure_keeps_original_and_can_be_retried(
         assert (await repository.get_message(message_id)).content == "Hello, world."
     finally:
         await service.close()
+
+
+@pytest.mark.asyncio
+async def test_translation_requested_after_close_is_ignored(tmp_path: Path) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    message_id = await make_response(repository, "Hello, world.")
+    provider = TranslationProvider()
+    service = TranslationService(
+        repository, provider, FakeRegistry(provider), FreeOperationPolicy()
+    )
+
+    await service.close()
+    result = await service.request_translation(message_id)
+
+    assert result is None
+    assert await repository.get_current_translation(message_id) is None
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_close_fails_running_and_queued_translations(tmp_path: Path) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    running_message_id = await make_response(repository, "First response.")
+    queued_message_id = await make_response(repository, "Second response.")
+    provider = WaitingTranslationProvider()
+    service = TranslationService(
+        repository, provider, FakeRegistry(provider), FreeOperationPolicy()
+    )
+
+    await service.request_translation(running_message_id)
+    await asyncio.wait_for(provider.started.wait(), timeout=0.2)
+    await service.request_translation(queued_message_id)
+    await service.close()
+    await service.wait_until_idle()
+
+    running = await repository.get_current_translation(running_message_id)
+    queued = await repository.get_current_translation(queued_message_id)
+    assert running is not None
+    assert running.state is TranslationState.FAILED
+    assert running.error_code == "application_closed"
+    assert queued is not None
+    assert queued.state is TranslationState.FAILED
+    assert queued.error_code == "application_closed"
