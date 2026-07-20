@@ -77,6 +77,11 @@ class ConversationService:
     async def restore(self, conversation_id: str) -> None:
         await self._repository.restore_conversation(conversation_id)
 
+    async def set_auto_translate(self, conversation_id: str, enabled: bool) -> None:
+        await self._repository.set_conversation_auto_translate(
+            conversation_id, enabled
+        )
+
     async def messages(self, conversation_id: str) -> list[Message]:
         return await self._repository.list_active_messages(conversation_id)
 
@@ -93,8 +98,17 @@ class ConversationService:
     async def branches(self, conversation_id: str) -> list[BranchInfo]:
         return await self._repository.list_branches(conversation_id)
 
+    async def all_branches(self, conversation_id: str) -> list[BranchInfo]:
+        return await self._repository.list_all_branches(conversation_id)
+
     async def activate_branch(self, conversation_id: str, branch_id: str) -> None:
         await self._repository.activate_branch(conversation_id, branch_id)
+
+    async def hide_branch(self, conversation_id: str, branch_id: str) -> None:
+        await self._repository.hide_branch(conversation_id, branch_id)
+
+    async def restore_branch(self, conversation_id: str, branch_id: str) -> None:
+        await self._repository.restore_branch(conversation_id, branch_id)
 
     async def _require_model(
         self, provider_name: str, model_name: str

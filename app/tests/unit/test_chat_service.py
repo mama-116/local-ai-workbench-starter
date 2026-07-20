@@ -138,6 +138,17 @@ class FailingTranslationScheduler:
         raise RuntimeError("queue unavailable")
 
 
+class RecordingTranslationScheduler:
+    def __init__(self) -> None:
+        self.message_ids: list[str] = []
+
+    async def request_translation(
+        self, message_id: str, force: bool = False
+    ) -> Translation | None:
+        self.message_ids.append(message_id)
+        return None
+
+
 class RecordingMemoryCaptureScheduler:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
@@ -489,6 +500,7 @@ async def test_blocks_before_persisting_when_cloud_is_enabled(tmp_path: Path) ->
 async def test_translation_enqueue_failure_does_not_fail_chat(tmp_path: Path) -> None:
     repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
     conversation_id = await make_conversation(repository)
+    await repository.set_conversation_auto_translate(conversation_id, True)
     service = ChatService(
         repository,
         FakeRegistry(),
@@ -500,6 +512,25 @@ async def test_translation_enqueue_failure_does_not_fail_chat(tmp_path: Path) ->
 
     assert response.content == "回答です"
     assert response.state is MessageState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_manual_translation_default_does_not_enqueue_automatically(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_conversation(repository)
+    scheduler = RecordingTranslationScheduler()
+    service = ChatService(
+        repository,
+        FakeRegistry(),
+        FreeOperationPolicy(),
+        scheduler,
+    )
+
+    await service.send_message(conversation_id, "質問")
+
+    assert scheduler.message_ids == []
 
 
 @pytest.mark.asyncio

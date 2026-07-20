@@ -1269,6 +1269,24 @@ class SQLiteAppRepository:
 
         await self._write(operation)
 
+    async def set_conversation_auto_translate(
+        self, conversation_id: str, enabled: bool
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            self._require_conversation(connection, conversation_id)
+            cursor = connection.execute(
+                """
+                UPDATE conversations
+                SET auto_translate = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                """,
+                (int(enabled), _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("会話の翻訳設定を保存できません。")
+
+        await self._write(operation)
+
     async def list_active_messages(self, conversation_id: str) -> list[Message]:
         def operation(connection: sqlite3.Connection) -> list[Message]:
             conversation = self._require_conversation(connection, conversation_id)
@@ -1501,6 +1519,22 @@ class SQLiteAppRepository:
 
     async def list_branches(self, conversation_id: str) -> list[BranchInfo]:
         def operation(connection: sqlite3.Connection) -> list[BranchInfo]:
+            self._require_conversation(connection, conversation_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM branches
+                WHERE conversation_id = ? AND hidden_at IS NULL
+                ORDER BY created_at
+                """,
+                (conversation_id,),
+            ).fetchall()
+            return [self._branch_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def list_all_branches(self, conversation_id: str) -> list[BranchInfo]:
+        def operation(connection: sqlite3.Connection) -> list[BranchInfo]:
+            self._require_conversation(connection, conversation_id)
             rows = connection.execute(
                 "SELECT * FROM branches WHERE conversation_id = ? ORDER BY created_at",
                 (conversation_id,),
@@ -1511,16 +1545,56 @@ class SQLiteAppRepository:
 
     async def activate_branch(self, conversation_id: str, branch_id: str) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_conversation(connection, conversation_id)
             branch = connection.execute(
-                "SELECT id FROM branches WHERE id = ? AND conversation_id = ?",
+                """
+                SELECT id FROM branches
+                WHERE id = ? AND conversation_id = ? AND hidden_at IS NULL
+                """,
                 (branch_id, conversation_id),
             ).fetchone()
             if branch is None:
-                raise ValidationError("会話の続きが見つかりません。")
+                raise ValidationError("会話の分岐が見つからないか、非表示です。")
             connection.execute(
                 "UPDATE conversations SET active_branch_id = ?, updated_at = ? WHERE id = ?",
                 (branch_id, _now(), conversation_id),
             )
+
+        await self._write(operation)
+
+    async def hide_branch(self, conversation_id: str, branch_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, branch_id)
+            if branch.conversation_id != conversation_id:
+                raise ValidationError("別の会話の分岐は非表示にできません。")
+            if branch.parent_branch_id is None:
+                raise ValidationError("最初の分岐は非表示にできません。")
+            if branch.id == conversation.active_branch_id:
+                raise ValidationError("使用中の分岐は非表示にできません。")
+            cursor = connection.execute(
+                "UPDATE branches SET hidden_at = ? WHERE id = ? AND hidden_at IS NULL",
+                (_now(), branch_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("この分岐はすでに非表示です。")
+
+        await self._write(operation)
+
+    async def restore_branch(self, conversation_id: str, branch_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, branch_id)
+            if branch.conversation_id != conversation_id:
+                raise ValidationError("別の会話の分岐は復元できません。")
+            cursor = connection.execute(
+                "UPDATE branches SET hidden_at = NULL WHERE id = ? AND hidden_at IS NOT NULL",
+                (branch_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("この分岐は非表示になっていません。")
 
         await self._write(operation)
 
@@ -3630,6 +3704,7 @@ class SQLiteAppRepository:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             archived_at=_parse_time(row["archived_at"]),
+            auto_translate=bool(row["auto_translate"]),
         )
 
     @staticmethod
@@ -3852,4 +3927,5 @@ class SQLiteAppRepository:
             ),
             head_message_id=str(row["head_message_id"]) if row["head_message_id"] else None,
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            hidden_at=_parse_time(row["hidden_at"]),
         )

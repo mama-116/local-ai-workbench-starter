@@ -6,8 +6,9 @@ from typing import Any, cast
 import flet as ft
 
 from local_llm_chat.domain.group_turns import TurnBatch, TurnSegment
-from local_llm_chat.domain.models import utc_now
+from local_llm_chat.domain.models import Translation, utc_now
 from local_llm_chat.domain.states import (
+    TranslationState,
     TurnBatchState,
     TurnMode,
     TurnRepairState,
@@ -43,6 +44,18 @@ def replay_buttons(control: object) -> Iterator[ft.IconButton]:
     if controls is not None:
         for child in controls:
             yield from replay_buttons(child)
+
+
+def translation_buttons(control: object) -> Iterator[ft.IconButton]:
+    if isinstance(control, ft.IconButton) and control.icon == ft.Icons.TRANSLATE_ROUNDED:
+        yield control
+    content = getattr(control, "content", None)
+    if content is not None:
+        yield from translation_buttons(content)
+    controls = getattr(control, "controls", None)
+    if controls is not None:
+        for child in controls:
+            yield from translation_buttons(child)
 
 
 def batch(state: TurnBatchState = TurnBatchState.COMPLETED) -> TurnBatch:
@@ -85,6 +98,22 @@ def segment(kind: TurnSpeakerKind, speaker_id: str | None = None) -> TurnSegment
         speaker_id=speaker_id,
         display_name="先輩",
         content="俺はこう思う。",
+    )
+
+
+def translation(state: TranslationState = TranslationState.COMPLETED) -> Translation:
+    now = utc_now()
+    return Translation(
+        id="translation-1",
+        message_id="assistant-1",
+        source_hash="hash",
+        target_language="ja",
+        provider="ollama-local",
+        model="translation-model",
+        content="全体の日本語訳です。" if state is TranslationState.COMPLETED else "",
+        state=state,
+        created_at=now,
+        completed_at=now if state is TranslationState.COMPLETED else None,
     )
 
 
@@ -169,3 +198,42 @@ def test_partial_batch_has_only_one_regenerate_action_at_its_end() -> None:
 
     assert len(list(replay_buttons(first))) == 0
     assert len(list(replay_buttons(last))) == 1
+
+
+def test_manual_translation_action_is_rendered_once_at_batch_end() -> None:
+    first = TurnSegmentBubble(
+        segment(TurnSpeakerKind.CHARACTER, "character-1"),
+        batch(),
+        utc_now(),
+        on_translate=lambda: None,
+    )
+    last = TurnSegmentBubble(
+        segment(TurnSpeakerKind.CHARACTER, "character-1"),
+        batch(),
+        utc_now(),
+        is_batch_end=True,
+        on_translate=lambda: None,
+    )
+
+    assert list(translation_buttons(first)) == []
+    assert len(list(translation_buttons(last))) == 1
+
+
+def test_completed_translation_is_displayed_only_at_batch_end() -> None:
+    translated = translation()
+    first = TurnSegmentBubble(
+        segment(TurnSpeakerKind.CHARACTER, "character-1"),
+        batch(),
+        utc_now(),
+        translation=translated,
+    )
+    last = TurnSegmentBubble(
+        segment(TurnSpeakerKind.CHARACTER, "character-1"),
+        batch(),
+        utc_now(),
+        is_batch_end=True,
+        translation=translated,
+    )
+
+    assert "全体の日本語訳です。" not in "\n".join(texts(first))
+    assert "全体の日本語訳です。" in "\n".join(texts(last))

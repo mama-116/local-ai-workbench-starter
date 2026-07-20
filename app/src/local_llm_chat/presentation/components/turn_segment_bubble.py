@@ -7,7 +7,12 @@ from typing import Any
 import flet as ft
 
 from local_llm_chat.domain.group_turns import TurnBatch, TurnSegment
-from local_llm_chat.domain.states import TurnBatchState, TurnSpeakerKind
+from local_llm_chat.domain.models import Translation
+from local_llm_chat.domain.states import (
+    TranslationState,
+    TurnBatchState,
+    TurnSpeakerKind,
+)
 
 
 class TurnSegmentBubble(ft.Container):
@@ -19,6 +24,8 @@ class TurnSegmentBubble(ft.Container):
         *,
         is_batch_end: bool = False,
         on_regenerate: Callable[[], Any] | None = None,
+        translation: Translation | None = None,
+        on_translate: Callable[[], Any] | None = None,
     ) -> None:
         label, label_color = _speaker_label(segment)
         status = (
@@ -56,20 +63,45 @@ class TurnSegmentBubble(ft.Container):
 
             regenerate_button.on_click = regenerate
             meta_controls.append(regenerate_button)
+        if is_batch_end and on_translate is not None:
+            translation_button = ft.IconButton(
+                icon=ft.Icons.TRANSLATE_ROUNDED,
+                icon_size=16,
+                icon_color="#AAA69D",
+                tooltip=("日本語に訳す" if translation is None else "訳し直す"),
+                disabled=(
+                    translation is not None
+                    and translation.state
+                    in (TranslationState.PENDING, TranslationState.RUNNING)
+                ),
+                on_click=on_translate,
+            )
+            meta_controls.append(translation_button)
         meta = ft.Row(meta_controls, spacing=4)
-        card = ft.Container(
-            content=ft.Column(
-                [
-                    meta,
-                    ft.Text(
-                        segment.content,
-                        size=14,
-                        color="#F3F0E8",
-                        selectable=True,
-                    ),
-                ],
-                spacing=6,
+        content_controls: list[ft.Control] = [
+            meta,
+            ft.Text(
+                segment.content,
+                size=14,
+                color="#F3F0E8",
+                selectable=True,
             ),
+        ]
+        if is_batch_end and translation is not None:
+            content_controls.extend(
+                [
+                    ft.Divider(height=1, color="#18FFFFFF"),
+                    ft.Text(
+                        "TurnBatch全体の日本語訳",
+                        size=10,
+                        weight=ft.FontWeight.W_600,
+                        color="#F2A65A",
+                    ),
+                    _translation_body(translation),
+                ]
+            )
+        card = ft.Container(
+            content=ft.Column(content_controls, spacing=6),
             bgcolor=(
                 "#1D202B"
                 if segment.speaker_kind is TurnSpeakerKind.NARRATOR
@@ -88,6 +120,20 @@ class TurnSegmentBubble(ft.Container):
             ),
             padding=ft.Padding(32, 4, 32, 4),
         )
+
+
+def _translation_body(translation: Translation) -> ft.Control:
+    if translation.state is TranslationState.PENDING:
+        return ft.Text("翻訳を待っています...", size=12, color="#AAA69D")
+    if translation.state is TranslationState.RUNNING:
+        return ft.Text("ローカルモデルで翻訳しています...", size=12, color="#AAA69D")
+    if translation.state is TranslationState.FAILED:
+        return ft.Text(
+            "翻訳できませんでした。元のTurnBatchは変更していません。",
+            size=12,
+            color="#D87866",
+        )
+    return ft.Text(translation.content, size=13, color="#F3F0E8", selectable=True)
 
 
 def _speaker_label(segment: TurnSegment) -> tuple[str, str]:

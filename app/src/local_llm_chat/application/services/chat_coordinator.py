@@ -246,7 +246,15 @@ class ChatCoordinator:
                 await self._log_post_commit_failure(
                     "telemetry_enqueue_failed", error, run_id
                 )
-        if self._translation_scheduler is not None:
+        auto_translate = False
+        try:
+            conversation = await self._repository.get_conversation(conversation_id)
+            auto_translate = conversation.auto_translate
+        except Exception as error:
+            await self._log_post_commit_failure(
+                "translation_preference_read_failed", error, run_id
+            )
+        if auto_translate and self._translation_scheduler is not None:
             try:
                 await self._translation_scheduler.request_translation(
                     response_message_id

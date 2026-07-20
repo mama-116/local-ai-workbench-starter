@@ -88,7 +88,7 @@ def test_one_unit_over_limit_includes_every_capacity_component() -> None:
     assert exact.action is ContextBudgetAction.SEND
 
 
-def test_conservative_counter_counts_japanese_and_emoji_as_utf8_bytes() -> None:
+def test_conservative_counter_estimates_tokens_instead_of_raw_utf8_bytes() -> None:
     text = "長い日本語🙂"
     counter = ConservativeContextCounter()
     used = counter.count_text(text)
@@ -98,9 +98,26 @@ def test_conservative_counter_counts_japanese_and_emoji_as_utf8_bytes() -> None:
     over = planner.decide(ContextBudgetInput(used, 1, text, ()))
 
     assert exact.action is ContextBudgetAction.SEND
-    assert used > len(text.encode("utf-8"))
+    assert len(text) < used < len(text.encode("utf-8"))
     assert over.excess_units == 1
     assert over.action is ContextBudgetAction.COMPRESS
+
+
+def test_japanese_system_prompt_does_not_exhaust_a_4096_token_window() -> None:
+    counter = ConservativeContextCounter()
+    planner = ContextBudgetPlanner(counter)
+    japanese_prompt = "登場人物の設定です。" * 300
+
+    decision = planner.decide(
+        ContextBudgetInput(
+            context_limit=4096,
+            output_reserve=512,
+            system_prompt=japanese_prompt,
+            branch_messages=(ChatMessageInput(MessageRole.USER, "続きを話してください。"),),
+        )
+    )
+
+    assert decision.action is ContextBudgetAction.SEND
 
 
 class SummaryProvider:

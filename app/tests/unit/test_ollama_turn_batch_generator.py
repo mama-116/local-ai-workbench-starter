@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -181,6 +182,122 @@ async def test_generator_streams_readable_preview_before_structured_output_finis
     assert updates[0] == "One: Hello"
     assert updates[-1] == "One: Hello world"
     assert len(updates) >= 2
+
+
+@pytest.mark.asyncio
+async def test_round_table_trims_old_history_to_fit_4096_and_keeps_latest_user_turn() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "First answer.",
+            },
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-2",
+                "display_name": "Two",
+                "content": "Second answer.",
+            },
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+    latest = "3ターン目の質問を続けてください。"
+    history = tuple(
+        ChatMessageInput(
+            MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT,
+            (f"履歴{index}。" + "長い日本語の会話。" * 80),
+        )
+        for index in range(6)
+    ) + (ChatMessageInput(MessageRole.USER, latest),)
+    request = replace(
+        generation_request(),
+        mode=TurnMode.ROUND_TABLE,
+        messages=history,
+        options={"num_ctx": 4096},
+    )
+
+    await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(request)
+
+    [sent] = provider.requests
+    assert len(sent.messages) < len(history)
+    assert sent.messages[-1].content == latest
+    assert sent.messages[0].role is MessageRole.USER
+
+
+@pytest.mark.asyncio
+async def test_round_table_schema_allows_only_registered_character_ids_or_narrator() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "First answer.",
+            },
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-2",
+                "display_name": "Two",
+                "content": "Second answer.",
+            },
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+    request = replace(generation_request(), mode=TurnMode.ROUND_TABLE)
+
+    await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(request)
+
+    [sent] = provider.requests
+    assert sent.response_format is not None
+    schema = cast(dict[str, Any], sent.response_format)
+    variants = schema["properties"]["segments"]["items"]["oneOf"]
+    character_variant, narrator_variant = variants
+    assert character_variant["properties"]["speaker_kind"] == {
+        "type": "string",
+        "const": "character",
+    }
+    assert character_variant["properties"]["speaker_id"] == {
+        "type": "string",
+        "enum": ["character-1", "character-2"],
+    }
+    assert narrator_variant["properties"]["speaker_kind"] == {
+        "type": "string",
+        "const": "narrator",
+    }
+    assert narrator_variant["properties"]["speaker_id"] == {
+        "type": "null",
+        "const": None,
+    }
+    assert "unresolved" not in json.dumps(sent.response_format)
+
+
+@pytest.mark.asyncio
+async def test_story_schema_keeps_unresolved_speaker_option() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "unresolved",
+                "speaker_id": None,
+                "display_name": "Unknown",
+                "content": "Who am I?",
+            }
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+
+    await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+        generation_request()
+    )
+
+    [sent] = provider.requests
+    assert sent.response_format is not None
+    schema = cast(dict[str, Any], sent.response_format)
+    kinds = schema["properties"]["segments"]["items"]["properties"][
+        "speaker_kind"
+    ]["enum"]
+    assert kinds == ["character", "narrator", "unresolved"]
 
 
 @pytest.mark.asyncio

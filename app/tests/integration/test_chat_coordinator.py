@@ -25,7 +25,7 @@ from local_llm_chat.domain.group_turns import (
     TurnBatchGenerationRequest,
     TurnSegmentDraft,
 )
-from local_llm_chat.domain.models import Conversation, Message
+from local_llm_chat.domain.models import Conversation, Message, Translation
 from local_llm_chat.domain.states import (
     MessageState,
     MessageRole,
@@ -157,6 +157,17 @@ class RecordingMemoryScheduler:
         self.requests.append((request, run_id))
 
 
+class RecordingTranslationScheduler:
+    def __init__(self) -> None:
+        self.message_ids: list[str] = []
+
+    async def request_translation(
+        self, message_id: str, force: bool = False
+    ) -> Translation | None:
+        self.message_ids.append(message_id)
+        return None
+
+
 async def make_conversation(repository: SQLiteAppRepository) -> Conversation:
     await repository.initialize()
     character = await repository.ensure_default_character()
@@ -174,6 +185,7 @@ def coordinator(
     single: SingleChatStub,
     generator: RecordingGenerator,
     memory: RecordingMemoryScheduler | None = None,
+    translation: RecordingTranslationScheduler | None = None,
 ) -> ChatCoordinator:
     return ChatCoordinator(
         repository,
@@ -181,6 +193,7 @@ def coordinator(
         TurnBatchGenerationService(repository, generator),
         TurnBatchService(repository),
         memory_capture_scheduler=memory,
+        translation_scheduler=translation,
     )
 
 
@@ -263,6 +276,42 @@ async def test_enabled_conversation_generates_and_finishes_one_turn_batch(
     assert latest.run.response_duration_ms is not None
     assert latest.run.response_duration_ms >= 0
     assert latest.tokens_per_second == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_group_translation_is_manual_by_default_and_optional_per_conversation(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation = await make_conversation(repository)
+    await ConversationGroupSettingsService(repository).configure(
+        conversation.id, enabled=True, mode=TurnMode.STORY
+    )
+    placeholder = Message(
+        "unused",
+        conversation.id,
+        None,
+        None,
+        MessageRole.ASSISTANT,
+        "",
+        MessageState.COMPLETED,
+        datetime.now(UTC),
+        datetime.now(UTC),
+    )
+    translation = RecordingTranslationScheduler()
+    chat = coordinator(
+        repository,
+        SingleChatStub(placeholder),
+        RecordingGenerator(),
+        translation=translation,
+    )
+
+    await chat.send_message(conversation.id, "manual")
+    assert translation.message_ids == []
+
+    await repository.set_conversation_auto_translate(conversation.id, True)
+    response = await chat.send_message(conversation.id, "automatic")
+    assert translation.message_ids == [response.id]
 
 
 @pytest.mark.asyncio
