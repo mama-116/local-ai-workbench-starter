@@ -184,6 +184,48 @@ async def test_generator_streams_readable_preview_before_structured_output_finis
 
 
 @pytest.mark.asyncio
+async def test_round_table_trims_old_history_to_fit_4096_and_keeps_latest_user_turn() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "First answer.",
+            },
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-2",
+                "display_name": "Two",
+                "content": "Second answer.",
+            },
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+    latest = "3ターン目の質問を続けてください。"
+    history = tuple(
+        ChatMessageInput(
+            MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT,
+            (f"履歴{index}。" + "長い日本語の会話。" * 80),
+        )
+        for index in range(6)
+    ) + (ChatMessageInput(MessageRole.USER, latest),)
+    request = replace(
+        generation_request(),
+        mode=TurnMode.ROUND_TABLE,
+        messages=history,
+        options={"num_ctx": 4096},
+    )
+
+    await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(request)
+
+    [sent] = provider.requests
+    assert len(sent.messages) < len(history)
+    assert sent.messages[-1].content == latest
+    assert sent.messages[0].role is MessageRole.USER
+
+
+@pytest.mark.asyncio
 async def test_generator_preserves_ollama_performance_metrics() -> None:
     content = model_output(
         [

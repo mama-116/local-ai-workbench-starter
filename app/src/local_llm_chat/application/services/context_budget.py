@@ -108,10 +108,15 @@ class ContextBudgetPlanner:
 
 
 class ConservativeContextCounter:
-    """Use UTF-8 payload bytes as conservative tokenizer-independent units."""
+    """Estimate tokens from UTF-8 JSON payloads without a model tokenizer.
+
+    Three payload bytes per unit is intentionally conservative for English while
+    avoiding the previous one-byte/one-token assumption that rejected Japanese
+    prompts at roughly one third of the configured model context window.
+    """
 
     def count_text(self, value: str) -> int:
-        return self._json_bytes({"role": "system", "content": value})
+        return self._json_units({"role": "system", "content": value})
 
     def count_message(self, value: ChatMessageInput) -> int:
         payload: dict[str, object] = {
@@ -132,10 +137,10 @@ class ConservativeContextCounter:
                 }
                 for call in value.tool_calls
             ]
-        return self._json_bytes(payload)
+        return self._json_units(payload)
 
     def count_tool(self, value: ToolDefinition) -> int:
-        return self._json_bytes(
+        return self._json_units(
             {
                 "type": "function",
                 "function": {
@@ -147,8 +152,8 @@ class ConservativeContextCounter:
         )
 
     @staticmethod
-    def _json_bytes(value: object) -> int:
-        return len(
+    def _json_units(value: object) -> int:
+        payload_bytes = len(
             json.dumps(
                 value,
                 ensure_ascii=False,
@@ -156,6 +161,7 @@ class ConservativeContextCounter:
                 separators=(",", ":"),
             ).encode("utf-8")
         )
+        return max(1, (payload_bytes + 2) // 3)
 
 
 class ContextWindowManager:
