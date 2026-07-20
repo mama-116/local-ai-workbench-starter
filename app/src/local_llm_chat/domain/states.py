@@ -106,6 +106,47 @@ class CostClass(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ComputerActionType(StrEnum):
+    LAUNCH_ALLOWED_APP = "launch_allowed_app"
+    CLICK_UIA_ELEMENT = "click_uia_element"
+    TYPE_PLAIN_TEXT = "type_plain_text"
+
+
+class ComputerUseRunState(StrEnum):
+    PENDING = "pending"
+    AWAITING_APPROVAL = "awaiting_approval"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    DENIED = "denied"
+
+
+class ComputerActionState(StrEnum):
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    DENIED = "denied"
+
+
+class ComputerPolicyDecision(StrEnum):
+    ALLOW = "allow"
+    REQUIRE_APPROVAL = "require_approval"
+    DENY = "deny"
+
+
+class DesktopIntegrityLevel(StrEnum):
+    UNTRUSTED = "untrusted"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    SYSTEM = "system"
+    PROTECTED = "protected"
+
+
 class MemoryKind(StrEnum):
     PREFERENCE = "preference"
     SAFETY_CONSTRAINT = "safety_constraint"

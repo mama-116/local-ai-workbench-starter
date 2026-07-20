@@ -21,6 +21,11 @@ from local_llm_chat.domain.states import (
     ToolCallState,
     ContextSummaryState,
     JobRunState,
+    ComputerActionType,
+    ComputerActionState,
+    ComputerPolicyDecision,
+    ComputerUseRunState,
+    DesktopIntegrityLevel,
 )
 
 
@@ -467,6 +472,119 @@ class AgentStep:
     result_size_bytes: int | None
     result_sha256: str | None
     restore_token: str | None
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerUseLimits:
+    max_actions: int = 5
+    max_duration_seconds: float = 60.0
+    approval_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_actions <= 5:
+            raise ValueError("max_actions must be between 1 and 5")
+        if (
+            not math.isfinite(self.max_duration_seconds)
+            or not 0 < self.max_duration_seconds <= 60
+        ):
+            raise ValueError("max_duration_seconds must be between 0 and 60")
+        if (
+            not math.isfinite(self.approval_timeout_seconds)
+            or not 0 < self.approval_timeout_seconds <= 30
+        ):
+            raise ValueError(
+                "approval_timeout_seconds must be between 0 and 30"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerActionRequest:
+    id: str
+    action_type: ComputerActionType
+    target_profile_id: str
+    text: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action_type, ComputerActionType):
+            raise TypeError("action_type must be ComputerActionType")
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerPlan:
+    conversation_id: str
+    objective: str
+    observation_id: str
+    actions: tuple[ComputerActionRequest, ...]
+    limits: ComputerUseLimits = field(default_factory=ComputerUseLimits)
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerPlanApproval:
+    id: str
+    plan_hash: str
+    approved_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DesktopSecurityContext:
+    controller_user_sid: str
+    target_user_sid: str
+    controller_session_id: int
+    target_session_id: int
+    controller_integrity: DesktopIntegrityLevel
+    target_integrity: DesktopIntegrityLevel
+    controller_elevated: bool
+    target_elevated: bool
+    ui_access: bool
+    secure_desktop: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerPolicyResult:
+    decision: ComputerPolicyDecision
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerActionExecution:
+    action_id: str
+    result: str
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerUseExecution:
+    state: ComputerUseRunState
+    failure_reason: str | None
+    completed_action_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerUseRun:
+    id: str
+    conversation_id: str
+    objective: str
+    observation_id: str
+    plan_hash: str
+    limits: ComputerUseLimits
+    planned_action_count: int
+    state: ComputerUseRunState
+    failure_reason: str | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerActionAudit:
+    id: str
+    run_id: str
+    ordinal: int
+    request: ComputerActionRequest
+    state: ComputerActionState
     failure_reason: str | None
     created_at: datetime
     started_at: datetime | None = None

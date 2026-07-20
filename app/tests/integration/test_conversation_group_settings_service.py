@@ -140,4 +140,3 @@ async def test_failed_settings_update_rolls_back_the_previous_mode(
         )
 
     assert await service.get(conversation_id) == before
-

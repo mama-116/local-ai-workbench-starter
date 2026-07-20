@@ -5,8 +5,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from local_llm_chat.application.services.chat_service import ChatService
 from local_llm_chat.application.services.chat_coordinator import ChatCoordinator
+from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.computer_use_access_service import (
+    ComputerUseAccessService,
+)
+from local_llm_chat.application.services.computer_use_service import (
+    ComputerUseCoordinator,
+)
 from local_llm_chat.application.services.memory_candidate_service import (
     DEFAULT_MEMORY_TEMPLATES,
     MemoryCandidateService,
@@ -45,6 +51,9 @@ from local_llm_chat.infrastructure.llm.ollama_registry import (
     LOCAL_ENDPOINT,
     LOCAL_PROVIDER_NAME,
     OllamaProviderRegistry,
+)
+from local_llm_chat.infrastructure.computer_use.fake_action_broker import (
+    FakeDesktopActionBroker,
 )
 from local_llm_chat.infrastructure.llm.ollama_memory_candidate_extractor import (
     OllamaMemoryCandidateExtractor,
@@ -106,6 +115,7 @@ class AppContainer:
     chat: ChatCoordinator
     tool_access: ToolAccessService
     scheduler: SchedulerService
+    computer_use: ComputerUseAccessService
 
     async def close(self) -> None:
         await _close_services_in_order(
@@ -163,6 +173,10 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     )
     scheduler = SchedulerService(repository, {})
     scheduler.start()
+    computer_use = ComputerUseAccessService(
+        repository,
+        ComputerUseCoordinator(FakeDesktopActionBroker(repository)),
+    )
 
     single_chat = ChatService(
         repository,
@@ -191,6 +205,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         memory_extractor=memory_extractor,
         tool_access=tool_access,
         scheduler=scheduler,
+        computer_use=computer_use,
         chat=ChatCoordinator(
             repository,
             single_chat,
