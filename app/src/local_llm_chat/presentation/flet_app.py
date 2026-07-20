@@ -12,8 +12,23 @@ from local_llm_chat.application.model_selection import (
     model_option_label,
     recommend_chat_model,
 )
+from local_llm_chat.application.services.conversation_timeline_service import (
+    ConversationTimelineItem,
+)
+from local_llm_chat.application.services.memory_capture_service import (
+    MemoryCaptureUpdate,
+)
+from local_llm_chat.application.services.memory_decision_service import (
+    MemoryDecisionAction,
+    MemoryDecisionRequest,
+)
+from local_llm_chat.application.services.memory_review_service import (
+    MemoryReviewSnapshot,
+)
 from local_llm_chat.bootstrap import AppContainer
+from local_llm_chat.domain.canonical_memory import CanonicalMemoryReviewItem
 from local_llm_chat.domain.errors import AppError
+from local_llm_chat.domain.group_turns import ConversationGroupConfiguration
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
@@ -41,6 +56,14 @@ from local_llm_chat.presentation.components.computer_use_review import (
     ComputerUseReviewDialog,
 )
 from local_llm_chat.presentation.components.message_bubble import MessageBubble
+from local_llm_chat.presentation.components.group_chat_settings_dialog import (
+    GroupChatSettingsDialog,
+    GroupChatSettingsInput,
+    group_configuration_summary,
+)
+from local_llm_chat.presentation.components.turn_segment_bubble import (
+    TurnSegmentBubble,
+)
 
 ACCENT = "#F2A65A"
 MINT = "#55C2A3"
@@ -77,6 +100,13 @@ class LocalChatApp:
         self.tool_folder_grant: ToolFolderGrant | None = None
         self.tool_audits: list[ToolCallAudit] = []
         self.computer_use_runs: list[ComputerUseRun] = []
+        self.group_configuration: ConversationGroupConfiguration | None = None
+        self.memory_review = MemoryReviewSnapshot((), ())
+        self._new_memory_event_ids: list[str] = []
+        self._memory_notice_conversation_id: str | None = None
+        self._memory_notice_branch_id: str | None = None
+        self._memory_decision_in_progress = False
+        self._memory_saved_expanded = False
         self.selected_conversation_id: str | None = None
         self.guard_error: str | None = None
         self.selected_provider_name: str | None = None
@@ -321,17 +351,110 @@ class LocalChatApp:
         )
         self.character_dropdown = self._dropdown("キャラクター")
         self.character_dropdown.on_select = self.update_selection
+        self.group_chat_summary = ft.Text("単独会話", size=11, color=MUTED)
+        self.group_chat_button = ft.Button(
+            "キャストとモード",
+            icon=ft.Icons.GROUPS_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_group_chat_dialog,
+            disabled=True,
+        )
+        self.memory_undo_list = ft.Column(spacing=6)
+        self.memory_undo_bar = ft.Container(
+            visible=False,
+            bgcolor="#202A26",
+            border=ft.Border.all(1, MINT),
+            border_radius=12,
+            padding=10,
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(
+                                "今回保存した記憶",
+                                size=11,
+                                color=TEXT,
+                                weight=ft.FontWeight.W_600,
+                            ),
+                            ft.Container(expand=True),
+                            ft.IconButton(
+                                icon=ft.Icons.CLOSE_ROUNDED,
+                                icon_color=MUTED,
+                                tooltip="通知を閉じる（記憶は残ります）",
+                                on_click=self.dismiss_memory_undo_bar,
+                            ),
+                        ],
+                        spacing=4,
+                    ),
+                    self.memory_undo_list,
+                ],
+                spacing=4,
+            ),
+        )
+        self.memory_pending_count = ft.Text("確認待ち 0件", size=11, color=MUTED)
+        self.memory_pending_list = ft.Column(spacing=7, visible=False)
+        self.memory_saved_count = ft.Text("保存済み 0件", size=11, color=MUTED)
+        self.memory_saved_list = ft.Column(spacing=7, visible=False)
+        self.memory_saved_toggle = ft.Button(
+            "保存済みを表示",
+            icon=ft.Icons.EXPAND_MORE_ROUNDED,
+            color=MUTED,
+            bgcolor="#292925",
+            on_click=self.toggle_saved_memories,
+            disabled=True,
+        )
+        self.memory_card = ft.Container(
+            bgcolor="#242421",
+            border_radius=14,
+            padding=12,
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.MEMORY_ROUNDED, size=16, color=MINT),
+                            ft.Text(
+                                "正史記憶",
+                                size=11,
+                                weight=ft.FontWeight.W_600,
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                    self.memory_pending_count,
+                    self.memory_pending_list,
+                    self.memory_saved_count,
+                    self.memory_saved_toggle,
+                    self.memory_saved_list,
+                ],
+                spacing=8,
+            ),
+        )
         self.connection_dropdown = self._dropdown("Ollama接続先")
         self.connection_dropdown.on_select = self.switch_connection
         self.model_dropdown = self._dropdown("モデル")
         self.model_dropdown.on_select = self.update_selection
         self.branch_dropdown = self._dropdown("会話の分岐")
         self.branch_dropdown.on_select = self.activate_branch
-        self.archive_button = ft.Button(
-            "会話を保管",
-            icon=ft.Icons.ARCHIVE_ROUNDED,
+        self.auto_translate_switch = ft.Switch(
+            label="回答後に自動翻訳",
+            value=False,
+            active_color=MINT,
+            on_change=self.update_auto_translate,
+        )
+        self.manage_branches_button = ft.Button(
+            "分岐を整理",
+            icon=ft.Icons.ACCOUNT_TREE_ROUNDED,
             color=MUTED,
             bgcolor="#242421",
+            on_click=self.show_branch_management,
+            disabled=True,
+        )
+        self.archive_button = ft.Button(
+            "会話をゴミ箱へ移動",
+            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+            color="#D87866",
+            bgcolor="#302522",
             on_click=self.confirm_archive,
             disabled=True,
         )
@@ -347,6 +470,7 @@ class LocalChatApp:
         self.container.translations.subscribe(self._on_translation_update)
         self.container.telemetry.subscribe(self._on_telemetry_update)
         self.container.tool_access.subscribe(self._on_tool_update)
+        self.container.memory_capture.subscribe(self._on_memory_capture)
 
     async def initialize(self) -> None:
         self._configure_page()
@@ -393,8 +517,8 @@ class LocalChatApp:
                     ft.Text("CONVERSATIONS", size=10, color="#6F6B64"),
                     self.conversation_list,
                     ft.Button(
-                        "保管庫",
-                        icon=ft.Icons.ARCHIVE_ROUNDED,
+                        "ゴミ箱",
+                        icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
                         color=MUTED,
                         bgcolor="#22221F",
                         on_click=self.show_archive_dialog,
@@ -430,6 +554,7 @@ class LocalChatApp:
                         content=ft.Column(
                             [
                                 self.rag_selection_bar,
+                                self.memory_undo_bar,
                                 ft.Row(
                                     [self.rag_button, self.composer, self.send_button],
                                     spacing=10,
@@ -475,16 +600,35 @@ class LocalChatApp:
                     self._section_label("PERSONA"),
                     self.character_dropdown,
                     ft.Button(
-                        "キャラクターを追加・編集",
+                        "キャラクターを追加",
+                        icon=ft.Icons.ADD_ROUNDED,
+                        color=TEXT,
+                        bgcolor="#292925",
+                        on_click=self.show_new_character_dialog,
+                    ),
+                    ft.Button(
+                        "選択中を編集",
                         icon=ft.Icons.EDIT_ROUNDED,
                         color=TEXT,
                         bgcolor="#292925",
-                        on_click=self.show_character_dialog,
+                        on_click=self.show_selected_character_dialog,
                     ),
+                    self._section_label("GROUP CHAT"),
+                    self.group_chat_summary,
+                    self.group_chat_button,
+                    self.memory_card,
                     self._section_label("LOCAL MODEL"),
                     self.model_dropdown,
                     self._section_label("BRANCH"),
                     self.branch_dropdown,
+                    self.manage_branches_button,
+                    self._section_label("TRANSLATION"),
+                    self.auto_translate_switch,
+                    ft.Text(
+                        "OFFでも、必要な回答だけ手動で翻訳できます。",
+                        size=10,
+                        color="#716D65",
+                    ),
                     self.archive_button,
                     ft.Text(
                         "会話・設定・実行ログはこのPC内のSQLiteだけに保存します。",
@@ -723,7 +867,19 @@ class LocalChatApp:
             self.title_text.value = "最初の会話を作りましょう"
             self.subtitle_text.value = "右側で無料運営の状態を確認できます"
             self.archive_button.disabled = True
+            self.manage_branches_button.disabled = True
+            self.auto_translate_switch.disabled = True
+            self.auto_translate_switch.value = False
             self.character_dropdown.value = None
+            self.character_dropdown.disabled = False
+            self.group_configuration = None
+            self.memory_review = MemoryReviewSnapshot((), ())
+            self._new_memory_event_ids.clear()
+            self._memory_notice_conversation_id = None
+            self._memory_notice_branch_id = None
+            self._render_memory_review()
+            self.group_chat_summary.value = "会話を選択してください"
+            self.group_chat_button.disabled = True
             self.connection_dropdown.value = self.selected_provider_name
             self.model_dropdown.value = None
             self.branch_dropdown.options = []
@@ -754,6 +910,17 @@ class LocalChatApp:
             f"{selection.model_profile.model_name}"
         )
         self.character_dropdown.value = selection.character.id
+        self.group_configuration = await self.container.group_configuration.get(
+            conversation.id
+        )
+        self.group_chat_summary.value = group_configuration_summary(
+            self.group_configuration
+        )
+        self.group_chat_button.disabled = self._generation_task is not None
+        self.character_dropdown.disabled = (
+            self.group_configuration.settings.enabled
+            or len(self.group_configuration.cast.members) > 1
+        )
         self.selected_provider_name = selection.model_profile.provider
         self.connection_dropdown.value = selection.model_profile.provider
         allowed_model_names = {model.name for model in self.models}
@@ -763,12 +930,25 @@ class LocalChatApp:
             else None
         )
         self.archive_button.disabled = False
+        self.manage_branches_button.disabled = self._generation_task is not None
+        self.auto_translate_switch.disabled = self._generation_task is not None
+        self.auto_translate_switch.value = conversation.auto_translate
         self.branches = await self.container.conversations.branches(conversation.id)
         self.branch_dropdown.options = [
             ft.DropdownOption(branch.id, f"分岐 {index + 1}")
             for index, branch in enumerate(self.branches)
         ]
         self.branch_dropdown.value = conversation.active_branch_id
+        if (
+            self._memory_notice_conversation_id != conversation.id
+            or self._memory_notice_branch_id != conversation.active_branch_id
+        ):
+            self._new_memory_event_ids.clear()
+            self._memory_notice_conversation_id = conversation.id
+            self._memory_notice_branch_id = conversation.active_branch_id
+        await self._refresh_memory_review(
+            conversation.id, conversation.active_branch_id
+        )
         await self._refresh_messages(conversation.id)
         self.selected_rag_documents = await self.container.rag.selected_documents(
             conversation.id
@@ -776,8 +956,255 @@ class LocalChatApp:
         self._render_rag_selection()
         self._set_composer_enabled(bool(self.models) and self._generation_task is None)
 
+    async def _refresh_memory_review(
+        self, conversation_id: str, branch_id: str
+    ) -> None:
+        self.memory_review = await self.container.memory_review.list_items(
+            conversation_id, branch_id
+        )
+        undoable_ids = {item.event_id for item in self.memory_review.undoable}
+        self._new_memory_event_ids = [
+            event_id
+            for event_id in self._new_memory_event_ids
+            if event_id in undoable_ids
+        ]
+        self._render_memory_review()
+
+    async def _on_memory_capture(self, update: MemoryCaptureUpdate) -> None:
+        conversation = self._selected_conversation()
+        if (
+            conversation is None
+            or update.conversation_id != conversation.id
+            or update.branch_id != conversation.active_branch_id
+        ):
+            return
+        snapshot = await self.container.memory_review.list_items(
+            conversation.id, conversation.active_branch_id
+        )
+        current = self._selected_conversation()
+        if (
+            current is None
+            or current.id != update.conversation_id
+            or current.active_branch_id != update.branch_id
+        ):
+            return
+        self.memory_review = snapshot
+        self._memory_notice_conversation_id = current.id
+        self._memory_notice_branch_id = current.active_branch_id
+        undoable_ids = {item.event_id for item in self.memory_review.undoable}
+        for event_id in update.persisted_event_ids:
+            if event_id in undoable_ids and event_id not in self._new_memory_event_ids:
+                self._new_memory_event_ids.append(event_id)
+        self._render_memory_review()
+        self.page.update(self.memory_card, self.memory_undo_bar)
+
+    def _render_memory_review(self) -> None:
+        pending = self.memory_review.pending_confirmation
+        self.memory_pending_count.value = f"確認待ち {len(pending)}件"
+        self.memory_pending_count.color = ACCENT if pending else MUTED
+        pending_controls: list[ft.Control] = []
+        for item in pending:
+            async def confirm(event_id: str = item.event_id) -> None:
+                await self._decide_memory(event_id, MemoryDecisionAction.CONFIRM)
+
+            async def reject(event_id: str = item.event_id) -> None:
+                await self._decide_memory(event_id, MemoryDecisionAction.REJECT)
+
+            pending_controls.append(
+                ft.Container(
+                    bgcolor="#2A2925",
+                    border_radius=10,
+                    padding=9,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                self._memory_item_label(item),
+                                size=11,
+                                color=TEXT,
+                                selectable=True,
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Button(
+                                        "承認",
+                                        color="#17120D",
+                                        bgcolor=MINT,
+                                        on_click=confirm,
+                                        disabled=self._memory_decision_in_progress,
+                                    ),
+                                    ft.Button(
+                                        "却下",
+                                        color=ERROR,
+                                        bgcolor="#332A27",
+                                        on_click=reject,
+                                        disabled=self._memory_decision_in_progress,
+                                    ),
+                                ],
+                                spacing=6,
+                            ),
+                        ],
+                        spacing=7,
+                    ),
+                )
+            )
+        self.memory_pending_list.controls = pending_controls
+        self.memory_pending_list.visible = bool(pending_controls)
+
+        saved_controls: list[ft.Control] = []
+        saved_items = self.memory_review.undoable
+        for item in saved_items if self._memory_saved_expanded else ():
+            async def undo_saved(event_id: str = item.event_id) -> None:
+                await self._decide_memory(event_id, MemoryDecisionAction.UNDO)
+
+            saved_controls.append(
+                ft.Container(
+                    bgcolor="#2A2925",
+                    border_radius=10,
+                    padding=9,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                self._memory_item_label(item),
+                                size=11,
+                                color=TEXT,
+                                selectable=True,
+                            ),
+                            ft.Button(
+                                "元に戻す",
+                                color=ACCENT,
+                                bgcolor="#332E27",
+                                on_click=undo_saved,
+                                disabled=self._memory_decision_in_progress,
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                )
+            )
+        self.memory_saved_count.value = f"保存済み {len(saved_items)}件"
+        self.memory_saved_toggle.disabled = not saved_items
+        self.memory_saved_toggle.content = (
+            "保存済みを隠す" if self._memory_saved_expanded else "保存済みを表示"
+        )
+        self.memory_saved_toggle.icon = (
+            ft.Icons.EXPAND_LESS_ROUNDED
+            if self._memory_saved_expanded
+            else ft.Icons.EXPAND_MORE_ROUNDED
+        )
+        self.memory_saved_list.controls = saved_controls
+        self.memory_saved_list.visible = (
+            self._memory_saved_expanded and bool(saved_items)
+        )
+
+        by_id = {item.event_id: item for item in self.memory_review.undoable}
+        undo_controls: list[ft.Control] = []
+        for event_id in self._new_memory_event_ids:
+            undo_item = by_id.get(event_id)
+            if undo_item is None:
+                continue
+
+            async def undo(target_id: str = event_id) -> None:
+                await self._decide_memory(target_id, MemoryDecisionAction.UNDO)
+
+            undo_controls.append(
+                ft.Row(
+                    [
+                        ft.Text(
+                            self._memory_item_label(undo_item),
+                            size=11,
+                            color=TEXT,
+                            expand=True,
+                            selectable=True,
+                        ),
+                        ft.Button(
+                            "元に戻す",
+                            color=ACCENT,
+                            bgcolor="#332E27",
+                            on_click=undo,
+                            disabled=self._memory_decision_in_progress,
+                        ),
+                    ],
+                    spacing=8,
+                )
+            )
+        self.memory_undo_list.controls = undo_controls
+        self.memory_undo_bar.visible = bool(undo_controls)
+
+    async def _decide_memory(
+        self, event_id: str, action: MemoryDecisionAction
+    ) -> None:
+        conversation = self._selected_conversation()
+        if conversation is None or self._memory_decision_in_progress:
+            return
+        self._memory_decision_in_progress = True
+        self._render_memory_review()
+        self.page.update(self.memory_card, self.memory_undo_bar)
+        try:
+            await self.container.memory_review.decide(
+                MemoryDecisionRequest(
+                    conversation.id,
+                    conversation.active_branch_id,
+                    event_id,
+                    action,
+                )
+            )
+            self._new_memory_event_ids = [
+                item for item in self._new_memory_event_ids if item != event_id
+            ]
+            message = {
+                MemoryDecisionAction.CONFIRM: "記憶を承認しました。",
+                MemoryDecisionAction.REJECT: "記憶候補を却下しました。",
+                MemoryDecisionAction.UNDO: "保存した記憶を元に戻しました。",
+            }[action]
+            self._toast(message, MINT)
+        except AppError as error:
+            self._toast(f"記憶の状態が変わりました。再確認してください。 {error}", ERROR)
+        finally:
+            self._memory_decision_in_progress = False
+            current = self._selected_conversation()
+            if current is None:
+                self.memory_review = MemoryReviewSnapshot((), ())
+                self._new_memory_event_ids.clear()
+                self._render_memory_review()
+            else:
+                await self._refresh_memory_review(
+                    current.id, current.active_branch_id
+                )
+            self.page.update(self.memory_card, self.memory_undo_bar)
+
+    def dismiss_memory_undo_bar(self) -> None:
+        self._new_memory_event_ids.clear()
+        self._render_memory_review()
+        self.page.update(self.memory_undo_bar)
+
+    def toggle_saved_memories(self) -> None:
+        self._memory_saved_expanded = not self._memory_saved_expanded
+        self._render_memory_review()
+        self.page.update(self.memory_card)
+
+    @staticmethod
+    def _memory_item_label(item: CanonicalMemoryReviewItem) -> str:
+        subject = "あなた" if item.subject_id == "user" else item.subject_id
+        slot = {
+            "favorite_food": "一番好きな食べ物",
+            "liked_food": "好きな食べ物",
+            "food_allergy": "食物アレルギー",
+            "personal_goal": "目標",
+            "club_membership_intent": "所属の意向",
+        }.get(item.slot, item.slot)
+        scope = (
+            "会話内で共有"
+            if not item.known_by_character_ids
+            else f"知っている人物 {len(item.known_by_character_ids)}人"
+        )
+        return f"{subject}の{slot}: {item.value}（{scope}）"
+
     async def _refresh_messages(self, conversation_id: str) -> None:
-        messages = await self.container.conversations.messages(conversation_id)
+        timeline_items = await self.container.timeline.list_items(conversation_id)
+        messages_by_id = {
+            item.message.id: item.message for item in timeline_items
+        }
+        messages = list(messages_by_id.values())
         self.message_translations = (
             await self.container.translations.list_current(
                 [message.id for message in messages]
@@ -786,9 +1213,36 @@ class LocalChatApp:
         self.message_rag_usage = await self.container.rag.message_usage(
             [message.id for message in messages]
         )
-        self.message_list.controls = [self._message_bubble(message) for message in messages]
-        if not messages:
+        self.message_list.controls = [
+            self._timeline_control(item) for item in timeline_items
+        ]
+        if not timeline_items:
             self._show_empty_state("何を話しましょう。すべての内容はこのPC内に残ります。")
+
+    def _timeline_control(self, item: ConversationTimelineItem) -> ft.Control:
+        if item.segment is None or item.turn_batch is None:
+            return self._message_bubble(item.message)
+        return TurnSegmentBubble(
+            item.segment,
+            item.turn_batch,
+            item.message.created_at,
+            is_batch_end=item.is_batch_end,
+            on_regenerate=(
+                lambda: self.page.run_task(self.regenerate_turn_batch, item.message)
+                if item.is_batch_end
+                else None
+            ),
+            translation=(
+                self.message_translations.get(item.message.id)
+                if item.is_batch_end
+                else None
+            ),
+            on_translate=(
+                lambda: self.page.run_task(self.translate_message, item.message)
+                if item.is_batch_end and item.message.state is MessageState.COMPLETED
+                else None
+            ),
+        )
 
     def _message_bubble(self, message: Message) -> MessageBubble:
         if message.role is MessageRole.USER:
@@ -945,6 +1399,38 @@ class LocalChatApp:
         except AppError as error:
             self._toast(str(error), ERROR)
 
+    async def show_group_chat_dialog(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None or self._generation_task is not None:
+            return
+        configuration = await self.container.group_configuration.get(
+            conversation_id
+        )
+
+        async def save(value: GroupChatSettingsInput) -> None:
+            try:
+                await self.container.group_configuration.save(
+                    conversation_id,
+                    character_version_ids=value.character_version_ids,
+                    enabled=value.enabled,
+                    mode=value.mode,
+                    spotlight_character_id=value.spotlight_character_id,
+                )
+                self.page.pop_dialog()
+                await self.refresh_all()
+                self._toast("グループ会話の設定を保存しました。", MINT)
+            except AppError as error:
+                self._toast(str(error), ERROR)
+
+        self.page.show_dialog(
+            GroupChatSettingsDialog(
+                configuration,
+                self.characters,
+                save,
+                self._close_dialog,
+            )
+        )
+
     async def activate_branch(self) -> None:
         if self.selected_conversation_id is None or not self.branch_dropdown.value:
             return
@@ -955,6 +1441,95 @@ class LocalChatApp:
             await self.refresh_all()
         except AppError as error:
             self._toast(str(error), ERROR)
+
+    async def update_auto_translate(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None or self._generation_task is not None:
+            return
+        try:
+            await self.container.conversations.set_auto_translate(
+                conversation_id, bool(self.auto_translate_switch.value)
+            )
+            await self.refresh_all()
+            label = "ON" if self.auto_translate_switch.value else "OFF"
+            self._toast(f"この会話の自動翻訳を{label}にしました。", MINT)
+        except AppError as error:
+            await self.refresh_all()
+            self._toast(str(error), ERROR)
+
+    async def show_branch_management(self) -> None:
+        conversation = self._selected_conversation()
+        if conversation is None or self._generation_task is not None:
+            return
+        branches = await self.container.conversations.all_branches(conversation.id)
+        items: list[ft.Control] = []
+        for index, branch in enumerate(branches):
+            is_active = branch.id == conversation.active_branch_id
+            is_root = branch.parent_branch_id is None
+            status = "使用中" if is_active else "非表示" if branch.hidden_at else "表示中"
+
+            async def change_visibility(
+                branch_id: str = branch.id,
+                restore: bool = branch.hidden_at is not None,
+            ) -> None:
+                try:
+                    if restore:
+                        await self.container.conversations.restore_branch(
+                            conversation.id, branch_id
+                        )
+                    else:
+                        await self.container.conversations.hide_branch(
+                            conversation.id, branch_id
+                        )
+                    self.page.pop_dialog()
+                    await self.refresh_all()
+                    self._toast(
+                        "分岐を表示しました。" if restore else "分岐を非表示にしました。",
+                        MINT,
+                    )
+                except AppError as error:
+                    self._toast(str(error), ERROR)
+
+            action_label = "表示に戻す" if branch.hidden_at else "非表示にする"
+            items.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(f"分岐 {index + 1}", color=TEXT),
+                                    ft.Text(
+                                        f"{status}{' · root' if is_root else ''}",
+                                        size=10,
+                                        color=MUTED,
+                                    ),
+                                ],
+                                expand=True,
+                                spacing=2,
+                            ),
+                            ft.Button(
+                                action_label,
+                                color=MUTED,
+                                bgcolor="#302E29",
+                                disabled=is_active or is_root,
+                                on_click=change_visibility,
+                            ),
+                        ]
+                    ),
+                    bgcolor="#2A2925",
+                    border_radius=12,
+                    padding=12,
+                )
+            )
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="分岐管理",
+                content=ft.ListView(items, spacing=8, width=460, height=360),
+                bgcolor="#24231F",
+                actions=[ft.Button("閉じる", on_click=self._close_dialog)],
+            )
+        )
 
     async def send_message(self) -> None:
         content = (self.composer.value or "").strip()
@@ -1365,6 +1940,28 @@ class LocalChatApp:
 
         await self._run_generation(conversation_id, action)
 
+    async def regenerate_turn_batch(self, source: Message) -> None:
+        conversation = self._selected_conversation()
+        if (
+            conversation is None
+            or conversation.id != source.conversation_id
+            or self._generation_task is not None
+        ):
+            return
+        conversation_id = conversation.id
+        expected_active_branch_id = conversation.active_branch_id
+
+        async def action(on_update: Callable[[str], Awaitable[None]]) -> Message:
+            return await self.container.chat.regenerate_turn_batch(
+                conversation_id,
+                source.id,
+                expected_active_branch_id,
+                on_update,
+                self._context_notice,
+            )
+
+        await self._run_generation(conversation_id, action)
+
     async def _run_generation(
         self,
         conversation_id: str,
@@ -1584,11 +2181,19 @@ class LocalChatApp:
             )
         )
 
-    def show_character_dialog(self) -> None:
-        current = next(
-            (item for item in self.characters if item.id == self.character_dropdown.value),
-            None,
-        )
+    def show_new_character_dialog(self) -> None:
+        self.show_character_dialog(create_new=True)
+
+    def show_selected_character_dialog(self) -> None:
+        self.show_character_dialog(create_new=False)
+
+    def show_character_dialog(self, *, create_new: bool = False) -> None:
+        current = None
+        if not create_new:
+            current = next(
+                (item for item in self.characters if item.id == self.character_dropdown.value),
+                None,
+            )
         name = ft.TextField(label="名前", value=current.display_name if current else "")
         prompt = ft.TextField(
             label="ふるまい・話し方",
@@ -1615,12 +2220,17 @@ class LocalChatApp:
 
         dialog = ft.AlertDialog(
             modal=True,
-            title="キャラクター設定",
+            title="新しいキャラクター" if create_new else "キャラクター設定",
             bgcolor="#24231F",
             content=ft.Column([name, prompt], tight=True, width=460),
             actions=[
                 ft.Button("キャンセル", on_click=self._close_dialog),
-                ft.Button("版を保存", bgcolor=ACCENT, color="#17120D", on_click=save),
+                ft.Button(
+                    "追加" if create_new else "版を保存",
+                    bgcolor=ACCENT,
+                    color="#17120D",
+                    on_click=save,
+                ),
             ],
         )
         self.page.show_dialog(dialog)
@@ -1677,17 +2287,17 @@ class LocalChatApp:
                 await self.container.conversations.archive(conversation_id)
                 self.selected_conversation_id = None
                 await self.refresh_all()
-                self._toast("会話を保管しました。データは削除していません。", MINT)
+                self._toast("会話をゴミ箱へ移動しました。元に戻せます。", MINT)
 
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title="会話を保管しますか？",
-                content=ft.Text("一覧から隠れますが、データは削除されません。"),
+                title="会話をゴミ箱へ移動しますか？",
+                content=ft.Text("一覧から隠れますが、ゴミ箱から元に戻せます。"),
                 bgcolor="#24231F",
                 actions=[
                     ft.Button("やめる", on_click=self._close_dialog),
-                    ft.Button("保管する", bgcolor="#56342E", color=TEXT, on_click=archive),
+                    ft.Button("ゴミ箱へ移動", bgcolor="#56342E", color=TEXT, on_click=archive),
                 ],
             )
         )
@@ -1695,7 +2305,7 @@ class LocalChatApp:
     async def show_archive_dialog(self) -> None:
         archived = await self.container.conversations.list_archived_conversations()
         if not archived:
-            self._toast("保管中の会話はありません。", MUTED)
+            self._toast("ゴミ箱は空です。", MUTED)
             return
 
         items: list[ft.Control] = []
@@ -1736,7 +2346,7 @@ class LocalChatApp:
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title="保管庫",
+                title="ゴミ箱",
                 bgcolor="#24231F",
                 content=ft.ListView(items, spacing=8, width=460, height=360),
                 actions=[ft.Button("閉じる", on_click=self._close_dialog)],
@@ -1747,6 +2357,16 @@ class LocalChatApp:
         self.stop_button.visible = busy
         self.send_button.visible = not busy
         self.restart_button.disabled = busy
+        self.group_chat_button.disabled = (
+            busy or self.selected_conversation_id is None
+        )
+        self.manage_branches_button.disabled = (
+            busy or self.selected_conversation_id is None
+        )
+        self.auto_translate_switch.disabled = (
+            busy or self.selected_conversation_id is None
+        )
+        self.archive_button.disabled = busy or self.selected_conversation_id is None
         self._set_composer_enabled(not busy and self.selected_conversation_id is not None)
         self.page.update()
 

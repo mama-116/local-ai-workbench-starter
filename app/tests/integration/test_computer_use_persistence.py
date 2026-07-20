@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -152,13 +152,36 @@ async def test_approval_can_be_consumed_only_once_across_instances(
     await first.create_computer_plan_approval(run.id, approval)
 
     results = await asyncio.gather(
-        first.verify_and_consume(approval, run.plan_hash),
-        second.verify_and_consume(approval, run.plan_hash),
+        first.verify_and_consume(approval, run.plan_hash, NOW),
+        second.verify_and_consume(approval, run.plan_hash, NOW),
     )
 
     assert sorted(results) == [False, True]
     assert (await first.get_computer_use_run(run.id)).state is ComputerUseRunState.RUNNING
-    assert await second.verify_and_consume(approval, run.plan_hash) is False
+    assert await second.verify_and_consume(approval, run.plan_hash, NOW) is False
+
+
+@pytest.mark.asyncio
+async def test_repository_rejects_approval_after_plan_deadline(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    conversation_id = await create_conversation(repository)
+    value = plan(conversation_id)
+    run = await repository.create_computer_use_run(awaiting_run("run-1", value))
+    await add_all_actions(repository, run, value)
+    approval = ComputerPlanApproval("approval-1", run.plan_hash, NOW)
+    await repository.create_computer_plan_approval(run.id, approval)
+
+    assert not await repository.verify_and_consume(
+        approval,
+        run.plan_hash,
+        NOW + timedelta(seconds=run.limits.approval_timeout_seconds),
+    )
+    assert (
+        await repository.get_computer_use_run(run.id)
+    ).state is ComputerUseRunState.AWAITING_APPROVAL
 
 
 @pytest.mark.asyncio
@@ -203,7 +226,7 @@ async def test_terminal_audit_cannot_be_rewritten(tmp_path: Path) -> None:
     actions = await add_all_actions(repository, run, value)
     approval = ComputerPlanApproval("approval-1", run.plan_hash, NOW)
     await repository.create_computer_plan_approval(run.id, approval)
-    assert await repository.verify_and_consume(approval, run.plan_hash)
+    assert await repository.verify_and_consume(approval, run.plan_hash, NOW)
     completed_actions: list[ComputerActionAudit] = []
     for action in actions:
         action = await repository.update_computer_action(
@@ -259,7 +282,7 @@ async def test_incomplete_action_audit_blocks_approval_and_completion(
     approval = ComputerPlanApproval("approval-1", run.plan_hash, NOW)
     await repository.create_computer_plan_approval(run.id, approval)
 
-    assert await repository.verify_and_consume(approval, run.plan_hash) is False
+    assert await repository.verify_and_consume(approval, run.plan_hash, NOW) is False
     stored = await repository.get_computer_use_run(run.id)
     assert stored.state is ComputerUseRunState.AWAITING_APPROVAL
     with pytest.raises(ValidationError):
@@ -280,7 +303,7 @@ async def test_action_cannot_be_added_after_approval_is_consumed(
     await add_all_actions(repository, run, value)
     approval = ComputerPlanApproval("approval-1", run.plan_hash, NOW)
     await repository.create_computer_plan_approval(run.id, approval)
-    assert await repository.verify_and_consume(approval, run.plan_hash)
+    assert await repository.verify_and_consume(approval, run.plan_hash, NOW)
 
     with pytest.raises(ValidationError):
         await repository.create_computer_action(

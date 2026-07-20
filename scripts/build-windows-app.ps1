@@ -90,7 +90,33 @@ try {
     $env:CL = if ([string]::IsNullOrWhiteSpace($previousCl)) { '/utf-8' } else { $previousCl + ' /utf-8' }
 
     New-Item -ItemType Directory -Force -Path $stagedApp | Out-Null
-    Copy-Item -LiteralPath $pyprojectPath -Destination $stagedApp -Force
+    $stagedPyproject = Join-Path $stagedApp 'pyproject.toml'
+    $stagedRequirements = Join-Path $stagedApp 'requirements.txt'
+    Copy-Item -LiteralPath $pyprojectPath -Destination $stagedPyproject -Force
+    $stagedConfig = Get-Content -LiteralPath $stagedPyproject -Raw -Encoding utf8
+    $dependencyBlockPattern = '(?ms)^dependencies\s*=\s*\[.*?^\]\s*$'
+    if ([regex]::Matches($stagedConfig, $dependencyBlockPattern).Count -ne 1) {
+        throw 'The staged project dependency block could not be isolated.'
+    }
+    $stagedConfig = [regex]::Replace(
+        $stagedConfig,
+        $dependencyBlockPattern,
+        'dependencies = []'
+    )
+    [System.IO.File]::WriteAllText(
+        $stagedPyproject,
+        $stagedConfig,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    & uv export --frozen --project $appRoot `
+        --no-dev `
+        --no-emit-project `
+        --no-hashes `
+        --format requirements.txt `
+        --output-file $stagedRequirements
+    if ($LASTEXITCODE -ne 0) {
+        throw "Locked runtime dependency export failed with exit code $LASTEXITCODE."
+    }
     Copy-Item -LiteralPath (Join-Path $appRoot 'README.md') -Destination $stagedApp -Force
     Copy-Item -LiteralPath (Join-Path $appRoot 'src') -Destination $stagedApp -Recurse -Force
 

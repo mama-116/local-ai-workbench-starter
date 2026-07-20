@@ -5,15 +5,36 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from uuid import uuid4
 
+from local_llm_chat.domain.canonical_memory import (
+    CanonicalMemoryEvent,
+    CanonicalMemoryFact,
+    CanonicalMemoryReviewItem,
+    CanonicalMemoryLedger,
+    MemoryApprovalDecision,
+    MemoryProjectionQuery,
+    transitive_superseded_event_ids,
+)
 from local_llm_chat.domain.errors import (
     ConversationNotFound,
     PersistenceError,
     ValidationError,
+)
+from local_llm_chat.domain.group_turns import (
+    MAX_FORMAL_CHARACTERS,
+    ConversationCast,
+    ConversationGroupConfiguration,
+    ConversationGroupSettings,
+    FormalCastMember,
+    TurnBatch,
+    TurnBatchDraft,
+    TurnSegment,
+    validate_conversation_group_settings,
 )
 from local_llm_chat.domain.models import (
     AgentExecutionLimits,
@@ -59,11 +80,18 @@ from local_llm_chat.domain.states import (
     DataClassification,
     CostClass,
     Locality,
+    MemoryApprovalState,
+    MemoryCardinality,
+    MemoryKind,
     MessageRole,
     MessageState,
     ContextSummaryState,
     JobRunState,
     RunState,
+    TurnBatchState,
+    TurnMode,
+    TurnRepairState,
+    TurnSpeakerKind,
     TranslationState,
     ToolCallState,
 )
@@ -765,13 +793,11 @@ class SQLiteAppRepository:
         self,
         approval: ComputerPlanApproval,
         plan_hash: str,
-        verified_at: datetime | None = None,
+        verified_at: datetime,
     ) -> bool:
         approved_at = _utc_iso(approval.approved_at)
-        verified_time: datetime | None = None
-        if verified_at is not None:
-            _utc_iso(verified_at)
-            verified_time = verified_at.astimezone(UTC)
+        _utc_iso(verified_at)
+        verified_time = verified_at.astimezone(UTC)
 
         def operation(connection: sqlite3.Connection) -> bool:
             connection.execute("BEGIN IMMEDIATE")
@@ -789,16 +815,13 @@ class SQLiteAppRepository:
             ).fetchone()
             if row is None:
                 return False
-            if verified_time is not None:
-                created_at = datetime.fromisoformat(str(row["created_at"]))
-                deadline = created_at + timedelta(
-                    seconds=float(row["approval_timeout_seconds"])
-                )
-                approval_time = approval.approved_at.astimezone(UTC)
-                if not (
-                    created_at <= approval_time <= verified_time < deadline
-                ):
-                    return False
+            created_at = datetime.fromisoformat(str(row["created_at"]))
+            deadline = created_at + timedelta(
+                seconds=float(row["approval_timeout_seconds"])
+            )
+            approval_time = approval.approved_at.astimezone(UTC)
+            if not created_at <= approval_time <= verified_time < deadline:
+                return False
             run_id = str(row["run_id"])
             audit = connection.execute(
                 """
@@ -1445,6 +1468,35 @@ class SQLiteAppRepository:
                 "UPDATE conversations SET active_branch_id = ? WHERE id = ?",
                 (branch_id, conversation_id),
             )
+            character_row = connection.execute(
+                "SELECT character_id FROM character_versions WHERE id = ?",
+                (character_version_id,),
+            ).fetchone()
+            if character_row is None:
+                raise ValidationError("conversation character version was not found")
+            connection.execute(
+                """
+                INSERT INTO conversation_cast_members(
+                    conversation_id, character_id, character_version_id,
+                    position, added_at
+                ) VALUES(?, ?, ?, 0, ?)
+                """,
+                (
+                    conversation_id,
+                    str(character_row["character_id"]),
+                    character_version_id,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO conversation_group_settings(
+                    conversation_id, enabled, mode,
+                    spotlight_character_id, updated_at
+                ) VALUES(?, 0, 'story', NULL, ?)
+                """,
+                (conversation_id, now),
+            )
             return Conversation(
                 id=conversation_id,
                 title=title.strip() or "新しい会話",
@@ -1496,6 +1548,32 @@ class SQLiteAppRepository:
         model_profile_id: str,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            version_row = connection.execute(
+                """
+                SELECT cv.character_id
+                FROM character_versions cv
+                JOIN characters c ON c.id = cv.character_id
+                WHERE cv.id = ? AND c.archived_at IS NULL
+                """,
+                (character_version_id,),
+            ).fetchone()
+            if version_row is None:
+                raise ValidationError("conversation character version was not found")
+            cast_rows = connection.execute(
+                """
+                SELECT character_version_id
+                FROM conversation_cast_members
+                WHERE conversation_id = ? ORDER BY position
+                """,
+                (conversation_id,),
+            ).fetchall()
+            if len(cast_rows) > 1 and character_version_id != str(
+                cast_rows[0]["character_version_id"]
+            ):
+                raise ValidationError(
+                    "multi-person character changes must use the formal cast service"
+                )
             cursor = connection.execute(
                 """
                 UPDATE conversations
@@ -1504,6 +1582,48 @@ class SQLiteAppRepository:
                 """,
                 (character_version_id, model_profile_id, _now(), conversation_id),
             )
+            cast_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM conversation_cast_members WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            assert cast_count is not None
+            if cursor.rowcount == 1 and int(cast_count["count"]) == 1:
+                connection.execute(
+                    "DELETE FROM conversation_cast_members WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conversation_cast_members(
+                        conversation_id, character_id, character_version_id,
+                        position, added_at
+                    ) VALUES(?, ?, ?, 0, ?)
+                    """,
+                    (
+                        conversation_id,
+                        str(version_row["character_id"]),
+                        character_version_id,
+                        _now(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE conversation_group_settings
+                    SET mode = 'story', spotlight_character_id = NULL,
+                        updated_at = ?
+                    WHERE conversation_id = ?
+                      AND spotlight_character_id IS NOT NULL
+                      AND spotlight_character_id <> ?
+                    """,
+                    (
+                        _now(),
+                        conversation_id,
+                        str(version_row["character_id"]),
+                    ),
+                )
             if cursor.rowcount != 1:
                 raise ConversationNotFound("会話が見つかりません。")
 
@@ -1535,6 +1655,24 @@ class SQLiteAppRepository:
 
         await self._write(operation)
 
+    async def set_conversation_auto_translate(
+        self, conversation_id: str, enabled: bool
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            self._require_conversation(connection, conversation_id)
+            cursor = connection.execute(
+                """
+                UPDATE conversations
+                SET auto_translate = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                """,
+                (int(enabled), _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("会話の翻訳設定を保存できません。")
+
+        await self._write(operation)
+
     async def list_active_messages(self, conversation_id: str) -> list[Message]:
         def operation(connection: sqlite3.Connection) -> list[Message]:
             conversation = self._require_conversation(connection, conversation_id)
@@ -1546,6 +1684,35 @@ class SQLiteAppRepository:
         return await self._read(
             lambda connection: self._require_message(connection, message_id)
         )
+
+    async def get_memory_source_message(
+        self, conversation_id: str, branch_id: str, source_message_id: str
+    ) -> Message:
+        def operation(connection: sqlite3.Connection) -> Message:
+            self._require_conversation(connection, conversation_id)
+            branch = connection.execute(
+                "SELECT 1 FROM branches WHERE id = ? AND conversation_id = ?",
+                (branch_id, conversation_id),
+            ).fetchone()
+            if branch is None:
+                raise ValidationError("memory branch is not in the conversation")
+            source = self._require_message(connection, source_message_id)
+            if (
+                source.conversation_id != conversation_id
+                or source.role is not MessageRole.USER
+                or source.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError(
+                    "memory source must be a completed user message in the conversation"
+                )
+            branch_message_ids = {
+                message.id for message in self._message_path(connection, branch_id)
+            }
+            if source_message_id not in branch_message_ids:
+                raise ValidationError("memory source is not in the selected branch")
+            return source
+
+        return await self._read(operation)
 
     async def get_response_model(self, message_id: str) -> tuple[str, str]:
         def operation(connection: sqlite3.Connection) -> tuple[str, str]:
@@ -1738,6 +1905,22 @@ class SQLiteAppRepository:
 
     async def list_branches(self, conversation_id: str) -> list[BranchInfo]:
         def operation(connection: sqlite3.Connection) -> list[BranchInfo]:
+            self._require_conversation(connection, conversation_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM branches
+                WHERE conversation_id = ? AND hidden_at IS NULL
+                ORDER BY created_at
+                """,
+                (conversation_id,),
+            ).fetchall()
+            return [self._branch_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def list_all_branches(self, conversation_id: str) -> list[BranchInfo]:
+        def operation(connection: sqlite3.Connection) -> list[BranchInfo]:
+            self._require_conversation(connection, conversation_id)
             rows = connection.execute(
                 "SELECT * FROM branches WHERE conversation_id = ? ORDER BY created_at",
                 (conversation_id,),
@@ -1748,18 +1931,511 @@ class SQLiteAppRepository:
 
     async def activate_branch(self, conversation_id: str, branch_id: str) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_conversation(connection, conversation_id)
             branch = connection.execute(
-                "SELECT id FROM branches WHERE id = ? AND conversation_id = ?",
+                """
+                SELECT id FROM branches
+                WHERE id = ? AND conversation_id = ? AND hidden_at IS NULL
+                """,
                 (branch_id, conversation_id),
             ).fetchone()
             if branch is None:
-                raise ValidationError("会話の続きが見つかりません。")
+                raise ValidationError("会話の分岐が見つからないか、非表示です。")
             connection.execute(
                 "UPDATE conversations SET active_branch_id = ?, updated_at = ? WHERE id = ?",
                 (branch_id, _now(), conversation_id),
             )
 
         await self._write(operation)
+
+    async def hide_branch(self, conversation_id: str, branch_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, branch_id)
+            if branch.conversation_id != conversation_id:
+                raise ValidationError("別の会話の分岐は非表示にできません。")
+            if branch.parent_branch_id is None:
+                raise ValidationError("最初の分岐は非表示にできません。")
+            if branch.id == conversation.active_branch_id:
+                raise ValidationError("使用中の分岐は非表示にできません。")
+            cursor = connection.execute(
+                "UPDATE branches SET hidden_at = ? WHERE id = ? AND hidden_at IS NULL",
+                (_now(), branch_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("この分岐はすでに非表示です。")
+
+        await self._write(operation)
+
+    async def restore_branch(self, conversation_id: str, branch_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            self._require_conversation(connection, conversation_id)
+            branch = self._require_branch(connection, branch_id)
+            if branch.conversation_id != conversation_id:
+                raise ValidationError("別の会話の分岐は復元できません。")
+            cursor = connection.execute(
+                "UPDATE branches SET hidden_at = NULL WHERE id = ? AND hidden_at IS NOT NULL",
+                (branch_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("この分岐は非表示になっていません。")
+
+        await self._write(operation)
+
+    async def get_conversation_cast(
+        self, conversation_id: str
+    ) -> ConversationCast:
+        def operation(connection: sqlite3.Connection) -> ConversationCast:
+            self._require_conversation(connection, conversation_id)
+            return self._load_conversation_cast(connection, conversation_id)
+
+        return await self._read(operation)
+
+    async def set_conversation_cast(
+        self, conversation_id: str, character_version_ids: tuple[str, ...]
+    ) -> ConversationCast:
+        if not 1 <= len(character_version_ids) <= MAX_FORMAL_CHARACTERS:
+            raise ValidationError("formal cast must contain 1 to 5 characters")
+
+        def operation(connection: sqlite3.Connection) -> ConversationCast:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_conversation(connection, conversation_id)
+            now = _now()
+            cast = self._replace_conversation_cast(
+                connection, conversation_id, character_version_ids, now
+            )
+            stable_ids = tuple(member.character_id for member in cast.members)
+            placeholders_for_characters = ",".join("?" for _ in stable_ids)
+            connection.execute(
+                f"""
+                UPDATE conversation_group_settings
+                SET mode = 'story', spotlight_character_id = NULL, updated_at = ?
+                WHERE conversation_id = ?
+                  AND spotlight_character_id IS NOT NULL
+                  AND spotlight_character_id NOT IN ({placeholders_for_characters})
+                """,
+                (now, conversation_id, *stable_ids),
+            )
+            return cast
+
+        return await self._write(operation)
+
+    async def get_conversation_group_configuration(
+        self, conversation_id: str
+    ) -> ConversationGroupConfiguration:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> ConversationGroupConfiguration:
+            self._require_conversation(connection, conversation_id)
+            return ConversationGroupConfiguration(
+                self._load_conversation_cast(connection, conversation_id),
+                self._load_conversation_group_settings(
+                    connection, conversation_id
+                ),
+            )
+
+        return await self._read(operation)
+
+    async def set_conversation_group_configuration(
+        self,
+        conversation_id: str,
+        character_version_ids: tuple[str, ...],
+        enabled: bool,
+        mode: TurnMode,
+        spotlight_character_id: str | None,
+    ) -> ConversationGroupConfiguration:
+        if not 1 <= len(character_version_ids) <= MAX_FORMAL_CHARACTERS:
+            raise ValidationError("formal cast must contain 1 to 5 characters")
+        validate_conversation_group_settings(
+            enabled, mode, spotlight_character_id
+        )
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> ConversationGroupConfiguration:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_conversation(connection, conversation_id)
+            now = _now()
+            cast = self._replace_conversation_cast(
+                connection, conversation_id, character_version_ids, now
+            )
+            stable_ids = {member.character_id for member in cast.members}
+            if (
+                spotlight_character_id is not None
+                and spotlight_character_id not in stable_ids
+            ):
+                raise ValidationError(
+                    "spotlight character must belong to the registered cast"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE conversation_group_settings
+                SET enabled = ?, mode = ?, spotlight_character_id = ?, updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (
+                    int(enabled),
+                    mode.value,
+                    spotlight_character_id,
+                    now,
+                    conversation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("conversation group settings were not found")
+            return ConversationGroupConfiguration(
+                cast,
+                self._load_conversation_group_settings(
+                    connection, conversation_id
+                ),
+            )
+
+        return await self._write(operation)
+
+    async def get_conversation_group_settings(
+        self, conversation_id: str
+    ) -> ConversationGroupSettings:
+        def operation(connection: sqlite3.Connection) -> ConversationGroupSettings:
+            self._require_conversation(connection, conversation_id)
+            return self._load_conversation_group_settings(
+                connection, conversation_id
+            )
+
+        return await self._read(operation)
+
+    async def set_conversation_group_settings(
+        self,
+        conversation_id: str,
+        enabled: bool,
+        mode: TurnMode,
+        spotlight_character_id: str | None,
+    ) -> ConversationGroupSettings:
+        validate_conversation_group_settings(
+            enabled, mode, spotlight_character_id
+        )
+
+        def operation(connection: sqlite3.Connection) -> ConversationGroupSettings:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = self._require_conversation(connection, conversation_id)
+            if conversation.archived_at is not None:
+                raise ValidationError("archived conversation settings cannot be changed")
+            if spotlight_character_id is not None:
+                found = connection.execute(
+                    """
+                    SELECT 1 FROM conversation_cast_members
+                    WHERE conversation_id = ? AND character_id = ?
+                    """,
+                    (conversation_id, spotlight_character_id),
+                ).fetchone()
+                if found is None:
+                    raise ValidationError(
+                        "spotlight character must belong to the registered cast"
+                    )
+            now = _now()
+            cursor = connection.execute(
+                """
+                UPDATE conversation_group_settings
+                SET enabled = ?, mode = ?, spotlight_character_id = ?, updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (
+                    int(enabled),
+                    mode.value,
+                    spotlight_character_id,
+                    now,
+                    conversation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("conversation group settings were not found")
+            return self._load_conversation_group_settings(
+                connection, conversation_id
+            )
+
+        return await self._write(operation)
+
+    async def append_canonical_memory_event(
+        self, event: CanonicalMemoryEvent
+    ) -> None:
+        await self.append_canonical_memory_events((event,))
+
+    async def append_canonical_memory_events(
+        self, events: tuple[CanonicalMemoryEvent, ...]
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            for event in events:
+                self._append_canonical_memory_event_in_transaction(connection, event)
+
+        await self._write(operation)
+
+    async def append_captured_memory_events(
+        self, events: tuple[CanonicalMemoryEvent, ...]
+    ) -> tuple[str, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[str, ...]:
+            single_keys: set[
+                tuple[str, str, str, MemoryKind, str, frozenset[str]]
+            ] = set()
+            for event in events:
+                if event.cardinality is not MemoryCardinality.SINGLE:
+                    continue
+                key = (
+                    event.conversation_id,
+                    event.branch_id,
+                    event.subject_id,
+                    event.kind,
+                    event.slot,
+                    event.known_by_character_ids,
+                )
+                if key in single_keys:
+                    raise ValidationError(
+                        "one message cannot capture multiple values for one single slot"
+                    )
+                single_keys.add(key)
+
+            persisted_ids: list[str] = []
+            for event in events:
+                persisted_id = self._append_captured_memory_event_in_transaction(
+                    connection, event
+                )
+                if persisted_id is not None:
+                    persisted_ids.append(persisted_id)
+            return tuple(persisted_ids)
+
+        return await self._write(operation)
+
+    async def append_memory_approval_decision(
+        self, decision: MemoryApprovalDecision
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            target_row = connection.execute(
+                "SELECT conversation_id FROM canonical_memory_events WHERE id = ?",
+                (decision.target_event_id,),
+            ).fetchone()
+            if target_row is None:
+                raise ValidationError("判断対象の正史記憶が見つかりません。")
+            conversation_id = str(target_row["conversation_id"])
+            source = self._require_message(connection, decision.source_message_id)
+            if source.conversation_id != conversation_id:
+                raise ValidationError("記憶判断の出典が別の会話に属しています。")
+            events, decisions = self._load_canonical_memory_stream(
+                connection, conversation_id
+            )
+            duplicate = next((item for item in decisions if item.id == decision.id), None)
+            if duplicate is not None:
+                if duplicate == decision:
+                    return
+                raise ValidationError("同じIDの記憶判断が既に存在します。")
+            self._validate_memory_ledger(events, (*decisions, decision))
+            connection.execute(
+                """
+                INSERT INTO canonical_memory_decisions(
+                    id, conversation_id, target_event_id, state,
+                    source_message_id, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.id,
+                    conversation_id,
+                    decision.target_event_id,
+                    decision.state.value,
+                    decision.source_message_id,
+                    _utc_iso(decision.recorded_at),
+                ),
+            )
+
+        await self._write(operation)
+
+    async def decide_canonical_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        target_event_id: str,
+        state: MemoryApprovalState,
+        decision_id: str,
+        recorded_at: datetime,
+    ) -> MemoryApprovalDecision:
+        allowed_states = {
+            MemoryApprovalState.CONFIRMED,
+            MemoryApprovalState.REJECTED,
+            MemoryApprovalState.UNDONE,
+        }
+        if state not in allowed_states:
+            raise ValidationError("unsupported memory decision state")
+        if recorded_at.tzinfo is None:
+            raise ValidationError("memory decision timestamp must be timezone-aware")
+
+        def operation(connection: sqlite3.Connection) -> MemoryApprovalDecision:
+            self._require_conversation(connection, conversation_id)
+            branch = connection.execute(
+                "SELECT 1 FROM branches WHERE id = ? AND conversation_id = ?",
+                (branch_id, conversation_id),
+            ).fetchone()
+            if branch is None:
+                raise ValidationError("memory decision branch is not in the conversation")
+            branch_lineage = self._branch_lineage(
+                connection, conversation_id, branch_id
+            )
+            visible_source_ids = {
+                message.id for message in self._message_path(connection, branch_id)
+            }
+            events, decisions = self._load_canonical_memory_stream(
+                connection, conversation_id
+            )
+            target = next(
+                (item for item in events if item.id == target_event_id), None
+            )
+            if target is None:
+                raise ValidationError("memory decision target does not exist")
+            if (
+                target.branch_id not in branch_lineage
+                or target.source_message_id not in visible_source_ids
+            ):
+                raise ValidationError(
+                    "memory decision target is outside the selected branch path"
+                )
+
+            duplicate = next(
+                (item for item in decisions if item.id == decision_id), None
+            )
+            if duplicate is not None:
+                same_command = (
+                    duplicate.target_event_id == target.id
+                    and duplicate.state is state
+                    and duplicate.source_message_id == target.source_message_id
+                )
+                target_decisions = tuple(
+                    item for item in decisions if item.target_event_id == target.id
+                )
+                if same_command and target_decisions[-1].id == duplicate.id:
+                    return duplicate
+                raise ValidationError("memory decision command is stale or conflicting")
+
+            if state is MemoryApprovalState.UNDONE:
+                decision_states = {item.id: item.approval for item in events}
+                for item in decisions:
+                    decision_states[item.target_event_id] = item.state
+                visible_events = tuple(
+                    item
+                    for item in events
+                    if item.branch_id in branch_lineage
+                    and item.source_message_id in visible_source_ids
+                )
+                accepted_events = tuple(
+                    item
+                    for item in visible_events
+                    if decision_states[item.id]
+                    in {
+                        MemoryApprovalState.AUTO_SAVED,
+                        MemoryApprovalState.CONFIRMED,
+                    }
+                )
+                superseded_ids = transitive_superseded_event_ids(
+                    accepted_events, visible_events
+                )
+                if target.id in superseded_ids:
+                    raise ValidationError(
+                        "memory decision target is no longer active"
+                    )
+
+            decision = MemoryApprovalDecision(
+                id=decision_id,
+                target_event_id=target.id,
+                state=state,
+                source_message_id=target.source_message_id,
+                recorded_at=max(recorded_at, target.recorded_at),
+            )
+            self._validate_memory_ledger(events, (*decisions, decision))
+            connection.execute(
+                """
+                INSERT INTO canonical_memory_decisions(
+                    id, conversation_id, target_event_id, state,
+                    source_message_id, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.id,
+                    conversation_id,
+                    decision.target_event_id,
+                    decision.state.value,
+                    decision.source_message_id,
+                    _utc_iso(decision.recorded_at),
+                ),
+            )
+            return decision
+
+        return await self._write(operation)
+
+    async def project_canonical_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        speaker_character_id: str,
+        current_source_message_id: str | None = None,
+        include_historical: bool = False,
+    ) -> tuple[CanonicalMemoryFact, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[CanonicalMemoryFact, ...]:
+            self._require_conversation(connection, conversation_id)
+            speaker = connection.execute(
+                "SELECT 1 FROM characters WHERE id = ?", (speaker_character_id,)
+            ).fetchone()
+            if speaker is None:
+                raise ValidationError("発言キャラクターが見つかりません。")
+            if current_source_message_id is not None:
+                source = self._require_message(connection, current_source_message_id)
+                if source.conversation_id != conversation_id:
+                    raise ValidationError("現在応答の出典が別の会話に属しています。")
+            branch_lineage = self._branch_lineage(connection, conversation_id, branch_id)
+            visible_source_message_ids = frozenset(
+                message.id for message in self._message_path(connection, branch_id)
+            )
+            events, decisions = self._load_canonical_memory_stream(
+                connection, conversation_id
+            )
+            ledger = self._validate_memory_ledger(events, decisions)
+            return ledger.project(
+                MemoryProjectionQuery(
+                    conversation_id=conversation_id,
+                    branch_lineage=branch_lineage,
+                    speaker_character_id=speaker_character_id,
+                    current_source_message_id=current_source_message_id,
+                    include_historical=include_historical,
+                    visible_source_message_ids=visible_source_message_ids,
+                )
+            )
+
+        return await self._read(operation)
+
+    async def list_canonical_memory_review_items(
+        self, conversation_id: str, branch_id: str
+    ) -> tuple[CanonicalMemoryReviewItem, ...]:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[CanonicalMemoryReviewItem, ...]:
+            self._require_conversation(connection, conversation_id)
+            branch = connection.execute(
+                "SELECT 1 FROM branches WHERE id = ? AND conversation_id = ?",
+                (branch_id, conversation_id),
+            ).fetchone()
+            if branch is None:
+                raise ValidationError("memory review branch is not in the conversation")
+            branch_lineage = self._branch_lineage(
+                connection, conversation_id, branch_id
+            )
+            visible_source_message_ids = frozenset(
+                message.id for message in self._message_path(connection, branch_id)
+            )
+            events, decisions = self._load_canonical_memory_stream(
+                connection, conversation_id
+            )
+            return self._validate_memory_ledger(events, decisions).review(
+                conversation_id,
+                branch_lineage,
+                visible_source_message_ids,
+            )
+
+        return await self._read(operation)
 
     async def start_send(self, conversation_id: str, content: str) -> RunSession:
         if not content.strip():
@@ -2112,6 +2788,290 @@ class SQLiteAppRepository:
             return self._message_from_row(row)
 
         return await self._write(operation)
+
+    async def finish_turn_batch(
+        self, session: RunSession, draft: TurnBatchDraft
+    ) -> TurnBatch:
+        def operation(connection: sqlite3.Connection) -> TurnBatch:
+            connection.execute("BEGIN IMMEDIATE")
+            now = _now()
+            batch_id = str(uuid4())
+            branch = connection.execute(
+                """
+                SELECT 1 FROM branches
+                WHERE id = ? AND conversation_id = ? AND head_message_id = ?
+                """,
+                (
+                    session.branch_id,
+                    session.run.conversation_id,
+                    session.assistant_message.id,
+                ),
+            ).fetchone()
+            if branch is None:
+                raise ValidationError(
+                    "turn batch branch does not own the response message"
+                )
+            cast_rows = connection.execute(
+                """
+                SELECT character_id FROM conversation_cast_members
+                WHERE conversation_id = ? ORDER BY position
+                """,
+                (session.run.conversation_id,),
+            ).fetchall()
+            registered_character_ids = tuple(
+                str(row["character_id"]) for row in cast_rows
+            )
+            if draft.formal_character_ids != registered_character_ids:
+                raise ValidationError(
+                    "turn batch formal characters do not match the registered cast"
+                )
+            group_settings = self._load_conversation_group_settings(
+                connection, session.run.conversation_id
+            )
+            if (
+                not group_settings.enabled
+                or draft.mode is not group_settings.mode
+                or draft.spotlight_character_id
+                != group_settings.spotlight_character_id
+            ):
+                raise ValidationError(
+                    "turn batch mode does not match current group settings"
+                )
+            fallback_content = "\n\n".join(
+                f"{segment.display_name.strip()}: {segment.content.strip()}"
+                for segment in draft.segments
+            )
+            message_cursor = connection.execute(
+                """
+                UPDATE messages SET content = ?, state = 'completed', completed_at = ?
+                WHERE id = ? AND conversation_id = ?
+                  AND state IN ('pending', 'streaming')
+                """,
+                (
+                    fallback_content,
+                    now,
+                    session.assistant_message.id,
+                    session.run.conversation_id,
+                ),
+            )
+            if message_cursor.rowcount != 1:
+                raise PersistenceError("turn batch response is already terminal")
+            run_state = (
+                RunState.COMPLETED
+                if draft.state is TurnBatchState.COMPLETED
+                else RunState.FAILED
+            )
+            run_cursor = connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, started_at = COALESCE(started_at, ?), completed_at = ?,
+                    prompt_tokens = ?, output_tokens = ?, total_duration_ns = ?,
+                    generation_duration_ns = ?, response_duration_ms = ?, error_code = ?
+                WHERE id = ? AND conversation_id = ?
+                  AND request_message_id = ? AND response_message_id = ?
+                  AND state IN ('pending', 'running')
+                """,
+                (
+                    run_state.value,
+                    now,
+                    now,
+                    draft.prompt_tokens,
+                    draft.output_tokens,
+                    draft.total_duration_ns,
+                    draft.generation_duration_ns,
+                    draft.response_duration_ms,
+                    draft.error_code.strip() if draft.error_code is not None else None,
+                    session.run.id,
+                    session.run.conversation_id,
+                    session.user_message.id,
+                    session.assistant_message.id,
+                ),
+            )
+            if run_cursor.rowcount != 1:
+                raise PersistenceError("turn batch run is already terminal")
+            connection.execute(
+                """
+                INSERT INTO turn_batches(
+                    id, conversation_id, branch_id, source_message_id,
+                    response_message_id, run_id, model, mode,
+                    formal_character_ids_json, guest_ids_json, prompt_version,
+                    state, repair_state, error_code, created_at,
+                    spotlight_character_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    session.run.conversation_id,
+                    session.branch_id,
+                    session.user_message.id,
+                    session.assistant_message.id,
+                    session.run.id,
+                    session.run.model,
+                    draft.mode.value,
+                    json.dumps(draft.formal_character_ids, ensure_ascii=False),
+                    json.dumps(draft.guest_ids, ensure_ascii=False),
+                    draft.prompt_version.strip(),
+                    draft.state.value,
+                    draft.repair_state.value,
+                    draft.error_code.strip() if draft.error_code is not None else None,
+                    now,
+                    draft.spotlight_character_id,
+                ),
+            )
+            for position, segment in enumerate(draft.segments):
+                connection.execute(
+                    """
+                    INSERT INTO turn_segments(
+                        id, turn_batch_id, position, speaker_kind, speaker_id,
+                        display_name, content
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        batch_id,
+                        position,
+                        segment.speaker_kind.value,
+                        segment.speaker_id,
+                        segment.display_name.strip(),
+                        segment.content.strip(),
+                    ),
+                )
+            return self._load_turn_batch(connection, batch_id)
+
+        return await self._write(operation)
+
+    async def start_turn_batch_regenerate(
+        self,
+        conversation_id: str,
+        source_response_message_id: str,
+        expected_active_branch_id: str,
+    ) -> RunSession:
+        def operation(connection: sqlite3.Connection) -> RunSession:
+            conversation = self._require_conversation(connection, conversation_id)
+            if conversation.active_branch_id != expected_active_branch_id:
+                raise ValidationError("active branch changed before regeneration")
+
+            batch_row = connection.execute(
+                "SELECT * FROM turn_batches WHERE response_message_id = ?",
+                (source_response_message_id,),
+            ).fetchone()
+            if batch_row is None:
+                raise ValidationError("turn batch was not found for the response")
+            if str(batch_row["conversation_id"]) != conversation_id:
+                raise ValidationError("turn batch belongs to another conversation")
+
+            source_response = self._require_message(
+                connection, source_response_message_id
+            )
+            source_user = self._require_message(
+                connection, str(batch_row["source_message_id"])
+            )
+            if (
+                source_response.conversation_id != conversation_id
+                or source_response.role is not MessageRole.ASSISTANT
+                or source_response.state is not MessageState.COMPLETED
+                or source_response.parent_message_id != source_user.id
+                or source_user.conversation_id != conversation_id
+                or source_user.role is not MessageRole.USER
+                or source_user.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError("turn batch source messages are inconsistent")
+
+            source_branch = self._require_branch(
+                connection, str(batch_row["branch_id"])
+            )
+            if source_branch.conversation_id != conversation_id:
+                raise ValidationError("turn batch branch belongs to another conversation")
+
+            branch_id = str(uuid4())
+            now = _now()
+            connection.execute(
+                """
+                INSERT INTO branches(
+                    id, conversation_id, parent_branch_id,
+                    forked_from_message_id, created_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    branch_id,
+                    conversation_id,
+                    source_branch.id,
+                    source_response.id,
+                    now,
+                ),
+            )
+            session = self._insert_run_session(
+                connection=connection,
+                conversation=conversation,
+                branch_id=branch_id,
+                parent_message_id=source_user.id,
+                user_content=None,
+                source_message_id=source_response.id,
+                existing_user=source_user,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE conversations SET active_branch_id = ?, updated_at = ?
+                WHERE id = ? AND active_branch_id = ?
+                """,
+                (branch_id, now, conversation_id, expected_active_branch_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("active branch changed before regeneration")
+            return session
+
+        return await self._write(operation)
+
+    async def get_turn_batch_for_response(
+        self, response_message_id: str
+    ) -> TurnBatch:
+        def operation(connection: sqlite3.Connection) -> TurnBatch:
+            row = connection.execute(
+                "SELECT id FROM turn_batches WHERE response_message_id = ?",
+                (response_message_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("turn batch was not found for the response")
+            return self._load_turn_batch(connection, str(row["id"]))
+
+        return await self._read(operation)
+
+    async def list_turn_batches_for_responses(
+        self, response_message_ids: tuple[str, ...]
+    ) -> tuple[TurnBatch, ...]:
+        if not response_message_ids:
+            return ()
+
+        def operation(connection: sqlite3.Connection) -> tuple[TurnBatch, ...]:
+            placeholders = ",".join("?" for _ in response_message_ids)
+            batch_rows = connection.execute(
+                f"SELECT * FROM turn_batches WHERE response_message_id IN ({placeholders})",
+                response_message_ids,
+            ).fetchall()
+            if not batch_rows:
+                return ()
+            batch_ids = tuple(str(row["id"]) for row in batch_rows)
+            batch_placeholders = ",".join("?" for _ in batch_ids)
+            segment_rows = connection.execute(
+                f"SELECT * FROM turn_segments WHERE turn_batch_id IN ({batch_placeholders}) "
+                "ORDER BY turn_batch_id, position",
+                batch_ids,
+            ).fetchall()
+            segments_by_batch: dict[str, list[sqlite3.Row]] = {
+                batch_id: [] for batch_id in batch_ids
+            }
+            for segment_row in segment_rows:
+                segments_by_batch[str(segment_row["turn_batch_id"])].append(
+                    segment_row
+                )
+            return tuple(
+                self._turn_batch_from_row(
+                    row, tuple(segments_by_batch[str(row["id"])])
+                )
+                for row in batch_rows
+            )
+
+        return await self._read(operation)
 
     async def save_telemetry_metrics(
         self, run_id: str, metrics: tuple[TelemetryMetric, ...]
@@ -2559,6 +3519,195 @@ class SQLiteAppRepository:
         )
         return RunSession(user, assistant, run, branch_id)
 
+    def _append_captured_memory_event_in_transaction(
+        self, connection: sqlite3.Connection, event: CanonicalMemoryEvent
+    ) -> str | None:
+        if event.supersedes_event_id is not None:
+            raise ValidationError(
+                "captured memory must not choose its own replacement target"
+            )
+        self._require_conversation(connection, event.conversation_id)
+        branch_lineage = self._branch_lineage(
+            connection, event.conversation_id, event.branch_id
+        )
+        message_path = self._message_path(connection, event.branch_id)
+        message_positions = {
+            message.id: index for index, message in enumerate(message_path)
+        }
+        if event.source_message_id not in message_positions:
+            raise ValidationError("captured memory source is not in the branch")
+        existing_events, decisions = self._load_canonical_memory_stream(
+            connection, event.conversation_id
+        )
+        duplicate = next(
+            (item for item in existing_events if item.id == event.id), None
+        )
+        if duplicate is not None:
+            normalized = replace(
+                event,
+                supersedes_event_id=duplicate.supersedes_event_id,
+                recorded_at=duplicate.recorded_at,
+            )
+            if duplicate == normalized:
+                return duplicate.id
+            raise ValidationError("canonical memory event id already exists")
+
+        if event.cardinality is MemoryCardinality.MULTIPLE:
+            self._append_canonical_memory_event_in_transaction(connection, event)
+            return event.id
+
+        matching = tuple(
+            item
+            for item in existing_events
+            if item.branch_id in branch_lineage
+            and item.source_message_id in message_positions
+            and item.subject_id == event.subject_id
+            and item.kind is event.kind
+            and item.slot == event.slot
+            and item.cardinality is MemoryCardinality.SINGLE
+        )
+        states = {item.id: item.approval for item in existing_events}
+        for decision in decisions:
+            states[decision.target_event_id] = decision.state
+        unresolved = tuple(
+            item
+            for item in matching
+            if states[item.id] is MemoryApprovalState.PENDING_CONFIRMATION
+        )
+        if unresolved:
+            raise ValidationError(
+                "single-slot memory has an unresolved confirmation candidate"
+            )
+        accepted = tuple(
+            item
+            for item in matching
+            if states[item.id]
+            in {MemoryApprovalState.AUTO_SAVED, MemoryApprovalState.CONFIRMED}
+        )
+        superseded_ids = transitive_superseded_event_ids(accepted, matching)
+        active = tuple(item for item in accepted if item.id not in superseded_ids)
+        if len(active) > 1:
+            raise PersistenceError("single-slot memory has multiple active values")
+
+        replacement_target = active[0] if active else None
+        if replacement_target is not None:
+            incoming_position = message_positions.get(event.source_message_id)
+            target_position = message_positions.get(
+                replacement_target.source_message_id
+            )
+            if incoming_position is None or target_position is None:
+                raise ValidationError(
+                    "single-slot source is not in the selected branch"
+                )
+            if incoming_position < target_position:
+                return None
+            if incoming_position == target_position:
+                raise ValidationError(
+                    "one source message cannot set two single-slot values"
+                )
+            if (
+                replacement_target.known_by_character_ids
+                != event.known_by_character_ids
+            ):
+                raise ValidationError(
+                    "single-slot knowledge scope changes require explicit confirmation"
+                )
+            if replacement_target.value == event.value:
+                return None
+            event = replace(
+                event,
+                supersedes_event_id=replacement_target.id,
+                recorded_at=max(event.recorded_at, replacement_target.recorded_at),
+            )
+        self._append_canonical_memory_event_in_transaction(connection, event)
+        return event.id
+
+    def _append_canonical_memory_event_in_transaction(
+        self, connection: sqlite3.Connection, event: CanonicalMemoryEvent
+    ) -> None:
+        self._require_conversation(connection, event.conversation_id)
+        branch_lineage = self._branch_lineage(
+            connection, event.conversation_id, event.branch_id
+        )
+        source = self._require_message(connection, event.source_message_id)
+        if source.conversation_id != event.conversation_id:
+            raise ValidationError("memory source belongs to another conversation")
+        branch_message_ids = {
+            message.id for message in self._message_path(connection, event.branch_id)
+        }
+        if event.source_message_id not in branch_message_ids:
+            raise ValidationError("memory source is not in the selected branch")
+
+        existing_events, decisions = self._load_canonical_memory_stream(
+            connection, event.conversation_id
+        )
+        duplicate = next(
+            (item for item in existing_events if item.id == event.id), None
+        )
+        if duplicate is not None:
+            if duplicate == event:
+                return
+            raise ValidationError("canonical memory event id already exists")
+        if event.supersedes_event_id is not None:
+            target = next(
+                (
+                    item
+                    for item in existing_events
+                    if item.id == event.supersedes_event_id
+                ),
+                None,
+            )
+            if target is not None and (
+                target.branch_id not in branch_lineage
+                or target.source_message_id not in branch_message_ids
+            ):
+                raise ValidationError(
+                    "memory outside the selected branch path cannot be superseded"
+                )
+        for character_id in event.known_by_character_ids:
+            exists = connection.execute(
+                "SELECT 1 FROM characters WHERE id = ?", (character_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValidationError("knowledge scope character does not exist")
+        self._validate_memory_ledger((*existing_events, event), decisions)
+
+        connection.execute(
+            """
+            INSERT INTO canonical_memory_events(
+                id, conversation_id, branch_id, subject_id, kind, slot, value,
+                cardinality, approval, knowledge_count, source_message_id,
+                supersedes_event_id, effective_at, recorded_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.id,
+                event.conversation_id,
+                event.branch_id,
+                event.subject_id,
+                event.kind.value,
+                event.slot,
+                event.value,
+                event.cardinality.value,
+                event.approval.value,
+                len(event.known_by_character_ids),
+                event.source_message_id,
+                event.supersedes_event_id,
+                _utc_iso(event.effective_at),
+                _utc_iso(event.recorded_at),
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO canonical_memory_event_knowledge(event_id, character_id)
+            VALUES(?, ?)
+            """,
+            tuple(
+                (event.id, character_id)
+                for character_id in sorted(event.known_by_character_ids)
+            ),
+        )
+
     def _message_path(self, connection: sqlite3.Connection, branch_id: str) -> list[Message]:
         rows = connection.execute(
             """
@@ -2599,6 +3748,111 @@ class SQLiteAppRepository:
             raise ValidationError("発言が見つかりません。")
         return self._message_from_row(row)
 
+    def _branch_lineage(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        branch_id: str,
+    ) -> tuple[str, ...]:
+        lineage: list[str] = []
+        visited: set[str] = set()
+        current_id: str | None = branch_id
+        while current_id is not None:
+            if current_id in visited:
+                raise PersistenceError("会話の分岐関係が循環しています。")
+            visited.add(current_id)
+            branch = self._require_branch(connection, current_id)
+            if branch.conversation_id != conversation_id:
+                raise ValidationError("会話に属さない分岐です。")
+            lineage.append(branch.id)
+            current_id = branch.parent_branch_id
+        lineage.reverse()
+        return tuple(lineage)
+
+    def _load_canonical_memory_stream(
+        self, connection: sqlite3.Connection, conversation_id: str
+    ) -> tuple[tuple[CanonicalMemoryEvent, ...], tuple[MemoryApprovalDecision, ...]]:
+        event_rows = connection.execute(
+            """
+            SELECT * FROM canonical_memory_events
+            WHERE conversation_id = ? ORDER BY recorded_at, id
+            """,
+            (conversation_id,),
+        ).fetchall()
+        knowledge_rows = connection.execute(
+            """
+            SELECT knowledge.event_id, knowledge.character_id
+            FROM canonical_memory_event_knowledge knowledge
+            JOIN canonical_memory_events event ON event.id = knowledge.event_id
+            WHERE event.conversation_id = ?
+            ORDER BY knowledge.event_id, knowledge.character_id
+            """,
+            (conversation_id,),
+        ).fetchall()
+        knowledge: dict[str, set[str]] = {}
+        for row in knowledge_rows:
+            knowledge.setdefault(str(row["event_id"]), set()).add(
+                str(row["character_id"])
+            )
+        for row in event_rows:
+            event_id = str(row["id"])
+            if len(knowledge.get(event_id, set())) != int(row["knowledge_count"]):
+                raise PersistenceError("正史記憶の知識範囲が壊れています。")
+        events = tuple(
+            CanonicalMemoryEvent(
+                id=str(row["id"]),
+                conversation_id=str(row["conversation_id"]),
+                branch_id=str(row["branch_id"]),
+                subject_id=str(row["subject_id"]),
+                kind=MemoryKind(str(row["kind"])),
+                slot=str(row["slot"]),
+                value=str(row["value"]),
+                cardinality=MemoryCardinality(str(row["cardinality"])),
+                approval=MemoryApprovalState(str(row["approval"])),
+                source_message_id=str(row["source_message_id"]),
+                known_by_character_ids=frozenset(knowledge.get(str(row["id"]), set())),
+                supersedes_event_id=(
+                    str(row["supersedes_event_id"])
+                    if row["supersedes_event_id"]
+                    else None
+                ),
+                effective_at=datetime.fromisoformat(str(row["effective_at"])),
+                recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+            )
+            for row in event_rows
+        )
+        decision_rows = connection.execute(
+            """
+            SELECT decision.*
+            FROM canonical_memory_decisions decision
+            JOIN canonical_memory_events event ON event.id = decision.target_event_id
+            WHERE event.conversation_id = ?
+            ORDER BY decision.sequence
+            """,
+            (conversation_id,),
+        ).fetchall()
+        decisions = tuple(
+            MemoryApprovalDecision(
+                id=str(row["id"]),
+                target_event_id=str(row["target_event_id"]),
+                state=MemoryApprovalState(str(row["state"])),
+                source_message_id=str(row["source_message_id"]),
+                recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+            )
+            for row in decision_rows
+        )
+        return events, decisions
+
+    @staticmethod
+    def _validate_memory_ledger(
+        events: tuple[CanonicalMemoryEvent, ...],
+        decisions: tuple[MemoryApprovalDecision, ...],
+    ) -> CanonicalMemoryLedger:
+        try:
+            return CanonicalMemoryLedger(events, decisions)
+        except ValueError as error:
+            raise ValidationError(str(error)) from error
+
     def _require_translation(
         self, connection: sqlite3.Connection, translation_id: str
     ) -> Translation:
@@ -2608,6 +3862,194 @@ class SQLiteAppRepository:
         if row is None:
             raise ValidationError("翻訳結果が見つかりません。")
         return self._translation_from_row(row)
+
+    def _load_turn_batch(
+        self, connection: sqlite3.Connection, batch_id: str
+    ) -> TurnBatch:
+        row = connection.execute(
+            "SELECT * FROM turn_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValidationError("turn batch was not found")
+        segment_rows = connection.execute(
+            "SELECT * FROM turn_segments WHERE turn_batch_id = ? ORDER BY position",
+            (batch_id,),
+        ).fetchall()
+        return self._turn_batch_from_row(row, tuple(segment_rows))
+
+    def _turn_batch_from_row(
+        self, row: sqlite3.Row, segment_rows: tuple[sqlite3.Row, ...]
+    ) -> TurnBatch:
+        batch_id = str(row["id"])
+        segments = tuple(
+            TurnSegment(
+                id=str(segment_row["id"]),
+                turn_batch_id=batch_id,
+                position=int(segment_row["position"]),
+                speaker_kind=TurnSpeakerKind(str(segment_row["speaker_kind"])),
+                speaker_id=(
+                    str(segment_row["speaker_id"])
+                    if segment_row["speaker_id"] is not None
+                    else None
+                ),
+                display_name=str(segment_row["display_name"]),
+                content=str(segment_row["content"]),
+            )
+            for segment_row in segment_rows
+        )
+        return TurnBatch(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            branch_id=str(row["branch_id"]),
+            source_message_id=str(row["source_message_id"]),
+            response_message_id=str(row["response_message_id"]),
+            run_id=str(row["run_id"]),
+            model=str(row["model"]),
+            mode=TurnMode(str(row["mode"])),
+            formal_character_ids=self._json_string_tuple(
+                str(row["formal_character_ids_json"])
+            ),
+            guest_ids=self._json_string_tuple(str(row["guest_ids_json"])),
+            prompt_version=str(row["prompt_version"]),
+            state=TurnBatchState(str(row["state"])),
+            repair_state=TurnRepairState(str(row["repair_state"])),
+            error_code=(
+                str(row["error_code"]) if row["error_code"] is not None else None
+            ),
+            spotlight_character_id=(
+                str(row["spotlight_character_id"])
+                if row["spotlight_character_id"] is not None
+                else None
+            ),
+            segments=segments,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _json_string_tuple(value: str) -> tuple[str, ...]:
+        parsed = json.loads(value)
+        if not isinstance(parsed, list) or any(
+            not isinstance(item, str) for item in parsed
+        ):
+            raise PersistenceError("stored turn batch ids are invalid")
+        return tuple(parsed)
+
+    @staticmethod
+    def _load_conversation_cast(
+        connection: sqlite3.Connection, conversation_id: str
+    ) -> ConversationCast:
+        rows = connection.execute(
+            """
+            SELECT ccm.character_id, ccm.character_version_id,
+                   c.display_name, ccm.position
+            FROM conversation_cast_members ccm
+            JOIN characters c ON c.id = ccm.character_id
+            WHERE ccm.conversation_id = ?
+            ORDER BY ccm.position
+            """,
+            (conversation_id,),
+        ).fetchall()
+        if not rows:
+            raise PersistenceError("conversation formal cast is empty")
+        return ConversationCast(
+            conversation_id=conversation_id,
+            members=tuple(
+                FormalCastMember(
+                    character_id=str(row["character_id"]),
+                    character_version_id=str(row["character_version_id"]),
+                    display_name=str(row["display_name"]),
+                    position=int(row["position"]),
+                )
+                for row in rows
+            ),
+        )
+
+    def _replace_conversation_cast(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        character_version_ids: tuple[str, ...],
+        now: str,
+    ) -> ConversationCast:
+        placeholders = ",".join("?" for _ in character_version_ids)
+        rows = connection.execute(
+            f"""
+            SELECT cv.id, cv.character_id, c.display_name
+            FROM character_versions cv
+            JOIN characters c ON c.id = cv.character_id
+            WHERE cv.id IN ({placeholders}) AND c.archived_at IS NULL
+            """,
+            character_version_ids,
+        ).fetchall()
+        by_version_id = {str(row["id"]): row for row in rows}
+        if len(by_version_id) != len(character_version_ids):
+            raise ValidationError("formal cast character version was not found")
+        ordered_rows = [
+            by_version_id[version_id] for version_id in character_version_ids
+        ]
+        stable_ids = tuple(str(row["character_id"]) for row in ordered_rows)
+        if len(stable_ids) != len(set(stable_ids)):
+            raise ValidationError(
+                "formal cast cannot contain two versions of the same character"
+            )
+        connection.execute(
+            "DELETE FROM conversation_cast_members WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        for position, row in enumerate(ordered_rows):
+            connection.execute(
+                """
+                INSERT INTO conversation_cast_members(
+                    conversation_id, character_id, character_version_id,
+                    position, added_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    str(row["character_id"]),
+                    str(row["id"]),
+                    position,
+                    now,
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE conversations
+            SET character_version_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (character_version_ids[0], now, conversation_id),
+        )
+        return self._load_conversation_cast(connection, conversation_id)
+
+    @staticmethod
+    def _load_conversation_group_settings(
+        connection: sqlite3.Connection, conversation_id: str
+    ) -> ConversationGroupSettings:
+        row = connection.execute(
+            """
+            SELECT * FROM conversation_group_settings
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("conversation group settings were not found")
+        try:
+            mode = TurnMode(str(row["mode"]))
+        except ValueError as error:
+            raise PersistenceError("stored conversation group mode is invalid") from error
+        return ConversationGroupSettings(
+            conversation_id=conversation_id,
+            enabled=bool(row["enabled"]),
+            mode=mode,
+            spotlight_character_id=(
+                str(row["spotlight_character_id"])
+                if row["spotlight_character_id"] is not None
+                else None
+            ),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
 
     @staticmethod
     def _character_from_row(row: sqlite3.Row) -> CharacterVersion:
@@ -2648,6 +4090,7 @@ class SQLiteAppRepository:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             archived_at=_parse_time(row["archived_at"]),
+            auto_translate=bool(row["auto_translate"]),
         )
 
     @staticmethod
@@ -2914,4 +4357,5 @@ class SQLiteAppRepository:
             ),
             head_message_id=str(row["head_message_id"]) if row["head_message_id"] else None,
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            hidden_at=_parse_time(row["hidden_at"]),
         )

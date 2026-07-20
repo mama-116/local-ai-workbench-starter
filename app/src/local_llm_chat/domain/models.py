@@ -90,6 +90,7 @@ class Conversation:
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
+    auto_translate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ class BranchInfo:
     forked_from_message_id: str | None
     head_message_id: str | None
     created_at: datetime
+    hidden_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +297,7 @@ class ChatRequest:
     messages: tuple[ChatMessageInput, ...]
     options: dict[str, Any] = field(default_factory=dict)
     tools: tuple[ToolDefinition, ...] = ()
+    response_format: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 
+from local_llm_chat.application.services.memory_capture_service import (
+    MemoryCaptureRequest,
+    MemoryCaptureScheduler,
+)
 from local_llm_chat.application.services.translation_service import (
     TranslationScheduler,
 )
@@ -54,6 +59,7 @@ class ChatService:
         rag: RagService | None = None,
         tools: ToolCoordinator | None = None,
         context_window: ContextWindowManager | None = None,
+        memory_capture_scheduler: MemoryCaptureScheduler | None = None,
     ) -> None:
         self._repository = repository
         self._providers = providers
@@ -63,6 +69,7 @@ class ChatService:
         self._rag = rag
         self._tools = tools
         self._context_window = context_window or ContextWindowManager(repository)
+        self._memory_capture_scheduler = memory_capture_scheduler
 
     async def send_message(
         self,
@@ -73,7 +80,9 @@ class ChatService:
     ) -> Message:
         conversation, provider = await self._preflight(conversation_id)
         session = await self._repository.start_send(conversation_id, content)
-        return await self._execute(conversation, session, provider, on_update, on_notice)
+        return await self._execute(
+            conversation, session, provider, on_update, on_notice, capture_memory=True
+        )
 
     async def rewrite_message(
         self,
@@ -87,7 +96,9 @@ class ChatService:
         session = await self._repository.start_rewrite(
             conversation_id, source_message_id, content
         )
-        return await self._execute(conversation, session, provider, on_update, on_notice)
+        return await self._execute(
+            conversation, session, provider, on_update, on_notice, capture_memory=True
+        )
 
     async def regenerate_message(
         self,
@@ -100,7 +111,9 @@ class ChatService:
         session = await self._repository.start_regenerate(
             conversation_id, source_message_id
         )
-        return await self._execute(conversation, session, provider, on_update, on_notice)
+        return await self._execute(
+            conversation, session, provider, on_update, on_notice, capture_memory=False
+        )
 
     async def _preflight(
         self, conversation_id: str
@@ -123,6 +136,7 @@ class ChatService:
         provider: LLMProvider,
         on_update: StreamCallback,
         on_notice: NoticeCallback,
+        capture_memory: bool,
     ) -> Message:
         profile = await self._repository.get_model_profile(conversation.model_profile_id)
         character = await self._repository.get_character_version(
@@ -333,9 +347,48 @@ class ChatService:
                 generation_duration_ns,
                 round((time.monotonic() - response_started) * 1000),
             )
+            if capture_memory and self._memory_capture_scheduler is not None:
+                capture_request = MemoryCaptureRequest(
+                    conversation_id=conversation.id,
+                    branch_id=session.branch_id,
+                    source_message_id=session.user_message.id,
+                    model_name=profile.model_name,
+                    author_subject_id="user",
+                    allowed_subject_ids=frozenset(
+                        {"user", character.character_id}
+                    ),
+                    allowed_knowledge_character_ids=frozenset(
+                        {character.character_id}
+                    ),
+                )
+                try:
+                    await self._memory_capture_scheduler.request_capture(
+                        capture_request, session.run.id
+                    )
+                except Exception as error:
+                    with suppress(Exception):
+                        await self._repository.log_event(
+                            "error",
+                            "memory_capture_enqueue_failed",
+                            {"error_type": type(error).__name__},
+                            session.run.id,
+                        )
             if self._telemetry is not None:
                 self._telemetry.request_capture(session.run.id)
-            if self._translation_scheduler is not None:
+            auto_translate = False
+            try:
+                current_conversation = await self._repository.get_conversation(
+                    conversation.id
+                )
+                auto_translate = current_conversation.auto_translate
+            except Exception as error:
+                await self._repository.log_event(
+                    "error",
+                    "translation_preference_read_failed",
+                    {"error_type": type(error).__name__},
+                    session.run.id,
+                )
+            if auto_translate and self._translation_scheduler is not None:
                 try:
                     await self._translation_scheduler.request_translation(response.id)
                 except Exception as error:

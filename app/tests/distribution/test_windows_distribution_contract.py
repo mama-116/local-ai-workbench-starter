@@ -24,6 +24,12 @@ def test_portable_build_has_privacy_guard_and_user_instructions() -> None:
     script_text = script.read_text(encoding="utf-8")
     assert "flet build windows" in script_text
     assert "uv run --frozen" in script_text
+    assert "uv export --frozen" in script_text
+    assert "--no-dev" in script_text
+    assert "--no-emit-project" in script_text
+    assert "requirements.txt" in script_text
+    assert "dependencies = []" in script_text
+    assert "UTF8Encoding" in script_text
     assert "pyinstaller" in script_text
     assert "LocalNotesMCP.exe" in script_text
     assert ".local-data" in script_text

@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from local_llm_chat.domain.canonical_memory import (
+    CanonicalMemoryEvent,
+    CanonicalMemoryFact,
+    CanonicalMemoryReviewItem,
+    MemoryApprovalDecision,
+)
+from local_llm_chat.domain.group_turns import (
+    ConversationCast,
+    ConversationGroupConfiguration,
+    ConversationGroupSettings,
+    TurnBatch,
+    TurnBatchDraft,
+)
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
@@ -22,8 +36,10 @@ from local_llm_chat.domain.models import (
 )
 from local_llm_chat.domain.states import (
     ContextSummaryState,
+    MemoryApprovalState,
     MessageState,
     ToolCallState,
+    TurnMode,
     TranslationState,
 )
 
@@ -112,9 +128,17 @@ class AppRepository(Protocol):
 
     async def restore_conversation(self, conversation_id: str) -> None: ...
 
+    async def set_conversation_auto_translate(
+        self, conversation_id: str, enabled: bool
+    ) -> None: ...
+
     async def list_active_messages(self, conversation_id: str) -> list[Message]: ...
 
     async def get_message(self, message_id: str) -> Message: ...
+
+    async def get_memory_source_message(
+        self, conversation_id: str, branch_id: str, source_message_id: str
+    ) -> Message: ...
 
     async def get_response_model(self, message_id: str) -> tuple[str, str]: ...
 
@@ -147,7 +171,85 @@ class AppRepository(Protocol):
 
     async def list_branches(self, conversation_id: str) -> list[BranchInfo]: ...
 
+    async def list_all_branches(self, conversation_id: str) -> list[BranchInfo]: ...
+
     async def activate_branch(self, conversation_id: str, branch_id: str) -> None: ...
+
+    async def hide_branch(self, conversation_id: str, branch_id: str) -> None: ...
+
+    async def restore_branch(self, conversation_id: str, branch_id: str) -> None: ...
+
+    async def append_canonical_memory_event(
+        self, event: CanonicalMemoryEvent
+    ) -> None: ...
+
+    async def get_conversation_cast(
+        self, conversation_id: str
+    ) -> ConversationCast: ...
+
+    async def set_conversation_cast(
+        self, conversation_id: str, character_version_ids: tuple[str, ...]
+    ) -> ConversationCast: ...
+
+    async def get_conversation_group_settings(
+        self, conversation_id: str
+    ) -> ConversationGroupSettings: ...
+
+    async def set_conversation_group_settings(
+        self,
+        conversation_id: str,
+        enabled: bool,
+        mode: TurnMode,
+        spotlight_character_id: str | None,
+    ) -> ConversationGroupSettings: ...
+
+    async def get_conversation_group_configuration(
+        self, conversation_id: str
+    ) -> ConversationGroupConfiguration: ...
+
+    async def set_conversation_group_configuration(
+        self,
+        conversation_id: str,
+        character_version_ids: tuple[str, ...],
+        enabled: bool,
+        mode: TurnMode,
+        spotlight_character_id: str | None,
+    ) -> ConversationGroupConfiguration: ...
+
+    async def append_canonical_memory_events(
+        self, events: tuple[CanonicalMemoryEvent, ...]
+    ) -> None: ...
+
+    async def append_captured_memory_events(
+        self, events: tuple[CanonicalMemoryEvent, ...]
+    ) -> tuple[str, ...]: ...
+
+    async def append_memory_approval_decision(
+        self, decision: MemoryApprovalDecision
+    ) -> None: ...
+
+    async def decide_canonical_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        target_event_id: str,
+        state: MemoryApprovalState,
+        decision_id: str,
+        recorded_at: datetime,
+    ) -> MemoryApprovalDecision: ...
+
+    async def project_canonical_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        speaker_character_id: str,
+        current_source_message_id: str | None = None,
+        include_historical: bool = False,
+    ) -> tuple[CanonicalMemoryFact, ...]: ...
+
+    async def list_canonical_memory_review_items(
+        self, conversation_id: str, branch_id: str
+    ) -> tuple[CanonicalMemoryReviewItem, ...]: ...
 
     async def start_send(self, conversation_id: str, content: str) -> RunSession: ...
 
@@ -162,6 +264,13 @@ class AppRepository(Protocol):
         self,
         conversation_id: str,
         source_message_id: str,
+    ) -> RunSession: ...
+
+    async def start_turn_batch_regenerate(
+        self,
+        conversation_id: str,
+        source_response_message_id: str,
+        expected_active_branch_id: str,
     ) -> RunSession: ...
 
     async def context_to_message(self, message_id: str) -> list[Message]: ...
@@ -205,6 +314,18 @@ class AppRepository(Protocol):
         response_duration_ms: int | None = None,
         error_code: str | None = None,
     ) -> Message: ...
+
+    async def finish_turn_batch(
+        self, session: RunSession, draft: TurnBatchDraft
+    ) -> TurnBatch: ...
+
+    async def get_turn_batch_for_response(
+        self, response_message_id: str
+    ) -> TurnBatch: ...
+
+    async def list_turn_batches_for_responses(
+        self, response_message_ids: tuple[str, ...]
+    ) -> tuple[TurnBatch, ...]: ...
 
     async def save_telemetry_metrics(
         self, run_id: str, metrics: tuple[TelemetryMetric, ...]
