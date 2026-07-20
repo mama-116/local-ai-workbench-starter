@@ -54,6 +54,7 @@ class TranslationService:
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_size)
         self._worker_task: asyncio.Task[None] | None = None
         self._listeners: list[TranslationListener] = []
+        self._closing = False
 
     def subscribe(self, listener: TranslationListener) -> None:
         self._listeners.append(listener)
@@ -61,6 +62,8 @@ class TranslationService:
     async def request_translation(
         self, message_id: str, force: bool = False
     ) -> Translation | None:
+        if self._is_closing():
+            return None
         message = await self._repository.get_message(message_id)
         if not message.content.strip():
             return None
@@ -87,16 +90,24 @@ class TranslationService:
         )
         translation = prepared.translation
         if prepared.should_enqueue:
-            self._ensure_worker()
-            try:
-                self._queue.put_nowait(translation.id)
-            except asyncio.QueueFull:
+            if self._is_closing():
                 translation = await self._repository.finish_translation(
                     translation.id,
                     "",
                     TranslationState.FAILED,
-                    "queue_full",
+                    "application_closed",
                 )
+            else:
+                self._ensure_worker()
+                try:
+                    self._queue.put_nowait(translation.id)
+                except asyncio.QueueFull:
+                    translation = await self._repository.finish_translation(
+                        translation.id,
+                        "",
+                        TranslationState.FAILED,
+                        "queue_full",
+                    )
         await self._notify(translation.message_id)
         return translation
 
@@ -109,19 +120,40 @@ class TranslationService:
         return await self._repository.list_current_translations(message_ids)
 
     async def close(self) -> None:
+        self._closing = True
         task = self._worker_task
         self._worker_task = None
-        if task is None:
-            return
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        errors: list[Exception] = []
+        while not self._queue.empty():
+            translation_id = self._queue.get_nowait()
+            try:
+                failed = await self._repository.finish_translation(
+                    translation_id,
+                    "",
+                    TranslationState.FAILED,
+                    "application_closed",
+                )
+                await self._notify(failed.message_id)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                self._queue.task_done()
+        if errors:
+            raise ExceptionGroup("translation shutdown failed", errors)
 
     def _ensure_worker(self) -> None:
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(
                 self._run_worker(), name="local-translation-worker"
             )
+
+    def _is_closing(self) -> bool:
+        return self._closing
 
     async def _run_worker(self) -> None:
         while True:
@@ -135,14 +167,14 @@ class TranslationService:
                 await self._notify(message_id)
                 await self._translate(translation)
             except asyncio.CancelledError:
-                if message_id is not None:
-                    with suppress(Exception):
-                        await self._repository.finish_translation(
-                            translation_id,
-                            "",
-                            TranslationState.FAILED,
-                            "application_closed",
-                        )
+                with suppress(Exception):
+                    failed = await self._repository.finish_translation(
+                        translation_id,
+                        "",
+                        TranslationState.FAILED,
+                        "application_closed",
+                    )
+                    message_id = failed.message_id
                 raise
             except Exception as error:
                 with suppress(Exception):

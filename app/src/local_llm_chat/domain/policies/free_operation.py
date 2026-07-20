@@ -69,6 +69,15 @@ class FreeOperationPolicy:
                 "公開ネットワーク上のOllamaには接続できません。",
             )
 
+    def require_loopback_endpoint(self, endpoint: str) -> None:
+        self.require_endpoint(endpoint)
+        hostname = urlsplit(endpoint).hostname
+        if hostname is None or not ipaddress.ip_address(hostname).is_loopback:
+            raise FreeOperationBlocked(
+                "endpoint_not_loopback",
+                "記憶抽出はこのPC上のOllamaだけを利用できます。",
+            )
+
     def require_model(self, model: ModelInfo) -> None:
         if self._CLOUD_NAME.search(model.name):
             raise FreeOperationBlocked(

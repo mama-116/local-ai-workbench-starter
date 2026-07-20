@@ -28,11 +28,14 @@ class TelemetryService:
         self._collectors = tuple(collectors)
         self._tasks: set[asyncio.Task[None]] = set()
         self._subscribers: list[Callable[[str], Awaitable[None]]] = []
+        self._closing = False
 
     def subscribe(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._subscribers.append(callback)
 
     def request_capture(self, run_id: str) -> None:
+        if self._closing:
+            return
         task = asyncio.create_task(self._capture_and_notify(run_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -73,5 +76,10 @@ class TelemetryService:
         return await self._repository.get_latest_telemetry(conversation_id)
 
     async def close(self) -> None:
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._closing = True
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()

@@ -9,12 +9,14 @@ from local_llm_chat.domain.models import TelemetryMetric
 class FakeRepository:
     def __init__(self) -> None:
         self.saved: tuple[TelemetryMetric, ...] = ()
+        self.saved_event = asyncio.Event()
 
     async def save_telemetry_metrics(
         self, run_id: str, metrics: tuple[TelemetryMetric, ...]
     ) -> None:
         assert run_id == "run-1"
         self.saved = metrics
+        self.saved_event.set()
 
     async def get_latest_telemetry(self, conversation_id: str | None = None) -> None:
         return None
@@ -80,5 +82,33 @@ async def test_requested_capture_runs_in_background_without_blocking_chat() -> N
     assert repository.saved == ()
 
     collector.release.set()
+    await asyncio.wait_for(repository.saved_event.wait(), timeout=0.2)
     await service.close()
     assert next(iter(repository.saved)).value == 1.0
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_running_capture_instead_of_waiting_for_collector() -> None:
+    repository = FakeRepository()
+    collector = WaitingCollector()
+    service = TelemetryService(repository, [collector])
+    service.request_capture("run-1")
+    await asyncio.wait_for(collector.started.wait(), timeout=0.2)
+
+    await asyncio.wait_for(service.close(), timeout=0.2)
+
+    assert repository.saved == ()
+
+
+@pytest.mark.asyncio
+async def test_capture_requested_after_close_is_ignored() -> None:
+    repository = FakeRepository()
+    collector = WaitingCollector()
+    service = TelemetryService(repository, [collector])
+
+    await service.close()
+    service.request_capture("run-1")
+    await asyncio.sleep(0)
+
+    assert not collector.started.is_set()
+    assert repository.saved == ()

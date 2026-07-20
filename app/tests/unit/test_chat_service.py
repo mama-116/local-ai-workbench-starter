@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 
 from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.memory_capture_service import (
+    MemoryCaptureRequest,
+)
 from local_llm_chat.application.services.context_budget import ContextWindowManager
 from local_llm_chat.application.services.tool_coordinator import ToolCoordinator
 from local_llm_chat.application.services.rag_service import RagService
@@ -132,6 +136,19 @@ class FailingTranslationScheduler:
         self, message_id: str, force: bool = False
     ) -> Translation | None:
         raise RuntimeError("queue unavailable")
+
+
+class RecordingMemoryCaptureScheduler:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.requests: list[tuple[MemoryCaptureRequest, str]] = []
+
+    async def request_capture(
+        self, request: MemoryCaptureRequest, run_id: str
+    ) -> None:
+        self.requests.append((request, run_id))
+        if self.fail:
+            raise RuntimeError("memory queue unavailable")
 
 
 class FakeToolProvider:
@@ -293,6 +310,98 @@ async def test_streams_and_persists_completed_response(tmp_path: Path) -> None:
     assert updates == ["回答", "回答です"]
     assert response.content == "回答です"
     assert response.state is MessageState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheduler_fails", (False, True))
+async def test_completed_chat_enqueues_memory_without_losing_response(
+    tmp_path: Path, scheduler_fails: bool
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    conversation_id = await make_conversation(repository)
+    scheduler = RecordingMemoryCaptureScheduler(scheduler_fails)
+    service = ChatService(
+        repository,
+        FakeRegistry(),
+        FreeOperationPolicy(),
+        memory_capture_scheduler=scheduler,
+    )
+
+    response = await service.send_message(conversation_id, "質問")
+
+    assert response.state is MessageState.COMPLETED
+    assert response.content == "回答です"
+    assert len(scheduler.requests) == 1
+    capture_request, run_id = scheduler.requests[0]
+    assert capture_request.conversation_id == conversation_id
+    assert capture_request.source_message_id == response.parent_message_id
+    assert capture_request.model_name == "gemma4:12b"
+    assert capture_request.author_subject_id == "user"
+    assert "user" in capture_request.allowed_subject_ids
+    assert len(capture_request.allowed_subject_ids) == 2
+    assert capture_request.allowed_knowledge_character_ids == (
+        capture_request.allowed_subject_ids - {"user"}
+    )
+    assert run_id
+    if scheduler_fails:
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute(
+                "SELECT event_type FROM app_events "
+                "WHERE event_type = 'memory_capture_enqueue_failed'"
+            ).fetchone() == ("memory_capture_enqueue_failed",)
+
+
+@pytest.mark.asyncio
+async def test_regenerate_does_not_recapture_the_existing_user_message(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_conversation(repository)
+    scheduler = RecordingMemoryCaptureScheduler()
+    service = ChatService(
+        repository,
+        FakeRegistry(),
+        FreeOperationPolicy(),
+        memory_capture_scheduler=scheduler,
+    )
+
+    first_response = await service.send_message(conversation_id, "質問")
+    regenerated = await service.regenerate_message(
+        conversation_id, first_response.id
+    )
+
+    assert regenerated.state is MessageState.COMPLETED
+    assert len(scheduler.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_rewrite_captures_the_new_user_message_on_its_new_branch(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_conversation(repository)
+    scheduler = RecordingMemoryCaptureScheduler()
+    service = ChatService(
+        repository,
+        FakeRegistry(),
+        FreeOperationPolicy(),
+        memory_capture_scheduler=scheduler,
+    )
+
+    first_response = await service.send_message(conversation_id, "質問")
+    assert first_response.parent_message_id is not None
+    rewritten = await service.rewrite_message(
+        conversation_id, first_response.parent_message_id, "質問"
+    )
+
+    assert rewritten.state is MessageState.COMPLETED
+    assert len(scheduler.requests) == 2
+    first_request = scheduler.requests[0][0]
+    rewrite_request = scheduler.requests[1][0]
+    assert rewrite_request.source_message_id == rewritten.parent_message_id
+    assert rewrite_request.source_message_id != first_request.source_message_id
+    assert rewrite_request.branch_id != first_request.branch_id
 
 
 @pytest.mark.asyncio

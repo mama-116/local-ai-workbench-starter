@@ -1,3 +1,10 @@
+import json
+
+import httpx
+import pytest
+
+from local_llm_chat.domain.models import ChatMessageInput, ChatRequest
+from local_llm_chat.domain.states import MessageRole
 from local_llm_chat.infrastructure.llm.ollama_provider import OllamaProvider
 
 
@@ -20,3 +27,34 @@ def test_parses_tool_call_and_marks_broken_arguments_for_denial() -> None:
 
     assert chunk.tool_calls[0].name == "read_allowed_text"
     assert chunk.tool_calls[0].arguments == {"__invalid_arguments__": True}
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_sends_response_schema_to_ollama() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=b'{"message":{"content":"{}"},"done":true}\n',
+        )
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OllamaProvider(client=client)
+    schema: dict[str, object] = {"type": "object"}
+    request = ChatRequest(
+        "model",
+        "system",
+        (ChatMessageInput(MessageRole.USER, "hello"),),
+        response_format=schema,
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat(request)]
+
+    assert chunks[-1].done
+    assert captured["format"] == schema
+    await client.aclose()

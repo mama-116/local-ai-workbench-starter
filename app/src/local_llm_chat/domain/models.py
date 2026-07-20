@@ -290,6 +290,7 @@ class ChatRequest:
     messages: tuple[ChatMessageInput, ...]
     options: dict[str, Any] = field(default_factory=dict)
     tools: tuple[ToolDefinition, ...] = ()
+    response_format: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
