@@ -377,11 +377,25 @@ class LocalChatApp:
         self.model_dropdown.on_select = self.update_selection
         self.branch_dropdown = self._dropdown("会話の分岐")
         self.branch_dropdown.on_select = self.activate_branch
-        self.archive_button = ft.Button(
-            "会話を保管",
-            icon=ft.Icons.ARCHIVE_ROUNDED,
+        self.auto_translate_switch = ft.Switch(
+            label="回答後に自動翻訳",
+            value=False,
+            active_color=MINT,
+            on_change=self.update_auto_translate,
+        )
+        self.manage_branches_button = ft.Button(
+            "分岐を整理",
+            icon=ft.Icons.ACCOUNT_TREE_ROUNDED,
             color=MUTED,
             bgcolor="#242421",
+            on_click=self.show_branch_management,
+            disabled=True,
+        )
+        self.archive_button = ft.Button(
+            "会話をゴミ箱へ移動",
+            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+            color="#D87866",
+            bgcolor="#302522",
             on_click=self.confirm_archive,
             disabled=True,
         )
@@ -444,8 +458,8 @@ class LocalChatApp:
                     ft.Text("CONVERSATIONS", size=10, color="#6F6B64"),
                     self.conversation_list,
                     ft.Button(
-                        "保管庫",
-                        icon=ft.Icons.ARCHIVE_ROUNDED,
+                        "ゴミ箱",
+                        icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
                         color=MUTED,
                         bgcolor="#22221F",
                         on_click=self.show_archive_dialog,
@@ -547,6 +561,14 @@ class LocalChatApp:
                     self.model_dropdown,
                     self._section_label("BRANCH"),
                     self.branch_dropdown,
+                    self.manage_branches_button,
+                    self._section_label("TRANSLATION"),
+                    self.auto_translate_switch,
+                    ft.Text(
+                        "OFFでも、必要な回答だけ手動で翻訳できます。",
+                        size=10,
+                        color="#716D65",
+                    ),
                     self.archive_button,
                     ft.Text(
                         "会話・設定・実行ログはこのPC内のSQLiteだけに保存します。",
@@ -766,6 +788,9 @@ class LocalChatApp:
             self.title_text.value = "最初の会話を作りましょう"
             self.subtitle_text.value = "右側で無料運営の状態を確認できます"
             self.archive_button.disabled = True
+            self.manage_branches_button.disabled = True
+            self.auto_translate_switch.disabled = True
+            self.auto_translate_switch.value = False
             self.character_dropdown.value = None
             self.character_dropdown.disabled = False
             self.group_configuration = None
@@ -826,6 +851,9 @@ class LocalChatApp:
             else None
         )
         self.archive_button.disabled = False
+        self.manage_branches_button.disabled = self._generation_task is not None
+        self.auto_translate_switch.disabled = self._generation_task is not None
+        self.auto_translate_switch.value = conversation.auto_translate
         self.branches = await self.container.conversations.branches(conversation.id)
         self.branch_dropdown.options = [
             ft.DropdownOption(branch.id, f"分岐 {index + 1}")
@@ -1125,6 +1153,16 @@ class LocalChatApp:
                 if item.is_batch_end
                 else None
             ),
+            translation=(
+                self.message_translations.get(item.message.id)
+                if item.is_batch_end
+                else None
+            ),
+            on_translate=(
+                lambda: self.page.run_task(self.translate_message, item.message)
+                if item.is_batch_end and item.message.state is MessageState.COMPLETED
+                else None
+            ),
         )
 
     def _message_bubble(self, message: Message) -> MessageBubble:
@@ -1324,6 +1362,95 @@ class LocalChatApp:
             await self.refresh_all()
         except AppError as error:
             self._toast(str(error), ERROR)
+
+    async def update_auto_translate(self) -> None:
+        conversation_id = self.selected_conversation_id
+        if conversation_id is None or self._generation_task is not None:
+            return
+        try:
+            await self.container.conversations.set_auto_translate(
+                conversation_id, bool(self.auto_translate_switch.value)
+            )
+            await self.refresh_all()
+            label = "ON" if self.auto_translate_switch.value else "OFF"
+            self._toast(f"この会話の自動翻訳を{label}にしました。", MINT)
+        except AppError as error:
+            await self.refresh_all()
+            self._toast(str(error), ERROR)
+
+    async def show_branch_management(self) -> None:
+        conversation = self._selected_conversation()
+        if conversation is None or self._generation_task is not None:
+            return
+        branches = await self.container.conversations.all_branches(conversation.id)
+        items: list[ft.Control] = []
+        for index, branch in enumerate(branches):
+            is_active = branch.id == conversation.active_branch_id
+            is_root = branch.parent_branch_id is None
+            status = "使用中" if is_active else "非表示" if branch.hidden_at else "表示中"
+
+            async def change_visibility(
+                branch_id: str = branch.id,
+                restore: bool = branch.hidden_at is not None,
+            ) -> None:
+                try:
+                    if restore:
+                        await self.container.conversations.restore_branch(
+                            conversation.id, branch_id
+                        )
+                    else:
+                        await self.container.conversations.hide_branch(
+                            conversation.id, branch_id
+                        )
+                    self.page.pop_dialog()
+                    await self.refresh_all()
+                    self._toast(
+                        "分岐を表示しました。" if restore else "分岐を非表示にしました。",
+                        MINT,
+                    )
+                except AppError as error:
+                    self._toast(str(error), ERROR)
+
+            action_label = "表示に戻す" if branch.hidden_at else "非表示にする"
+            items.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(f"分岐 {index + 1}", color=TEXT),
+                                    ft.Text(
+                                        f"{status}{' · root' if is_root else ''}",
+                                        size=10,
+                                        color=MUTED,
+                                    ),
+                                ],
+                                expand=True,
+                                spacing=2,
+                            ),
+                            ft.Button(
+                                action_label,
+                                color=MUTED,
+                                bgcolor="#302E29",
+                                disabled=is_active or is_root,
+                                on_click=change_visibility,
+                            ),
+                        ]
+                    ),
+                    bgcolor="#2A2925",
+                    border_radius=12,
+                    padding=12,
+                )
+            )
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="分岐管理",
+                content=ft.ListView(items, spacing=8, width=460, height=360),
+                bgcolor="#24231F",
+                actions=[ft.Button("閉じる", on_click=self._close_dialog)],
+            )
+        )
 
     async def send_message(self) -> None:
         content = (self.composer.value or "").strip()
@@ -1907,17 +2034,17 @@ class LocalChatApp:
                 await self.container.conversations.archive(conversation_id)
                 self.selected_conversation_id = None
                 await self.refresh_all()
-                self._toast("会話を保管しました。データは削除していません。", MINT)
+                self._toast("会話をゴミ箱へ移動しました。元に戻せます。", MINT)
 
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title="会話を保管しますか？",
-                content=ft.Text("一覧から隠れますが、データは削除されません。"),
+                title="会話をゴミ箱へ移動しますか？",
+                content=ft.Text("一覧から隠れますが、ゴミ箱から元に戻せます。"),
                 bgcolor="#24231F",
                 actions=[
                     ft.Button("やめる", on_click=self._close_dialog),
-                    ft.Button("保管する", bgcolor="#56342E", color=TEXT, on_click=archive),
+                    ft.Button("ゴミ箱へ移動", bgcolor="#56342E", color=TEXT, on_click=archive),
                 ],
             )
         )
@@ -1925,7 +2052,7 @@ class LocalChatApp:
     async def show_archive_dialog(self) -> None:
         archived = await self.container.conversations.list_archived_conversations()
         if not archived:
-            self._toast("保管中の会話はありません。", MUTED)
+            self._toast("ゴミ箱は空です。", MUTED)
             return
 
         items: list[ft.Control] = []
@@ -1966,7 +2093,7 @@ class LocalChatApp:
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title="保管庫",
+                title="ゴミ箱",
                 bgcolor="#24231F",
                 content=ft.ListView(items, spacing=8, width=460, height=360),
                 actions=[ft.Button("閉じる", on_click=self._close_dialog)],
@@ -1980,6 +2107,13 @@ class LocalChatApp:
         self.group_chat_button.disabled = (
             busy or self.selected_conversation_id is None
         )
+        self.manage_branches_button.disabled = (
+            busy or self.selected_conversation_id is None
+        )
+        self.auto_translate_switch.disabled = (
+            busy or self.selected_conversation_id is None
+        )
+        self.archive_button.disabled = busy or self.selected_conversation_id is None
         self._set_composer_enabled(not busy and self.selected_conversation_id is not None)
         self.page.update()
 

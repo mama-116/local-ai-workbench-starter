@@ -105,6 +105,8 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
 
+`conversations.auto_translate` は会話単位の自動翻訳許可で、既存・新規会話とも既定値を無効とする。`conversations.archived_at` は復元可能なゴミ箱移動だけに使い、物理削除を意味しない。`branches.hidden_at` は分岐を選択肢から隠す表示状態であり、メッセージ、Run、TurnBatch、正史記憶を削除しない。root分岐とactive分岐は非表示にできず、非表示分岐をactiveへ切り替えられない。
+
 ### TurnBatchの初期契約
 
 `TurnBatch` は会話、分岐、利用者メッセージ、応答メッセージ、Runへ結び付き、生成時のモデル、モード、正式キャラクターID集合、シーンゲストID集合、プロンプト版、順序付き発言セグメントを保持する。正式キャラクターは1〜5人、シーンゲストは0〜5人とし、ナレーターと未解決話者はIDを持たない。話者の表示名だけでは人物を同一視しない。構造化出力への防御として、初期版は1バッチ32セグメント、1セグメント8,000文字、表示名100文字を上限とする。
@@ -117,15 +119,15 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 AIメッセージ、Run、`turn_batches`、全 `turn_segments` はSQLiteの同一transactionで確定する。グループ生成のRunには、Ollamaの完了通知から得た入力・出力トークン数、総処理時間、生成時間と、生成呼出し直前から完了までを単調時計で測った応答時間を単独会話と同じ列へ保存する。Ollamaが返さない計測値は推測せずNULLとし、応答時間は生成結果を得た場合に0以上のミリ秒で保存する。部分生成で完了通知がない場合も応答時間は保存するが、Ollama由来の計測値はNULLとする。話者制約違反は書込み前に拒否し、途中の1件でも書込みに失敗すればメッセージ、Run、計測値を含めて全件ロールバックする。会話・分岐・応答メッセージの所属に加え、`TurnBatch` が持つ正式キャラクターIDの順序、モード、スポットライト対象が会話の現在キャストとグループ設定に完全一致することをtransaction内で再検査する。生成後にキャストまたはモードが変更された古いバッチは保存しない。再生成・分岐は個別セグメントではなくバッチ単位とする。
 
-`TurnBatchGenerationService` は会話の現在キャスト、固定キャラクターバージョン、選択モデル、現在分岐の文脈、会話モードから1件の生成要求を作る。`spotlight` は登録キャスト内の中心人物IDを必須とし、他モードはこのIDを持たない。`OllamaTurnBatchGenerator` はCloud無効化、端末内またはLAN内の無料Ollama、ローカルモデル実体を生成前に再検査し、JSON Schema付きの1回の生成だけを行う。登録IDに一致しない人物は新規キャラクターにせず `unresolved` とする。Ollamaの完了通知前に出力が切れた場合は、厳密に復元できた連続セグメントだけを `partial / failed` とし、続きを自動創作しない。会話本文と全5人のキャラクター設定を含む入力は合計200,000文字、生成応答は256,000文字を防御上限とする。
+`TurnBatchGenerationService` は会話の現在キャスト、固定キャラクターバージョン、選択モデル、現在分岐の文脈、会話モードから1件の生成要求を作る。`spotlight` は登録キャスト内の中心人物IDを必須とし、他モードはこのIDを持たない。`OllamaTurnBatchGenerator` はCloud無効化、端末内またはLAN内の無料Ollama、ローカルモデル実体を生成前に再検査し、JSON Schema付きの1回の生成だけを行う。モデルの `num_ctx` と出力予約量にはsystem prompt、構造化出力Schema、キャラクター設定、共有正史記憶、会話履歴を含め、超過時は元データを変えず最新利用者発言を含む直近履歴へ縮退する。登録IDに一致しない人物は新規キャラクターにせず `unresolved` とする。Ollamaの完了通知前に出力が切れた場合は、厳密に復元できた連続セグメントだけを `partial / failed` とし、続きを自動創作しない。会話本文と全5人のキャラクター設定を含む入力は合計200,000文字、生成応答は256,000文字を防御上限とする。
 
 グループ生成中は、構造化JSONの受信済み範囲から表示専用プレビューを復元してPresentationへ通知する。正式キャラクターの表示名はモデル出力を信用せず、受信済みの `speaker_id` と現在の固定キャストを照合して決める。プレビューはMessage、TurnBatch、segment、記憶根拠として保存せず、停止・失敗・会話切替時は破棄する。完了後の厳密な全体検証と原子的保存の契約はプレビューの有無によって変更しない。
 
-`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶候補取得、翻訳、観測を開始する。後処理失敗は保存済み応答を巻き戻さずログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
+`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶候補取得、観測を開始し、会話の `auto_translate` が有効な場合だけ翻訳も開始する。後処理失敗は保存済み応答を巻き戻さずログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
 
 TurnBatch応答の再生成は専用入口 `regenerate_turn_batch(conversation_id, source_response_message_id, expected_active_branch_id)` だけが扱う。Repositoryは対象TurnBatch、会話、元応答、元利用者メッセージ、元分岐、期待active branchを同一transactionで検査し、元TurnBatchの分岐を親、元応答を分岐点とする子分岐へ、元利用者メッセージを再利用した新しいAI応答とRunを作る。元バッチは不変とし、別会話、非TurnBatch応答、セグメントID、古いactive branchでは書込み前に拒否する。生成には現在のキャスト、モード、モデル、プロンプト版、元分岐から到達可能な正史だけを使う。成功後は翻訳とTelemetryを開始するが、同じ利用者入力から記憶候補を再抽出しない。生成後の保存、失敗、停止、設定競合は通常グループ送信と同じ終端契約に従う。
 
-`ConversationTimelineService` は現在分岐のメッセージと、それらを応答元に持つTurnBatchを一括取得する読み取り専用のPresentation Read Modelである。通常メッセージは1項目、TurnBatch応答は保存済みセグメントを位置順に1項目ずつ返し、互換AIメッセージ本文は重複表示しない。Flet表示はキャラクター名、ナレーター、ゲスト、未解決話者を区別し、`partial` の最終セグメントへ「一部のみ」を表示する。グループ応答の再生成操作はバッチ末尾だけに表示し、共有する元AI応答IDと現在のactive branch IDを専用入口へ渡す。
+`ConversationTimelineService` は現在分岐のメッセージと、それらを応答元に持つTurnBatchを一括取得する読み取り専用のPresentation Read Modelである。通常メッセージは1項目、TurnBatch応答は保存済みセグメントを位置順に1項目ずつ返し、互換AIメッセージ本文は重複表示しない。Flet表示はキャラクター名、ナレーター、ゲスト、未解決話者を区別し、`partial` の最終セグメントへ「一部のみ」を表示する。グループ応答の再生成と手動翻訳の操作はバッチ末尾だけに表示し、翻訳は共有する元AI応答IDへ関連付くTurnBatch全体の派生表示とする。再生成は共有する元AI応答IDと現在のactive branch IDを専用入口へ渡す。
 
 `ConversationGroupConfigurationService` は正式キャストとグループ有効状態・モード・スポットライトを1つの設定単位として保存する。SQLite Repositoryは `BEGIN IMMEDIATE` 後に全入力を再検査し、キャスト、代表キャラクター、グループ設定を同一transactionで更新する。グループOFFは正式キャスト1人、`story / target NULL` に限定する。設定UIは現在キャストが固定したキャラクター版を暗黙に最新版へ変えず、生成中は保存操作を無効にする。
 
@@ -185,11 +187,11 @@ Application層が信頼する入力は、会話ID、分岐ID、出典メッセ�
 
 Phase 6のSchedulerは、アプリに固定登録したハンドラーだけを固定間隔で実行する。予定取得と `running` 行作成を同じSQLite transactionで行い、同一ジョブ・予定時刻・試行番号の一意制約と、同一ジョブの `running` 1件制約で重複を拒否する。失敗と手動再実行は元行を更新せず `job_runs` へ追記し、起動時に残った処理は失敗へ復旧して自動再開しない。詳細は [ADR-0018](adr/0018-use-append-only-interval-scheduler-ledger.md) を正本とする。
 
-`messages.content` は自動圧縮でも変更・削除しない。コンテキスト容量は、system prompt、現在の分岐経路、RAG、ツール定義・結果、出力予約量をモデル呼出し前に合算する。実モデル用の初期推定はUTF-8 payload byte数をトークン相当単位として扱う保守的な方式とし、決定論的な偽カウンターへ交換できる契約にする。
+`messages.content` は自動圧縮でも変更・削除しない。コンテキスト容量は、system prompt、現在の分岐経路、RAG、ツール定義・結果、出力予約量をモデル呼出し前に合算する。実モデル用の初期推定はUTF-8 JSON payloadの3 byteを1トークン相当単位として切り上げる方式とし、日本語を1 byte＝1 tokenとして過大判定しない。モデル固有Tokenizerが利用可能になった場合に交換できる契約にする。
 
 上限超過時は現在分岐の古い連続区間だけをローカル要約し、`context_summaries` へ会話ID、分岐ID、順序付き対象メッセージIDと内容ハッシュ、モデル設定ハッシュ、要約プロンプト版、状態を追記する。完了済み要約はこれらがすべて一致するときだけ再利用する。要約失敗時は直近メッセージだけで上限内へ収め、古い文脈を利用できなかったことを既存の画面通知で警告する。要約とフォールバックはいずれも原文を変更せず、外部Providerを利用しない。
 
-`messages.content` は会話履歴へ渡す原文の正本とし、表示用の日本語訳を混ぜない。翻訳は `message_translations` へ試行単位で保存し、状態値は `pending`、`running`、`completed`、`failed` とする。同じ原文ハッシュ、対象言語、Provider、モデルの完了済み結果は別メッセージでも再利用できる。再翻訳は元の試行を上書きせず、新しい試行を追加する。
+`messages.content` は会話履歴へ渡す原文の正本とし、表示用の日本語訳を混ぜない。翻訳は既定で手動とし、完了済みAI回答ごとの操作で明示要求できる。会話単位で自動翻訳を有効化した場合だけ保存成功後に要求する。翻訳は `message_translations` へ試行単位で保存し、状態値は `pending`、`running`、`completed`、`failed` とする。同じ原文ハッシュ、対象言語、Provider、モデルの完了済み結果は別メッセージでも再利用できる。再翻訳は元の試行を上書きせず、新しい試行を追加する。
 
 ## Tools/MCP境界
 

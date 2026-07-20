@@ -109,6 +109,67 @@ async def test_archived_conversation_can_be_restored(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_conversation_translation_is_manual_by_default_and_can_be_toggled(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    character = await repository.ensure_default_character()
+    profile = await repository.ensure_model_profile(
+        "ollama-local", "gemma4:12b", {"num_ctx": 4096}
+    )
+    conversation = await repository.create_conversation(
+        "translation preference", character.id, profile.id
+    )
+
+    assert conversation.auto_translate is False
+
+    await repository.set_conversation_auto_translate(conversation.id, True)
+
+    assert (await repository.get_conversation(conversation.id)).auto_translate is True
+
+
+@pytest.mark.asyncio
+async def test_only_non_active_non_root_branch_can_be_hidden_and_restored(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    character = await repository.ensure_default_character()
+    profile = await repository.ensure_model_profile(
+        "ollama-local", "gemma4:12b", {"num_ctx": 4096}
+    )
+    conversation = await repository.create_conversation(
+        "branch visibility", character.id, profile.id
+    )
+    first = await repository.start_send(conversation.id, "original")
+    await repository.finish_response(first, "answer", MessageState.COMPLETED)
+    alternate = await repository.start_rewrite(
+        conversation.id, first.user_message.id, "alternate"
+    )
+    await repository.finish_response(alternate, "other answer", MessageState.COMPLETED)
+
+    with pytest.raises(ValidationError, match="使用中"):
+        await repository.hide_branch(conversation.id, alternate.branch_id)
+    await repository.activate_branch(conversation.id, conversation.active_branch_id)
+    with pytest.raises(ValidationError, match="最初"):
+        await repository.hide_branch(conversation.id, conversation.active_branch_id)
+
+    await repository.hide_branch(conversation.id, alternate.branch_id)
+
+    assert [branch.id for branch in await repository.list_branches(conversation.id)] == [
+        conversation.active_branch_id
+    ]
+    all_branches = await repository.list_all_branches(conversation.id)
+    assert next(branch for branch in all_branches if branch.id == alternate.branch_id).hidden_at
+    with pytest.raises(ValidationError, match="非表示"):
+        await repository.activate_branch(conversation.id, alternate.branch_id)
+
+    await repository.restore_branch(conversation.id, alternate.branch_id)
+    assert len(await repository.list_branches(conversation.id)) == 2
+
+
+@pytest.mark.asyncio
 async def test_translation_attempt_is_stored_separately_from_message(
     tmp_path: Path,
 ) -> None:

@@ -375,7 +375,20 @@ class ChatService:
                         )
             if self._telemetry is not None:
                 self._telemetry.request_capture(session.run.id)
-            if self._translation_scheduler is not None:
+            auto_translate = False
+            try:
+                current_conversation = await self._repository.get_conversation(
+                    conversation.id
+                )
+                auto_translate = current_conversation.auto_translate
+            except Exception as error:
+                await self._repository.log_event(
+                    "error",
+                    "translation_preference_read_failed",
+                    {"error_type": type(error).__name__},
+                    session.run.id,
+                )
+            if auto_translate and self._translation_scheduler is not None:
                 try:
                     await self._translation_scheduler.request_translation(response.id)
                 except Exception as error:
