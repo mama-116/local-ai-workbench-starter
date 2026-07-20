@@ -30,6 +30,7 @@ from local_llm_chat.domain.ports.turn_batch_generator import (
     no_turn_batch_stream_update,
 )
 from local_llm_chat.domain.states import (
+    TurnMode,
     TurnBatchState,
     TurnRepairState,
     TurnSpeakerKind,
@@ -67,6 +68,64 @@ _OUTPUT_SCHEMA: dict[str, object] = {
     },
     "required": ["segments"],
 }
+
+
+def _round_table_output_schema(
+    request: TurnBatchGenerationRequest,
+) -> dict[str, object]:
+    common_properties: dict[str, object] = {
+        "display_name": {"type": "string", "minLength": 1},
+        "content": {"type": "string", "minLength": 1},
+    }
+    character_properties = {
+        **common_properties,
+        "speaker_kind": {"type": "string", "const": "character"},
+        "speaker_id": {
+            "type": "string",
+            "enum": [
+                character.character_id for character in request.formal_characters
+            ],
+        },
+    }
+    narrator_properties = {
+        **common_properties,
+        "speaker_kind": {"type": "string", "const": "narrator"},
+        "speaker_id": {"type": "null", "const": None},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "segments": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_TURN_SEGMENTS,
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": character_properties,
+                            "required": sorted(_SEGMENT_KEYS),
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": narrator_properties,
+                            "required": sorted(_SEGMENT_KEYS),
+                        },
+                    ]
+                },
+            }
+        },
+        "required": ["segments"],
+    }
+
+
+def _output_schema(request: TurnBatchGenerationRequest) -> dict[str, object]:
+    if request.mode is TurnMode.ROUND_TABLE:
+        return _round_table_output_schema(request)
+    return _OUTPUT_SCHEMA
 _SEGMENTS_PREFIX = re.compile(r'^\s*\{\s*"segments"\s*:\s*\[')
 _SYSTEM_PROMPT = """Create the next group-chat turn from the conversation.
 Return only the JSON object required by the schema. Do not add markdown.
@@ -137,7 +196,7 @@ class OllamaTurnBatchGenerator:
             ),
             messages=request.messages,
             options=dict(request.options),
-            response_format=_OUTPUT_SCHEMA,
+            response_format=_output_schema(request),
         )
         chat_request = self._fit_context_window(chat_request)
         cast = ConversationCast(

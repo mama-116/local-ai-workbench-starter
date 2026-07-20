@@ -47,11 +47,12 @@
 ## 検証済み
 
 - [S-01〜S-09受入記録](acceptance/S01-S09-2026-07-17.md)（独立展開したPhase 0診断と各基準の試験手順・実績）
-- `pytest`: 348件成功（Windows固有条件により1件skip）
+- `pytest`: 350件成功（Windows固有条件により1件skip）
 - `mypy --strict`: 129ファイル、エラー0件
 - TurnBatch末尾1か所の再生成操作から専用Application入口へ元AI応答IDとactive branch IDを渡し、成功・競合・二重操作・失敗・キャンセル・会話切替を自動試験で確認。実Ollama `qwen3.5:9b` でも、元TurnBatchを保持した子分岐への再生成とactive branch切替を1回確認
 - グループ生成の構造化JSONを受信中に、固定キャストで話者名を再照合した表示専用プレビューをストリーミングし、完了時だけ従来のTurnBatch原子的保存へ進む経路を自動試験で確認
 - 5人の `round_table` を実Ollama `qwen3.5:9b` で確認し、登録順の名前付き別吹き出し5件、完了TurnBatch 1件、安定ID付きsegment 5件に加え、入力・出力トークン、Ollama総処理・生成時間、アプリ応答時間、導出速度のSQLite保存と再読込に合格。初回の終了遅延は再現せず、記憶抽出・翻訳・Telemetryの終了後受付停止、待機中翻訳の失敗確定、Telemetryの処理中キャンセル、全資源close続行契約を追加後、実Collector稼働中も0.005秒で終了
+- `round_table` 専用Schemaで登録済み正式キャラクターIDまたはナレーター以外を生成段階から除外し、実Ollama `qwen3.5:9b`、4096 token設定の3ターン連続生成が毎回登録順の安定IDで完了することを確認
 - Phase 5内蔵Toolsを実Ollamaの `qwen3.5:9b` で画面確認し、異なる2件の検索・読取り・確認コード回答・読取件数、`CONTROL DESK` の `実行中: 1件` から完了への遷移、入力・件数・サイズ・SHA-256・開始終了時刻、監査本文の非表示を確認
 - Windows上のFletネイティブ画面起動と3カラム表示
 - Ollama Cloud無効化設定を確認し、ローカルモデル15件だけが利用可能になること
