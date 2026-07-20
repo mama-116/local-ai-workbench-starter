@@ -60,7 +60,7 @@
 - `llama3.1:latest` による外国語原文の非同期日本語訳とSQLite保存
 - `192.168.1.17:11434`への読取専用接続とローカルモデル10件の取得
 - `CONTROL DESK` の再起動ボタンで新プロセスへ切り替わり、会話データが保持されることを利用者が画面確認
-- WindowsポータブルZIP 31.6 MiB、1267エントリ、EXE同梱、禁止ファイル0件、SHA-256一致
+- WindowsポータブルZIP 71.67 MiB、2736エントリ、グループ会話・正史記憶を含むアプリEXEと `LocalNotesMCP.exe` をロック済み本番依存で同梱、禁止ファイル0件、SHA-256一致
 - 配布版 `LocalLLMChat.exe` が12秒以上起動を維持し、検査終了後に対象プロセスだけを停止
 - 配布版 `LocalNotesMCP.exe` へ実stdio接続し、Tools-only能力、MCP Roots、UTF-8検索・読取り、正常終了を確認
 - 別のWindows 11 PCでZIPを展開し、`LocalLLMChat.exe` が起動することを利用者が確認
