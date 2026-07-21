@@ -21,6 +21,11 @@ from local_llm_chat.domain.models import (
 from local_llm_chat.domain.states import CostClass, Locality
 
 
+_RETRYABLE_METADATA_REQUESTS = frozenset(
+    {("GET", "/api/tags"), ("POST", "/api/show")}
+)
+
+
 class OllamaProvider:
     def __init__(
         self,
@@ -169,21 +174,28 @@ class OllamaProvider:
         path: str,
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        try:
-            response = await self._client.request(method, path, json=json_body)
-            response.raise_for_status()
-            payload = response.json()
-        except httpx.ConnectError as error:
-            raise OllamaUnavailable("Ollamaに接続できません。") from error
-        except httpx.TimeoutException as error:
-            raise OllamaUnavailable("Ollamaの応答がタイムアウトしました。") from error
-        except httpx.TransportError as error:
-            raise OllamaUnavailable("Ollamaに接続できません。") from error
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as error:
-            raise OllamaUnavailable("Ollamaから不正な応答を受け取りました。") from error
-        if not isinstance(payload, dict):
-            raise OllamaUnavailable("Ollamaから不正な応答を受け取りました。")
-        return payload
+        attempts = 2 if (method.upper(), path) in _RETRYABLE_METADATA_REQUESTS else 1
+        for attempt in range(attempts):
+            try:
+                response = await self._client.request(method, path, json=json_body)
+                response.raise_for_status()
+                payload = response.json()
+            except httpx.TimeoutException as error:
+                raise OllamaUnavailable(
+                    "Ollamaの応答がタイムアウトしました。"
+                ) from error
+            except httpx.TransportError as error:
+                if attempt + 1 < attempts:
+                    continue
+                raise OllamaUnavailable("Ollamaに接続できません。") from error
+            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as error:
+                raise OllamaUnavailable(
+                    "Ollamaから不正な応答を受け取りました。"
+                ) from error
+            if not isinstance(payload, dict):
+                raise OllamaUnavailable("Ollamaから不正な応答を受け取りました。")
+            return payload
+        raise AssertionError("metadata retry loop ended unexpectedly")
 
     @staticmethod
     def _model_from_tag(item: dict[str, Any]) -> ModelInfo:

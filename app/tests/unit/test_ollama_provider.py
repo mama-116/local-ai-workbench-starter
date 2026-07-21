@@ -63,7 +63,11 @@ async def test_stream_chat_sends_response_schema_to_ollama() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_read_error_is_reported_as_ollama_connection_loss() -> None:
+    calls = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise httpx.ReadError("PRIVATE network detail", request=request)
 
     client = httpx.AsyncClient(
@@ -81,12 +85,17 @@ async def test_stream_read_error_is_reported_as_ollama_connection_loss() -> None
         OllamaUnavailable, match="Ollamaとの接続が途中で切れました"
     ):
         _ = [chunk async for chunk in provider.stream_chat(request)]
+    assert calls == 1
     await client.aclose()
 
 
 @pytest.mark.asyncio
 async def test_model_list_read_error_is_not_misreported_as_invalid_payload() -> None:
+    calls = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise httpx.ReadError("PRIVATE network detail", request=request)
 
     client = httpx.AsyncClient(
@@ -97,4 +106,27 @@ async def test_model_list_read_error_is_not_misreported_as_invalid_payload() -> 
 
     with pytest.raises(OllamaUnavailable, match="Ollamaに接続できません"):
         await provider.list_models()
+    assert calls == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_list_reconnects_once_after_stale_transport() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadError("stale keep-alive", request=request)
+        return httpx.Response(200, json={"models": []})
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OllamaProvider(client=client)
+
+    assert await provider.list_models() == []
+    assert calls == 2
     await client.aclose()
