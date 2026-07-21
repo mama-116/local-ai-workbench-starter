@@ -158,6 +158,10 @@ class OllamaProvider:
             raise OllamaUnavailable(
                 f"Ollamaがエラーを返しました ({error.response.status_code})。"
             ) from error
+        except httpx.TransportError as error:
+            raise OllamaUnavailable(
+                "Ollamaとの接続が途中で切れました。状態を再確認してください。"
+            ) from error
 
     async def _request_json(
         self,
@@ -173,6 +177,8 @@ class OllamaProvider:
             raise OllamaUnavailable("Ollamaに接続できません。") from error
         except httpx.TimeoutException as error:
             raise OllamaUnavailable("Ollamaの応答がタイムアウトしました。") from error
+        except httpx.TransportError as error:
+            raise OllamaUnavailable("Ollamaに接続できません。") from error
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as error:
             raise OllamaUnavailable("Ollamaから不正な応答を受け取りました。") from error
         if not isinstance(payload, dict):

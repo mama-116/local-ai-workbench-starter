@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from local_llm_chat.domain.errors import OllamaUnavailable
 from local_llm_chat.domain.models import ChatMessageInput, ChatRequest
 from local_llm_chat.domain.states import MessageRole
 from local_llm_chat.infrastructure.llm.ollama_provider import OllamaProvider
@@ -57,4 +58,43 @@ async def test_stream_chat_sends_response_schema_to_ollama() -> None:
 
     assert chunks[-1].done
     assert captured["format"] == schema
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_read_error_is_reported_as_ollama_connection_loss() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("PRIVATE network detail", request=request)
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OllamaProvider(client=client)
+    request = ChatRequest(
+        "model",
+        "system",
+        (ChatMessageInput(MessageRole.USER, "hello"),),
+    )
+
+    with pytest.raises(
+        OllamaUnavailable, match="Ollamaとの接続が途中で切れました"
+    ):
+        _ = [chunk async for chunk in provider.stream_chat(request)]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_list_read_error_is_not_misreported_as_invalid_payload() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("PRIVATE network detail", request=request)
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OllamaProvider(client=client)
+
+    with pytest.raises(OllamaUnavailable, match="Ollamaに接続できません"):
+        await provider.list_models()
     await client.aclose()
