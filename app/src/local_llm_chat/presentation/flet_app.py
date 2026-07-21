@@ -16,6 +16,7 @@ from local_llm_chat.application.services.conversation_timeline_service import (
     ConversationTimelineItem,
 )
 from local_llm_chat.application.services.memory_capture_service import (
+    MemoryCaptureState,
     MemoryCaptureUpdate,
 )
 from local_llm_chat.application.services.memory_decision_service import (
@@ -105,6 +106,7 @@ class LocalChatApp:
         self._new_memory_event_ids: list[str] = []
         self._memory_notice_conversation_id: str | None = None
         self._memory_notice_branch_id: str | None = None
+        self._memory_capture_source_message_id: str | None = None
         self._memory_decision_in_progress = False
         self._memory_saved_expanded = False
         self.selected_conversation_id: str | None = None
@@ -395,6 +397,9 @@ class LocalChatApp:
         self.memory_pending_count = ft.Text("確認待ち 0件", size=11, color=MUTED)
         self.memory_pending_list = ft.Column(spacing=7, visible=False)
         self.memory_saved_count = ft.Text("保存済み 0件", size=11, color=MUTED)
+        self.memory_capture_status = ft.Text(
+            "記憶確認: 未実行", size=10, color=MUTED
+        )
         self.memory_saved_list = ft.Column(spacing=7, visible=False)
         self.memory_saved_toggle = ft.Button(
             "保存済みを表示",
@@ -421,6 +426,7 @@ class LocalChatApp:
                         ],
                         spacing=6,
                     ),
+                    self.memory_capture_status,
                     self.memory_pending_count,
                     self.memory_pending_list,
                     self.memory_saved_count,
@@ -944,6 +950,9 @@ class LocalChatApp:
             or self._memory_notice_branch_id != conversation.active_branch_id
         ):
             self._new_memory_event_ids.clear()
+            self._memory_capture_source_message_id = None
+            self.memory_capture_status.value = "記憶確認: 未実行"
+            self.memory_capture_status.color = MUTED
             self._memory_notice_conversation_id = conversation.id
             self._memory_notice_branch_id = conversation.active_branch_id
         await self._refresh_memory_review(
@@ -978,6 +987,24 @@ class LocalChatApp:
             or update.branch_id != conversation.active_branch_id
         ):
             return
+        if not self._memory_capture_update_is_current(
+            self._memory_capture_source_message_id, update
+        ):
+            return
+        if update.state is MemoryCaptureState.PROCESSING:
+            self._memory_capture_source_message_id = update.source_message_id
+        self.memory_capture_status.value = self._memory_capture_status_label(
+            update.state, len(update.persisted_event_ids)
+        )
+        self.memory_capture_status.color = {
+            MemoryCaptureState.PROCESSING: ACCENT,
+            MemoryCaptureState.SAVED: MINT,
+            MemoryCaptureState.NO_CANDIDATES: MUTED,
+            MemoryCaptureState.FAILED: ERROR,
+        }[update.state]
+        if update.state is not MemoryCaptureState.SAVED:
+            self.page.update(self.memory_card)
+            return
         snapshot = await self.container.memory_review.list_items(
             conversation.id, conversation.active_branch_id
         )
@@ -997,6 +1024,28 @@ class LocalChatApp:
                 self._new_memory_event_ids.append(event_id)
         self._render_memory_review()
         self.page.update(self.memory_card, self.memory_undo_bar)
+
+    @staticmethod
+    def _memory_capture_status_label(
+        state: MemoryCaptureState, persisted_count: int
+    ) -> str:
+        if state is MemoryCaptureState.PROCESSING:
+            return "記憶確認: 処理中…"
+        if state is MemoryCaptureState.SAVED:
+            return f"記憶確認: {persisted_count}件を保存・確認待ちへ追加"
+        if state is MemoryCaptureState.NO_CANDIDATES:
+            return "記憶確認: 保存対象なし"
+        return "記憶確認: 失敗（会話は保存済み）"
+
+    @staticmethod
+    def _memory_capture_update_is_current(
+        current_source_message_id: str | None,
+        update: MemoryCaptureUpdate,
+    ) -> bool:
+        return (
+            update.state is MemoryCaptureState.PROCESSING
+            or update.source_message_id == current_source_message_id
+        )
 
     def _render_memory_review(self) -> None:
         pending = self.memory_review.pending_confirmation

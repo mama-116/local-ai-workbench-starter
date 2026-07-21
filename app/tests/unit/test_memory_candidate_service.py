@@ -6,7 +6,11 @@ from local_llm_chat.application.services.memory_candidate_service import (
     DEFAULT_MEMORY_TEMPLATES,
     MemoryCandidateService,
 )
-from local_llm_chat.domain.errors import FreeOperationBlocked, ValidationError
+from local_llm_chat.domain.errors import (
+    FreeOperationBlocked,
+    OllamaUnavailable,
+    ValidationError,
+)
 from local_llm_chat.domain.memory_candidates import (
     MemoryCandidateDraft,
     MemoryCandidateRequest,
@@ -35,6 +39,7 @@ class FakeExtractor:
     )
     disabled: bool = True
     calls: int = 0
+    error: Exception | None = None
 
     @property
     def metadata(self) -> ProviderMetadata:
@@ -48,6 +53,8 @@ class FakeExtractor:
         self, request: MemoryCandidateRequest
     ) -> tuple[MemoryCandidateDraft, ...]:
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         return self.drafts
 
 
@@ -72,6 +79,56 @@ def request(
         ),
         known_by_character_ids=known_by,
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_registered_form_survives_unavailable_local_extractor() -> None:
+    extractor = FakeExtractor(
+        (), error=OllamaUnavailable("PRIVATE endpoint detail")
+    )
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    generation = await service.generate_with_status(
+        request("アイスはチョコ味が好き！")
+    )
+    candidates = generation.candidates
+
+    assert extractor.calls == 1
+    assert len(candidates) == 1
+    assert candidates[0].slot == "liked_food"
+    assert candidates[0].value == "チョコ味"
+    assert candidates[0].disposition is MemoryCandidateDisposition.AUTO_SAVE
+    assert generation.extractor_unavailable is True
+
+
+@pytest.mark.asyncio
+async def test_unavailable_local_extractor_still_fails_for_unregistered_form() -> None:
+    extractor = FakeExtractor(
+        (), error=OllamaUnavailable("PRIVATE endpoint detail")
+    )
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    with pytest.raises(OllamaUnavailable, match="PRIVATE endpoint detail"):
+        await service.generate(request("今日は楽しかった。"))
+
+
+@pytest.mark.asyncio
+async def test_unavailable_extractor_fallback_keeps_eight_candidate_limit() -> None:
+    extractor = FakeExtractor((), error=OllamaUnavailable("unavailable"))
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+    content = "。".join(
+        f"アイスはフレーバー{index}が好き" for index in range(9)
+    )
+
+    candidates = await service.generate(request(content))
+
+    assert len(candidates) == 8
 
 
 @pytest.mark.asyncio
