@@ -6,6 +6,14 @@ class ValidationError(AppError):
     pass
 
 
+class TurnBatchOutputError(ValidationError):
+    """A safe, structured classification for untrusted group-model output."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class FreeOperationBlocked(AppError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)

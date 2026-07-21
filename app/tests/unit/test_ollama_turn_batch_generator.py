@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import TurnBatchOutputError, ValidationError
 from local_llm_chat.domain.group_turns import (
     TurnBatchCharacter,
     TurnBatchGenerationRequest,
@@ -153,6 +153,33 @@ async def test_generator_uses_one_schema_constrained_request_and_parses_order() 
         TurnSpeakerKind.NARRATOR,
     ]
     assert draft.segments[0].display_name == "Two"
+
+
+@pytest.mark.asyncio
+async def test_generator_prompt_requires_connected_turns_and_preserves_user_agency() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "A connected answer.",
+            }
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+
+    await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+        generation_request()
+    )
+
+    [sent] = provider.requests
+    prompt = " ".join(sent.system_prompt.lower().split())
+    assert "latest user message" in prompt
+    assert "previous segment" in prompt
+    assert "do not repeat" in prompt
+    assert "never write dialogue, actions, emotions, or consent for the user" in prompt
+    assert "relationship change" in prompt
 
 
 @pytest.mark.asyncio
@@ -387,15 +414,137 @@ async def test_truncated_output_keeps_only_complete_validated_segments_as_partia
 
 
 @pytest.mark.asyncio
+async def test_completed_output_with_only_a_json_fence_is_repaired_without_retry() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "Recovered response.",
+            }
+        ]
+    )
+    provider = FakeProvider(
+        (ChatChunk(content=f"```json\n{content}\n```"), ChatChunk(done=True))
+    )
+
+    draft = await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+        generation_request()
+    )
+
+    assert len(provider.requests) == 1
+    assert draft.state is TurnBatchState.COMPLETED
+    assert draft.repair_state is TurnRepairState.SUCCEEDED
+    assert draft.error_code is None
+    assert draft.segments[0].content == "Recovered response."
+
+
+@pytest.mark.asyncio
+async def test_completed_broken_json_keeps_only_validated_prefix_as_partial() -> None:
+    first = json.dumps(
+        {
+            "speaker_kind": "character",
+            "speaker_id": "character-1",
+            "display_name": "One",
+            "content": "Safe prefix.",
+        }
+    )
+    provider = FakeProvider(
+        (
+            ChatChunk(content='{"segments":[' + first + ',{"speaker_kind":'),
+            ChatChunk(done=True),
+        )
+    )
+
+    draft = await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+        generation_request()
+    )
+
+    assert draft.state is TurnBatchState.PARTIAL
+    assert draft.repair_state is TurnRepairState.FAILED
+    assert draft.error_code == "group_output_not_json"
+    assert [segment.content for segment in draft.segments] == ["Safe prefix."]
+
+
+@pytest.mark.asyncio
+async def test_fenced_broken_json_recovers_prefix_from_inside_the_fence() -> None:
+    first = json.dumps(
+        {
+            "speaker_kind": "character",
+            "speaker_id": "character-1",
+            "display_name": "One",
+            "content": "Safe fenced prefix.",
+        }
+    )
+    content = '```json\n{"segments":[' + first + ',{"speaker_kind":\n```'
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+
+    draft = await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+        generation_request()
+    )
+
+    assert draft.state is TurnBatchState.PARTIAL
+    assert draft.error_code == "group_output_not_json"
+    assert [segment.content for segment in draft.segments] == [
+        "Safe fenced prefix."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_round_table_contract_violation_keeps_valid_cast_prefix() -> None:
+    content = model_output(
+        [
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One",
+                "content": "Safe first turn.",
+            },
+            {
+                "speaker_kind": "character",
+                "speaker_id": "character-1",
+                "display_name": "One again",
+                "content": "Invalid repeated speaker.",
+            },
+        ]
+    )
+    provider = FakeProvider((ChatChunk(content=content), ChatChunk(done=True)))
+    request = replace(generation_request(), mode=TurnMode.ROUND_TABLE)
+
+    draft = await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(request)
+
+    assert draft.state is TurnBatchState.PARTIAL
+    assert draft.error_code == "group_output_contract_violation"
+    assert [segment.speaker_id for segment in draft.segments] == ["character-1"]
+
+
+@pytest.mark.asyncio
+async def test_unrecoverable_root_reports_a_specific_safe_error_code() -> None:
+    provider = FakeProvider(
+        (ChatChunk(content='{"answer":"not segments"}'), ChatChunk(done=True))
+    )
+
+    with pytest.raises(TurnBatchOutputError) as caught:
+        await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
+            generation_request()
+        )
+
+    assert caught.value.code == "group_output_invalid_root"
+
+
+@pytest.mark.asyncio
 async def test_completed_nonconforming_output_is_rejected() -> None:
     provider = FakeProvider(
         (ChatChunk(content='{"segments":[],"extra":true}'), ChatChunk(done=True))
     )
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(TurnBatchOutputError) as caught:
         await OllamaTurnBatchGenerator(FakeRegistry(provider)).generate(
             generation_request()
         )
+
+    assert caught.value.code == "group_output_invalid_root"
 
 
 @pytest.mark.asyncio

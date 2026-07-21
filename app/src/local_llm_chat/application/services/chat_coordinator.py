@@ -17,7 +17,7 @@ from local_llm_chat.application.services.turn_batch_generation_service import (
     TurnBatchGenerationService,
 )
 from local_llm_chat.application.services.turn_batch_service import TurnBatchService
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import TurnBatchOutputError, ValidationError
 from local_llm_chat.domain.models import Message, RunSession
 from local_llm_chat.domain.ports.repositories import AppRepository
 from local_llm_chat.domain.states import MessageState
@@ -157,12 +157,17 @@ class ChatCoordinator:
                 )
             raise
         except Exception as error:
+            error_code = (
+                error.code
+                if isinstance(error, TurnBatchOutputError)
+                else type(error).__name__
+            )
             with suppress(Exception):
                 await self._repository.finish_response(
                     session,
                     "",
                     MessageState.FAILED,
-                    error_code=type(error).__name__,
+                    error_code=error_code,
                 )
             raise
 

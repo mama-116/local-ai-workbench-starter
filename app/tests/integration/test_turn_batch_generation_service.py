@@ -228,7 +228,7 @@ async def test_service_injects_only_memory_known_by_the_entire_cast(
         fact.event_id != "alice-secret"
         for fact in generator.request.shared_memory_facts
     )
-    assert generator.request.prompt_version == "group-turn-v2"
+    assert generator.request.prompt_version == "group-turn-v3"
 
 
 @pytest.mark.asyncio

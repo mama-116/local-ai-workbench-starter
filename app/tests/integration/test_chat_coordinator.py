@@ -19,7 +19,7 @@ from local_llm_chat.application.services.turn_batch_generation_service import (
     TurnBatchGenerationService,
 )
 from local_llm_chat.application.services.turn_batch_service import TurnBatchService
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import TurnBatchOutputError, ValidationError
 from local_llm_chat.domain.group_turns import (
     TurnBatchDraft,
     TurnBatchGenerationRequest,
@@ -259,6 +259,7 @@ async def test_enabled_conversation_generates_and_finishes_one_turn_batch(
 
     assert single.send_count == 0
     assert len(generator.requests) == 1
+    assert generator.requests[0].prompt_version == "group-turn-v3"
     assert response.state is MessageState.COMPLETED
     assert response.content.endswith("グループ応答")
     assert updates == [
@@ -363,6 +364,44 @@ async def test_group_failure_always_terminates_started_response(
         ).fetchone()
     assert response is not None and response["state"] == expected_message_state.value
     assert run is not None and run["state"] == expected_run_state.value
+
+
+@pytest.mark.asyncio
+async def test_group_output_failure_persists_specific_safe_error_code(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    conversation = await make_conversation(repository)
+    await ConversationGroupSettingsService(repository).configure(
+        conversation.id, enabled=True, mode=TurnMode.STORY
+    )
+    placeholder = Message(
+        "unused",
+        conversation.id,
+        None,
+        None,
+        MessageRole.ASSISTANT,
+        "",
+        MessageState.COMPLETED,
+        datetime.now(UTC),
+        datetime.now(UTC),
+    )
+    error = TurnBatchOutputError(
+        "group_output_invalid_speaker", "unsafe model details are not persisted"
+    )
+
+    with pytest.raises(TurnBatchOutputError):
+        await coordinator(
+            repository, SingleChatStub(placeholder), RecordingGenerator(error)
+        ).send_message(conversation.id, "失敗する質問")
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT state, error_code FROM runs WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 1",
+            (conversation.id,),
+        ).fetchone()
+    assert row == (RunState.FAILED.value, "group_output_invalid_speaker")
 
 
 @pytest.mark.asyncio

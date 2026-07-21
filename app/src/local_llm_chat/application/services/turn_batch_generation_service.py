@@ -27,7 +27,7 @@ from local_llm_chat.domain.states import TurnMode
 from local_llm_chat.domain.states import MemoryKind
 
 
-TURN_BATCH_PROMPT_VERSION = "group-turn-v2"
+TURN_BATCH_PROMPT_VERSION = "group-turn-v3"
 
 
 class TurnBatchGenerationService:
