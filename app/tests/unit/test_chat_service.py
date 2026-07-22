@@ -13,10 +13,12 @@ from local_llm_chat.application.services.memory_capture_service import (
 from local_llm_chat.application.services.context_budget import ContextWindowManager
 from local_llm_chat.application.services.tool_coordinator import ToolCoordinator
 from local_llm_chat.application.services.rag_service import RagService
+from local_llm_chat.domain.canonical_memory import CanonicalMemoryEvent
 from local_llm_chat.domain.errors import (
     FreeOperationBlocked,
     OllamaUnavailable,
     ToolUseUnavailable,
+    ValidationError,
 )
 from local_llm_chat.domain.models import (
     ChatChunk,
@@ -30,7 +32,14 @@ from local_llm_chat.domain.models import (
     ToolProviderResult,
 )
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
-from local_llm_chat.domain.states import CostClass, Locality, MessageState
+from local_llm_chat.domain.states import (
+    CostClass,
+    Locality,
+    MemoryApprovalState,
+    MemoryCardinality,
+    MemoryKind,
+    MessageState,
+)
 from local_llm_chat.infrastructure.persistence.sqlite_repositories import (
     SQLiteAppRepository,
 )
@@ -361,6 +370,186 @@ async def test_completed_chat_enqueues_memory_without_losing_response(
                 "SELECT event_type FROM app_events "
                 "WHERE event_type = 'memory_capture_enqueue_failed'"
             ).fetchone() == ("memory_capture_enqueue_failed",)
+
+
+@pytest.mark.asyncio
+async def test_single_chat_request_includes_active_canonical_memory(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_conversation(repository)
+    conversation = await repository.get_conversation(conversation_id)
+    character = await repository.get_character_version(
+        conversation.character_version_id
+    )
+    source = await repository.start_send(conversation_id, "長期記憶の出典")
+    await repository.finish_response(source, "保存しました", MessageState.COMPLETED)
+    await repository.append_canonical_memory_event(
+        CanonicalMemoryEvent(
+            id="memory-single-chat-marker",
+            conversation_id=conversation_id,
+            branch_id=source.branch_id,
+            subject_id="user",
+            kind=MemoryKind.SAFETY_CONSTRAINT,
+            slot="network_policy",
+            value="SINGLE-MEMORY-731",
+            cardinality=MemoryCardinality.SINGLE,
+            approval=MemoryApprovalState.AUTO_SAVED,
+            source_message_id=source.user_message.id,
+            known_by_character_ids=frozenset({character.character_id}),
+            supersedes_event_id=None,
+            effective_at=source.user_message.created_at,
+            recorded_at=source.user_message.created_at,
+        )
+    )
+    await repository.append_canonical_memory_event(
+        CanonicalMemoryEvent(
+            id="memory-pending-marker",
+            conversation_id=conversation_id,
+            branch_id=source.branch_id,
+            subject_id="user",
+            kind=MemoryKind.SAFETY_CONSTRAINT,
+            slot="pending_policy",
+            value="PENDING-MEMORY-MUST-NOT-LEAK",
+            cardinality=MemoryCardinality.SINGLE,
+            approval=MemoryApprovalState.PENDING_CONFIRMATION,
+            source_message_id=source.user_message.id,
+            known_by_character_ids=frozenset({character.character_id}),
+            supersedes_event_id=None,
+            effective_at=source.user_message.created_at,
+            recorded_at=source.user_message.created_at,
+        )
+    )
+    registry = FakeRegistry()
+    service = ChatService(repository, registry, FreeOperationPolicy())
+
+    response = await service.send_message(conversation_id, "質問")
+
+    assert registry.provider.last_request is not None
+    request_text = "\n".join(
+        (
+            registry.provider.last_request.system_prompt,
+            *(message.content for message in registry.provider.last_request.messages),
+        )
+    )
+    assert "SINGLE-MEMORY-731" in request_text
+    assert "PENDING-MEMORY-MUST-NOT-LEAK" not in request_text
+
+    await service.regenerate_message(conversation_id, response.id)
+
+    assert registry.provider.last_request is not None
+    regenerated_text = "\n".join(
+        (
+            registry.provider.last_request.system_prompt,
+            *(message.content for message in registry.provider.last_request.messages),
+        )
+    )
+    assert "SINGLE-MEMORY-731" in regenerated_text
+    assert "PENDING-MEMORY-MUST-NOT-LEAK" not in regenerated_text
+
+
+@pytest.mark.asyncio
+async def test_single_chat_rejects_excess_safety_memory_before_generation(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_conversation(repository)
+    conversation = await repository.get_conversation(conversation_id)
+    character = await repository.get_character_version(
+        conversation.character_version_id
+    )
+    source = await repository.start_send(conversation_id, "安全制約の出典")
+    await repository.finish_response(source, "保存しました", MessageState.COMPLETED)
+    await repository.append_canonical_memory_events(
+        tuple(
+            CanonicalMemoryEvent(
+                id=f"safety-{index:02d}",
+                conversation_id=conversation_id,
+                branch_id=source.branch_id,
+                subject_id="user",
+                kind=MemoryKind.SAFETY_CONSTRAINT,
+                slot="blocked_operation",
+                value=f"BLOCK-{index:02d}",
+                cardinality=MemoryCardinality.MULTIPLE,
+                approval=MemoryApprovalState.AUTO_SAVED,
+                source_message_id=source.user_message.id,
+                known_by_character_ids=frozenset({character.character_id}),
+                supersedes_event_id=None,
+                effective_at=source.user_message.created_at,
+                recorded_at=source.user_message.created_at,
+            )
+            for index in range(33)
+        )
+    )
+    registry = FakeRegistry()
+    service = ChatService(repository, registry, FreeOperationPolicy())
+
+    with pytest.raises(ValidationError, match="safety memory exceeds"):
+        await service.send_message(conversation_id, "質問")
+
+    assert registry.provider.last_request is None
+    messages = await repository.list_active_messages(conversation_id)
+    assert messages[-1].state is MessageState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_single_chat_keeps_canonical_memory_after_restart_and_100_turns(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    conversation_id = await make_small_context_conversation(repository)
+    conversation = await repository.get_conversation(conversation_id)
+    character = await repository.get_character_version(
+        conversation.character_version_id
+    )
+    source = await repository.start_send(conversation_id, "最初の長期記憶")
+    await repository.finish_response(source, "保存しました", MessageState.COMPLETED)
+    await repository.append_canonical_memory_event(
+        CanonicalMemoryEvent(
+            id="memory-after-100-turns",
+            conversation_id=conversation_id,
+            branch_id=source.branch_id,
+            subject_id="user",
+            kind=MemoryKind.PREFERENCE,
+            slot="project_code",
+            value="LONG-MEMORY-100",
+            cardinality=MemoryCardinality.SINGLE,
+            approval=MemoryApprovalState.AUTO_SAVED,
+            source_message_id=source.user_message.id,
+            known_by_character_ids=frozenset({character.character_id}),
+            supersedes_event_id=None,
+            effective_at=source.user_message.created_at,
+            recorded_at=source.user_message.created_at,
+        )
+    )
+    for index in range(1, 100):
+        session = await repository.start_send(conversation_id, f"履歴-{index}")
+        await repository.finish_response(
+            session, f"回答-{index}", MessageState.COMPLETED
+        )
+
+    reopened = SQLiteAppRepository(database_path)
+    await reopened.initialize()
+    registry = FakeRegistry()
+    provider = CompressingProvider()
+    registry.provider = provider
+    service = ChatService(
+        reopened,
+        registry,
+        FreeOperationPolicy(),
+        context_window=ContextWindowManager(reopened, OneUnitCounter()),
+    )
+
+    await service.send_message(conversation_id, "現在の質問")
+
+    assert len(provider.requests) == 2
+    final_request = provider.requests[-1]
+    assert "LONG-MEMORY-100" in final_request.system_prompt
+    assert final_request.messages[0].content.startswith(
+        "[以前の会話のローカル要約]"
+    )
+    assert final_request.messages[-1].content == "現在の質問"
 
 
 @pytest.mark.asyncio

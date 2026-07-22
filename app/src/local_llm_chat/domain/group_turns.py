@@ -5,6 +5,10 @@ from datetime import datetime
 from typing import Any
 
 from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.canonical_memory import (
+    MAX_CANONICAL_MEMORY_CONTEXT_CHARACTERS,
+    MAX_CANONICAL_MEMORY_FACTS,
+)
 from local_llm_chat.domain.models import ChatMessageInput
 from local_llm_chat.domain.states import (
     MemoryKind,
@@ -21,8 +25,8 @@ MAX_TURN_SEGMENTS = 32
 MAX_TURN_SEGMENT_CHARACTERS = 8_000
 MAX_SPEAKER_DISPLAY_NAME_CHARACTERS = 100
 MAX_TURN_GENERATION_CONTEXT_CHARACTERS = 200_000
-MAX_SHARED_MEMORY_FACTS = 32
-MAX_SHARED_MEMORY_CONTEXT_CHARACTERS = 16_000
+MAX_SHARED_MEMORY_FACTS = MAX_CANONICAL_MEMORY_FACTS
+MAX_SHARED_MEMORY_CONTEXT_CHARACTERS = MAX_CANONICAL_MEMORY_CONTEXT_CHARACTERS
 
 
 @dataclass(frozen=True, slots=True)

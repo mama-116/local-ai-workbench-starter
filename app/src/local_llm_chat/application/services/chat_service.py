@@ -9,6 +9,9 @@ from local_llm_chat.application.services.memory_capture_service import (
     MemoryCaptureRequest,
     MemoryCaptureScheduler,
 )
+from local_llm_chat.application.services.canonical_memory_context import (
+    render_single_chat_memory_context,
+)
 from local_llm_chat.application.services.translation_service import (
     TranslationScheduler,
 )
@@ -21,6 +24,7 @@ from local_llm_chat.domain.errors import (
     FreeOperationBlocked,
     OllamaUnavailable,
     ToolUseUnavailable,
+    ValidationError,
 )
 from local_llm_chat.domain.models import (
     ChatMessageInput,
@@ -143,7 +147,32 @@ class ChatService:
             session.run.character_version_id
         )
         context = await self._repository.context_to_message(session.user_message.id)
+        try:
+            memory_facts = await self._repository.project_canonical_memory(
+                conversation.id,
+                session.branch_id,
+                character.character_id,
+            )
+            memory_context = render_single_chat_memory_context(memory_facts)
+        except asyncio.CancelledError:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.CANCELLED,
+                error_code="cancelled_by_user",
+            )
+            raise
+        except Exception as error:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.FAILED,
+                error_code=type(error).__name__,
+            )
+            raise
         system_prompt = character.system_prompt
+        if memory_context:
+            system_prompt = f"{system_prompt}\n\n{memory_context}"
         rag_context = ""
         if self._rag is not None:
             selected_document_count, rag_results = await self._rag.prepare_for_conversation(
@@ -209,6 +238,16 @@ class ChatService:
             )
             raise
         request = prepared.request
+        if not request.messages or request.messages[-1].content != session.user_message.content:
+            await self._repository.finish_response(
+                session,
+                "",
+                MessageState.FAILED,
+                error_code="ValidationError",
+            )
+            raise ValidationError(
+                "canonical memory and system context leave no room for the current message"
+            )
         if prepared.notice is not None:
             await on_notice(prepared.notice, prepared.notice_is_warning)
         content = ""
