@@ -14,6 +14,8 @@ from local_llm_chat.domain.states import (
 _PERSISTED_APPROVAL_STATES = frozenset(
     {MemoryApprovalState.AUTO_SAVED, MemoryApprovalState.CONFIRMED}
 )
+MAX_CANONICAL_MEMORY_FACTS = 32
+MAX_CANONICAL_MEMORY_CONTEXT_CHARACTERS = 16_000
 
 
 def transitive_superseded_event_ids(
