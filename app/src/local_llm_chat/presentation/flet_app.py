@@ -28,7 +28,7 @@ from local_llm_chat.application.services.memory_review_service import (
 )
 from local_llm_chat.bootstrap import AppContainer
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryReviewItem
-from local_llm_chat.domain.errors import AppError
+from local_llm_chat.domain.errors import AppError, ValidationError
 from local_llm_chat.domain.group_turns import ConversationGroupConfiguration
 from local_llm_chat.domain.models import (
     BranchInfo,
@@ -2356,6 +2356,7 @@ class LocalChatApp:
         if not archived:
             self._toast("ゴミ箱は空です。", MUTED)
             return
+        archived_ids = tuple(conversation.id for conversation in archived)
 
         items: list[ft.Control] = []
         for conversation in archived:
@@ -2392,12 +2393,103 @@ class LocalChatApp:
                     padding=12,
                 )
             )
+
+        async def confirm_empty_trash() -> None:
+            async def empty_trash() -> None:
+                try:
+                    deleted = await self.container.conversations.empty_trash(
+                        archived_ids
+                    )
+                except ValidationError:
+                    self.page.pop_dialog()
+                    self.page.pop_dialog()
+                    await self.refresh_all()
+                    self._toast(
+                        "ゴミ箱の内容が変わりました。もう一度確認してください。",
+                        "#D87866",
+                    )
+                    return
+                except AppError as error:
+                    self.page.pop_dialog()
+                    self._toast(
+                        f"完全削除できませんでした。データは保持されています。 {error}",
+                        ERROR,
+                    )
+                    return
+                self.page.pop_dialog()
+                self.page.pop_dialog()
+                await self.refresh_all()
+                self._toast(
+                    f"{deleted}件の会話を完全に削除しました。",
+                    MINT,
+                )
+
+            count = len(archived_ids)
+            self.page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=f"{count}件の会話を完全に削除しますか？",
+                    content=ft.Text(
+                        "会話本文と関連データが削除され、元に戻せません。"
+                    ),
+                    bgcolor="#24231F",
+                    actions=[
+                        ft.Button("キャンセル", on_click=self._close_dialog),
+                        ft.Button(
+                            f"{count}件を完全に削除",
+                            bgcolor="#56342E",
+                            color=TEXT,
+                            on_click=empty_trash,
+                        ),
+                    ],
+                )
+            )
+
+        danger = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "完全削除",
+                        color="#D87866",
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    ft.Text(
+                        "削除した会話は元に戻せません",
+                        size=11,
+                        color=MUTED,
+                    ),
+                    ft.Button(
+                        f"{len(archived_ids)}件を完全に削除",
+                        color="#D87866",
+                        bgcolor="#302522",
+                        on_click=confirm_empty_trash,
+                    ),
+                ],
+                spacing=8,
+            ),
+            border=ft.Border.all(1, "#56342E"),
+            border_radius=12,
+            padding=12,
+        )
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
                 title="ゴミ箱",
                 bgcolor="#24231F",
-                content=ft.ListView(items, spacing=8, width=460, height=360),
+                content=ft.Column(
+                    [
+                        ft.ListView(
+                            items,
+                            spacing=8,
+                            width=460,
+                            height=300,
+                        ),
+                        danger,
+                    ],
+                    spacing=12,
+                    width=460,
+                    height=430,
+                ),
                 actions=[ft.Button("閉じる", on_click=self._close_dialog)],
             )
         )
