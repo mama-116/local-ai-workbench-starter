@@ -130,3 +130,67 @@ async def test_model_list_reconnects_once_after_stale_transport() -> None:
     assert await provider.list_models() == []
     assert calls == 2
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lists_only_embedding_capable_models_and_embeds_batch() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "chat:latest",
+                            "size": 100,
+                            "digest": "chat-digest",
+                            "details": {"format": "gguf"},
+                        },
+                        {
+                            "name": "embed:latest",
+                            "size": 200,
+                            "digest": "embed-digest",
+                            "details": {"format": "gguf"},
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/api/show":
+            body = json.loads(request.content)
+            name = str(body["model"])
+            return httpx.Response(
+                200,
+                json={
+                    "capabilities": (
+                        ["embedding"] if name == "embed:latest" else ["completion"]
+                    ),
+                    "details": {"format": "gguf"},
+                },
+            )
+        if request.url.path == "/api/embed":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"embeddings": [[1.0, 0.0], [0.0, 1.0]]},
+            )
+        raise AssertionError(request.url.path)
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OllamaProvider(client=client)
+
+    models = await provider.list_embedding_models()
+    vectors = await provider.embed("embed:latest", ("一つ目", "二つ目"))
+
+    assert [model.name for model in models] == ["embed:latest"]
+    assert models[0].digest == "embed-digest"
+    assert captured == {
+        "model": "embed:latest",
+        "input": ["一つ目", "二つ目"],
+    }
+    assert vectors == ((1.0, 0.0), (0.0, 1.0))
+    await client.aclose()

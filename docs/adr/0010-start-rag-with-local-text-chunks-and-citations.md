@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-16
 - Decision owner: 利用者
+- Amended by: ADR-0022
 
 ## Context
 

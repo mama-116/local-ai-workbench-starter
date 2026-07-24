@@ -45,6 +45,13 @@ class ContextSummaryState(StrEnum):
     FAILED = "failed"
 
 
+class EmbeddingIndexState(StrEnum):
+    PENDING = "pending"
+    BUILDING = "building"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class JobRunState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"

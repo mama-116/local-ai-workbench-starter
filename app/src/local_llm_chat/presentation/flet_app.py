@@ -36,6 +36,7 @@ from local_llm_chat.domain.models import (
     ComputerUseRun,
     Conversation,
     DocumentRecord,
+    EmbeddingConfiguration,
     LatestTelemetry,
     Message,
     MessageRagUsage,
@@ -50,6 +51,7 @@ from local_llm_chat.domain.models import (
 )
 from local_llm_chat.domain.states import (
     DesktopIntegrityLevel,
+    EmbeddingIndexState,
     MessageRole,
     MessageState,
 )
@@ -438,6 +440,16 @@ class LocalChatApp:
         )
         self.connection_dropdown = self._dropdown("Ollama接続先")
         self.connection_dropdown.on_select = self.switch_connection
+        self.embedding_status_text = ft.Text(
+            "埋め込み: 未設定（語句検索のみ）", size=10, color=MUTED
+        )
+        self.model_roles_button = ft.Button(
+            "用途別モデル設定",
+            icon=ft.Icons.TUNE_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_model_role_dialog,
+        )
         self.model_dropdown = self._dropdown("モデル")
         self.model_dropdown.on_select = self.update_selection
         self.branch_dropdown = self._dropdown("会話の分岐")
@@ -477,6 +489,7 @@ class LocalChatApp:
         self.container.telemetry.subscribe(self._on_telemetry_update)
         self.container.tool_access.subscribe(self._on_tool_update)
         self.container.memory_capture.subscribe(self._on_memory_capture)
+        self.container.embeddings.subscribe(self._on_embedding_update)
 
     async def initialize(self) -> None:
         self._configure_page()
@@ -603,6 +616,8 @@ class LocalChatApp:
                         bgcolor="#292925",
                         on_click=self.show_connection_dialog,
                     ),
+                    self.model_roles_button,
+                    self.embedding_status_text,
                     self._section_label("PERSONA"),
                     self.character_dropdown,
                     ft.Button(
@@ -676,7 +691,40 @@ class LocalChatApp:
         await self._refresh_telemetry()
         await self._refresh_tools()
         await self._refresh_computer_use()
+        await self._refresh_embedding_status()
         self.page.update()
+
+    async def _refresh_embedding_status(self) -> None:
+        configuration = await self.container.embeddings.configuration()
+        self.embedding_status_text.value, self.embedding_status_text.color = (
+            self._embedding_status(configuration)
+        )
+
+    async def _on_embedding_update(self) -> None:
+        await self._refresh_embedding_status()
+        self.page.update(self.embedding_status_text)
+
+    @staticmethod
+    def _embedding_status(
+        configuration: EmbeddingConfiguration,
+    ) -> tuple[str, str]:
+        desired = configuration.desired
+        active = configuration.active
+        if desired is None:
+            return "埋め込み: 未設定（語句検索のみ）", MUTED
+        target = f"{desired.provider_name} / {desired.model_name}"
+        if desired.state is EmbeddingIndexState.BUILDING:
+            suffix = "・旧索引で継続" if active and active.id != desired.id else ""
+            return (
+                f"埋め込み: 索引構築中 {desired.embedded_chunks}/{desired.total_chunks}{suffix}",
+                ACCENT,
+            )
+        if desired.state is EmbeddingIndexState.FAILED:
+            suffix = "・旧索引で継続" if active else "・語句検索のみ"
+            return f"埋め込み: 失敗{suffix}", ERROR
+        if active is not None and active.id == desired.id:
+            return f"埋め込み: 利用可能 · {target}", MINT
+        return f"埋め込み: 待機中 · {target}", MUTED
 
     async def _refresh_computer_use(self) -> None:
         conversation_id = self.selected_conversation_id
@@ -2229,6 +2277,163 @@ class LocalChatApp:
                 ],
             )
         )
+
+    async def show_model_role_dialog(self) -> None:
+        configuration = await self.container.embeddings.configuration()
+        desired = configuration.desired
+        connection = self._dropdown("埋め込み接続先")
+        connection.options = [
+            ft.DropdownOption(item.provider_name, item.display_name)
+            for item in self.connections
+        ]
+        connection.value = (
+            desired.provider_name
+            if desired is not None
+            and any(
+                item.provider_name == desired.provider_name
+                for item in self.connections
+            )
+            else None
+        )
+        model = self._dropdown("埋め込みモデル")
+        status = ft.Text(size=11, color=MUTED)
+        if desired is not None and desired.last_error:
+            status.value = f"前回の失敗: {desired.last_error}"
+            status.color = ERROR
+        elif desired is None:
+            status.value = "未設定です。保存するまでは語句検索だけを使用します。"
+        else:
+            status.value = self._embedding_status(configuration)[0]
+        save_button = ft.Button(
+            "保存して索引を構築",
+            bgcolor=ACCENT,
+            color="#17120D",
+        )
+
+        async def load_models() -> None:
+            provider_name = connection.value
+            model.options = []
+            model.value = None
+            if not provider_name:
+                status.value = "埋め込み接続先を選択してください。"
+                status.color = MUTED
+                self.page.update()
+                return
+            status.value = "接続確認中..."
+            status.color = ACCENT
+            save_button.disabled = True
+            self.page.update()
+            try:
+                models = await self.container.embeddings.list_models(provider_name)
+            except AppError as error:
+                status.value = str(error)
+                status.color = ERROR
+                self.page.update()
+                return
+            finally:
+                save_button.disabled = False
+            model.options = [
+                ft.DropdownOption(item.name, item.name) for item in models
+            ]
+            if (
+                desired is not None
+                and desired.provider_name == provider_name
+                and any(item.name == desired.model_name for item in models)
+            ):
+                model.value = desired.model_name
+            status.value = (
+                f"埋め込み対応モデル {len(models)}件"
+                if models
+                else "この接続先に埋め込み対応モデルがありません。"
+            )
+            status.color = MINT if models else ERROR
+            self.page.update()
+
+        async def save() -> None:
+            if not connection.value or not model.value:
+                status.value = "接続先と埋め込みモデルを選択してください。"
+                status.color = ERROR
+                self.page.update()
+                return
+            save_button.disabled = True
+            status.value = "接続・日本語検索品質を確認中..."
+            status.color = ACCENT
+            self.page.update()
+            try:
+                await self.container.embeddings.configure(
+                    connection.value, model.value
+                )
+            except AppError as error:
+                status.value = str(error)
+                status.color = ERROR
+                save_button.disabled = False
+                self.page.update()
+                return
+            self.page.pop_dialog()
+            await self._refresh_embedding_status()
+            self.page.update()
+            self._toast("埋め込み設定を保存し、索引構築を開始しました。", MINT)
+
+        connection.on_select = load_models
+        save_button.on_click = save
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="用途別モデル設定",
+                bgcolor="#24231F",
+                content=ft.Column(
+                    [
+                        ft.Container(
+                            padding=10,
+                            border=ft.Border.all(1, "#3A3934"),
+                            border_radius=10,
+                            content=ft.Row(
+                                [
+                                    ft.Text(
+                                        "会話生成",
+                                        width=100,
+                                        weight=ft.FontWeight.W_600,
+                                    ),
+                                    ft.Text("会話ごとに設定", color=MUTED),
+                                ],
+                            ),
+                        ),
+                        ft.Container(
+                            padding=10,
+                            border=ft.Border.all(1, "#3A3934"),
+                            border_radius=10,
+                            content=ft.Column(
+                                [
+                                    ft.Text(
+                                        "埋め込み",
+                                        weight=ft.FontWeight.W_600,
+                                        color=ACCENT,
+                                    ),
+                                    connection,
+                                    model,
+                                    status,
+                                ],
+                                spacing=8,
+                            ),
+                        ),
+                        ft.Text(
+                            "DGXを選ぶと、選択したRAG資料と検索文を確認済みLAN端末へ送ります。"
+                            "モデル変更後は新索引を構築し、完成まで旧索引または語句検索を使います。",
+                            size=10,
+                            color=MUTED,
+                        ),
+                    ],
+                    tight=True,
+                    width=520,
+                ),
+                actions=[
+                    ft.Button("閉じる", on_click=self._close_dialog),
+                    save_button,
+                ],
+            )
+        )
+        if connection.value:
+            await load_models()
 
     def show_new_character_dialog(self) -> None:
         self.show_character_dialog(create_new=True)

@@ -10,6 +10,7 @@ from local_llm_chat.domain.errors import ValidationError
 from local_llm_chat.domain.models import ProviderConnection
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.ports.llm_provider import LLMProvider
+from local_llm_chat.domain.ports.embedding_provider import EmbeddingProvider
 from local_llm_chat.infrastructure.llm.ollama_provider import OllamaProvider
 from local_llm_chat.infrastructure.settings import is_ollama_cloud_disabled
 
@@ -61,6 +62,12 @@ class OllamaProviderRegistry:
         return list(self._connections)
 
     def get(self, provider_name: str) -> LLMProvider:
+        try:
+            return self._providers[provider_name]
+        except KeyError as error:
+            raise ValidationError("登録されていないOllama接続先です。") from error
+
+    def get_embedding(self, provider_name: str) -> EmbeddingProvider:
         try:
             return self._providers[provider_name]
         except KeyError as error:

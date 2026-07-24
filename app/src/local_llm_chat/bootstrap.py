@@ -7,6 +7,9 @@ from pathlib import Path
 
 from local_llm_chat.application.services.chat_coordinator import ChatCoordinator
 from local_llm_chat.application.services.chat_service import ChatService
+from local_llm_chat.application.services.embedding_index_service import (
+    EmbeddingIndexService,
+)
 from local_llm_chat.application.services.computer_use_access_service import (
     ComputerUseAccessService,
 )
@@ -102,6 +105,7 @@ class AppContainer:
     repository: SQLiteAppRepository
     providers: OllamaProviderRegistry
     profiles: ProfileService
+    embeddings: EmbeddingIndexService
     rag: RagService
     restart: RestartService
     conversations: ConversationService
@@ -125,6 +129,7 @@ class AppContainer:
                 ("translations", self.translations.close),
                 ("telemetry", self.telemetry.close),
                 ("memory_extractor", self.memory_extractor.close),
+                ("embeddings", self.embeddings.close),
                 ("providers", self.providers.close),
             )
         )
@@ -161,7 +166,9 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     telemetry = TelemetryService(
         repository, [WindowsSystemCollector(), NvidiaSmiCollector()]
     )
-    rag = RagService(repository)
+    embeddings = EmbeddingIndexService(repository, providers, policy)
+    await embeddings.resume()
+    rag = RagService(repository, embeddings)
     tool_access = ToolAccessService(repository)
     tool_coordinator = ToolCoordinator(
         repository,
@@ -193,6 +200,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         repository=repository,
         providers=providers,
         profiles=ProfileService(repository, providers, policy),
+        embeddings=embeddings,
         rag=rag,
         restart=RestartService(paths.data_dir, SubprocessRestartLauncher()),
         conversations=ConversationService(repository, providers, policy),

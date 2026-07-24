@@ -97,6 +97,7 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `artifacts`: 設計書、ADR、コード、モック
 - `tasks`: 利用者に見せる次の一手と内部Issue参照
 - `documents` / `chunks`: RAG登録資料と断片
+- `embedding_profiles` / `chunk_embeddings` / `model_role_settings`: 再生成可能な意味検索索引、接続先・モデルdigest・次元、要求中／有効プロファイル
 - `telemetry_samples`: CPU、RAM、GPU、VRAM、速度
 - `scheduled_jobs` / `job_runs`: 定期処理と実行履歴
 - `agent_runs` / `agent_steps`: 許可ツール、予算、手数、時間、承認、復元を追記するAgent実行監査
@@ -104,6 +105,10 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `turn_batches` / `turn_segments`: 1回のモデル生成と、順序・内部話者ID・表示名を持つ複数発言の保存単位
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
+
+RAG検索は既存の語句一致とOllama埋め込みのcosine類似度をRRFで統合する。埋め込み用途はアプリ全体で1つの有効プロファイルを持つが、完成済み索引は接続ID、endpoint fingerprint、モデル名、モデルdigest、次元ごとに保持する。設定変更時は要求中プロファイルを別に構築し、全chunkの整合性確認後に同一transactionで有効プロファイルへ切り替える。失敗時は旧プロファイルを維持し、旧プロファイルも使えなければ語句検索へ縮退する。
+
+埋め込み先は登録済みのループバックまたはRFC 1918内Ollamaに限る。RAG資料と検索文を送る直前にも、無料Provider、Cloud無効化、ローカルモデル実体、embedding capability、endpoint fingerprintを再検査する。ベクトルはPRIVATEから導出したローカル派生データとしてSQLiteだけに保存し、外部APIやWeb検索へ送らない。
 
 `conversations.auto_translate` は会話単位の自動翻訳許可で、既存・新規会話とも既定値を無効とする。`conversations.archived_at` は復元可能なゴミ箱移動だけに使い、物理削除を意味しない。`branches.hidden_at` は分岐を選択肢から隠す表示状態であり、メッセージ、Run、TurnBatch、正史記憶を削除しない。root分岐とactive分岐は非表示にできず、非表示分岐をactiveへ切り替えられない。
 

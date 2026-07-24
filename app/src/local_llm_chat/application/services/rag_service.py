@@ -55,9 +55,25 @@ class RagRepository(Protocol):
     ) -> dict[str, MessageRagUsage]: ...
 
 
+class SemanticRagIndex(Protocol):
+    async def documents_changed(self) -> None: ...
+
+    async def search(
+        self,
+        query: str,
+        top_k: int,
+        document_ids: tuple[str, ...] | None = None,
+    ) -> list[RagSearchResult]: ...
+
+
 class RagService:
-    def __init__(self, repository: RagRepository) -> None:
+    def __init__(
+        self,
+        repository: RagRepository,
+        semantic_index: SemanticRagIndex | None = None,
+    ) -> None:
         self._repository = repository
+        self._semantic_index = semantic_index
 
     async def register_document(
         self, filename: str, payload: bytes
@@ -92,7 +108,10 @@ class RagService:
             created_at=utc_now(),
         )
         chunks = self._make_chunks(document)
-        return await self._repository.save_document(document, chunks)
+        saved = await self._repository.save_document(document, chunks)
+        if self._semantic_index is not None:
+            await self._semantic_index.documents_changed()
+        return saved
 
     async def search(
         self,
@@ -107,7 +126,19 @@ class RagService:
             raise ValidationError("検索語は500文字以下にしてください。")
         if not 1 <= top_k <= 8:
             raise ValidationError("検索件数は1件から8件で指定してください。")
-        return await self._repository.search_chunks(normalized, top_k, document_ids)
+        candidate_limit = max(top_k * 4, top_k)
+        lexical = await self._repository.search_chunks(
+            normalized, candidate_limit, document_ids
+        )
+        if self._semantic_index is None:
+            return lexical[:top_k]
+        try:
+            semantic = await self._semantic_index.search(
+                normalized, candidate_limit, document_ids
+            )
+        except Exception:
+            return lexical[:top_k]
+        return self._fuse_results(lexical, semantic, top_k)
 
     async def documents(self) -> list[DocumentRecord]:
         return await self._repository.list_documents()
@@ -187,6 +218,37 @@ class RagService:
                 f"文字{citation.start_offset}-{citation.end_offset}]\n{result.content}"
             )
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _fuse_results(
+        lexical: list[RagSearchResult],
+        semantic: list[RagSearchResult],
+        top_k: int,
+        rrf_k: int = 60,
+    ) -> list[RagSearchResult]:
+        by_chunk: dict[str, RagSearchResult] = {}
+        scores: dict[str, float] = {}
+        for ranked in (lexical, semantic):
+            for rank, result in enumerate(ranked, start=1):
+                chunk_id = result.citation.chunk_id
+                by_chunk.setdefault(chunk_id, result)
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+        fused = [
+            RagSearchResult(
+                content=result.content,
+                citation=result.citation,
+                score=scores[chunk_id],
+            )
+            for chunk_id, result in by_chunk.items()
+        ]
+        fused.sort(
+            key=lambda result: (
+                -result.score,
+                result.citation.document_title,
+                result.citation.start_offset,
+            )
+        )
+        return fused[:top_k]
 
     @staticmethod
     def _make_chunks(document: DocumentRecord) -> tuple[DocumentChunk, ...]:

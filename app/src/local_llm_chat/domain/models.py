@@ -26,6 +26,7 @@ from local_llm_chat.domain.states import (
     ComputerPolicyDecision,
     ComputerUseRunState,
     DesktopIntegrityLevel,
+    EmbeddingIndexState,
 )
 
 
@@ -60,6 +61,32 @@ class ModelInfo:
     parameter_size: str
     quantization: str
     license_text: str = ""
+    digest: str = ""
+    capabilities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingProfile:
+    id: str
+    connection_id: str
+    provider_name: str
+    endpoint_fingerprint: str
+    model_name: str
+    model_digest: str
+    vector_dimensions: int
+    min_similarity: float
+    state: EmbeddingIndexState
+    total_chunks: int
+    embedded_chunks: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingConfiguration:
+    desired: EmbeddingProfile | None
+    active: EmbeddingProfile | None
 
 
 @dataclass(frozen=True, slots=True)

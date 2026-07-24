@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import sqlite3
+import struct
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -52,6 +54,8 @@ from local_llm_chat.domain.models import (
     ContextSummaryPreparation,
     DocumentChunk,
     DocumentRecord,
+    EmbeddingConfiguration,
+    EmbeddingProfile,
     LatestTelemetry,
     JobRun,
     Message,
@@ -78,6 +82,7 @@ from local_llm_chat.domain.states import (
     ComputerUseRunState,
     AgentToolEffect,
     DataClassification,
+    EmbeddingIndexState,
     CostClass,
     Locality,
     MemoryApprovalState,
@@ -3196,6 +3201,354 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def save_embedding_profile(
+        self, profile: EmbeddingProfile
+    ) -> EmbeddingProfile:
+        def operation(connection: sqlite3.Connection) -> EmbeddingProfile:
+            connection.execute(
+                """
+                INSERT INTO embedding_profiles(
+                    id, connection_id, provider_name, endpoint_fingerprint,
+                    model_name, model_digest, vector_dimensions, min_similarity,
+                    state, total_chunks, embedded_chunks, last_error,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    provider_name = excluded.provider_name,
+                    endpoint_fingerprint = excluded.endpoint_fingerprint,
+                    model_name = excluded.model_name,
+                    model_digest = excluded.model_digest,
+                    vector_dimensions = excluded.vector_dimensions,
+                    min_similarity = excluded.min_similarity,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.id,
+                    profile.connection_id,
+                    profile.provider_name,
+                    profile.endpoint_fingerprint,
+                    profile.model_name,
+                    profile.model_digest,
+                    profile.vector_dimensions,
+                    profile.min_similarity,
+                    profile.state.value,
+                    profile.total_chunks,
+                    profile.embedded_chunks,
+                    profile.last_error,
+                    profile.created_at.isoformat(),
+                    profile.updated_at.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM embedding_profiles WHERE id = ?", (profile.id,)
+            ).fetchone()
+            if row is None:
+                raise PersistenceError("埋め込みプロファイルを保存できませんでした。")
+            return self._embedding_profile_from_row(row)
+
+        return await self._write(operation)
+
+    async def set_desired_embedding_profile(self, profile_id: str) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            if connection.execute(
+                "SELECT id FROM embedding_profiles WHERE id = ?", (profile_id,)
+            ).fetchone() is None:
+                raise ValidationError("埋め込みプロファイルが見つかりません。")
+            connection.execute(
+                """
+                INSERT INTO model_role_settings(
+                    role, desired_profile_id, active_profile_id, updated_at
+                ) VALUES('embedding', ?, NULL, ?)
+                ON CONFLICT(role) DO UPDATE SET
+                    desired_profile_id = excluded.desired_profile_id,
+                    updated_at = excluded.updated_at
+                """,
+                (profile_id, _now()),
+            )
+
+        await self._write(operation)
+
+    async def get_embedding_configuration(self) -> EmbeddingConfiguration:
+        def operation(connection: sqlite3.Connection) -> EmbeddingConfiguration:
+            row = connection.execute(
+                """
+                SELECT desired_profile_id, active_profile_id
+                FROM model_role_settings WHERE role = 'embedding'
+                """
+            ).fetchone()
+            if row is None:
+                return EmbeddingConfiguration(None, None)
+
+            def load(profile_id: object) -> EmbeddingProfile | None:
+                if profile_id is None:
+                    return None
+                profile_row = connection.execute(
+                    "SELECT * FROM embedding_profiles WHERE id = ?",
+                    (str(profile_id),),
+                ).fetchone()
+                return (
+                    self._embedding_profile_from_row(profile_row)
+                    if profile_row is not None
+                    else None
+                )
+
+            return EmbeddingConfiguration(
+                desired=load(row["desired_profile_id"]),
+                active=load(row["active_profile_id"]),
+            )
+
+        return await self._read(operation)
+
+    async def update_embedding_profile(
+        self,
+        profile_id: str,
+        state: EmbeddingIndexState,
+        total_chunks: int,
+        embedded_chunks: int,
+        last_error: str | None = None,
+    ) -> EmbeddingProfile:
+        def operation(connection: sqlite3.Connection) -> EmbeddingProfile:
+            connection.execute(
+                """
+                UPDATE embedding_profiles
+                SET state = ?, total_chunks = ?, embedded_chunks = ?,
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state.value,
+                    total_chunks,
+                    embedded_chunks,
+                    last_error,
+                    _now(),
+                    profile_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM embedding_profiles WHERE id = ?", (profile_id,)
+            ).fetchone()
+            if row is None:
+                raise ValidationError("埋め込みプロファイルが見つかりません。")
+            return self._embedding_profile_from_row(row)
+
+        return await self._write(operation)
+
+    async def complete_and_activate_embedding_profile(
+        self, profile_id: str, total_chunks: int
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            updated = connection.execute(
+                """
+                UPDATE embedding_profiles
+                SET state = 'ready', total_chunks = ?, embedded_chunks = ?,
+                    last_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (total_chunks, total_chunks, _now(), profile_id),
+            )
+            if updated.rowcount != 1:
+                raise ValidationError("埋め込みプロファイルが見つかりません。")
+            setting = connection.execute(
+                """
+                SELECT desired_profile_id FROM model_role_settings
+                WHERE role = 'embedding'
+                """
+            ).fetchone()
+            if setting is None or str(setting["desired_profile_id"]) != profile_id:
+                return
+            connection.execute(
+                """
+                UPDATE model_role_settings
+                SET active_profile_id = ?, updated_at = ?
+                WHERE role = 'embedding'
+                """,
+                (profile_id, _now()),
+            )
+
+        await self._write(operation)
+
+    async def list_chunks_needing_embeddings(
+        self, profile_id: str
+    ) -> list[DocumentChunk]:
+        def operation(connection: sqlite3.Connection) -> list[DocumentChunk]:
+            profile = connection.execute(
+                "SELECT vector_dimensions FROM embedding_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+            if profile is None:
+                raise ValidationError("埋め込みプロファイルが見つかりません。")
+            expected_bytes = int(profile["vector_dimensions"]) * 4
+            rows = connection.execute(
+                """
+                SELECT chunks.*, chunk_embeddings.content_hash,
+                       chunk_embeddings.vector_blob,
+                       length(chunk_embeddings.vector_blob) AS vector_bytes
+                FROM chunks
+                LEFT JOIN chunk_embeddings
+                  ON chunk_embeddings.chunk_id = chunks.id
+                 AND chunk_embeddings.profile_id = ?
+                ORDER BY chunks.document_id, chunks.ordinal
+                """,
+                (profile_id,),
+            ).fetchall()
+            result: list[DocumentChunk] = []
+            for row in rows:
+                content = str(row["content_text"])
+                content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                blob = (
+                    bytes(row["vector_blob"])
+                    if row["vector_blob"] is not None
+                    else b""
+                )
+                valid_vector = len(blob) == expected_bytes
+                if valid_vector:
+                    vector = struct.unpack(
+                        f"<{int(profile['vector_dimensions'])}f", blob
+                    )
+                    valid_vector = all(math.isfinite(value) for value in vector)
+                if (
+                    row["content_hash"] == content_hash
+                    and row["vector_bytes"] == expected_bytes
+                    and valid_vector
+                ):
+                    continue
+                result.append(
+                    DocumentChunk(
+                        id=str(row["id"]),
+                        document_id=str(row["document_id"]),
+                        ordinal=int(row["ordinal"]),
+                        content=content,
+                        start_offset=int(row["start_offset"]),
+                        end_offset=int(row["end_offset"]),
+                    )
+                )
+            return result
+
+        return await self._read(operation)
+
+    async def save_chunk_embeddings(
+        self,
+        profile_id: str,
+        embeddings: tuple[tuple[str, str, tuple[float, ...]], ...],
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            profile = connection.execute(
+                "SELECT vector_dimensions FROM embedding_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+            if profile is None:
+                raise ValidationError("埋め込みプロファイルが見つかりません。")
+            dimensions = int(profile["vector_dimensions"])
+            for chunk_id, content_hash, vector in embeddings:
+                if len(vector) != dimensions or not all(
+                    math.isfinite(value) for value in vector
+                ):
+                    raise ValidationError("埋め込みベクトルの次元または値が不正です。")
+                blob = struct.pack(f"<{dimensions}f", *vector)
+                connection.execute(
+                    """
+                    INSERT INTO chunk_embeddings(
+                        chunk_id, profile_id, content_hash, vector_blob, created_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(chunk_id, profile_id) DO UPDATE SET
+                        content_hash = excluded.content_hash,
+                        vector_blob = excluded.vector_blob,
+                        created_at = excluded.created_at
+                    """,
+                    (chunk_id, profile_id, content_hash, blob, _now()),
+                )
+
+        await self._write(operation)
+
+    async def count_profile_embeddings(self, profile_id: str) -> tuple[int, int]:
+        def operation(connection: sqlite3.Connection) -> tuple[int, int]:
+            total = int(connection.execute("SELECT count(*) FROM chunks").fetchone()[0])
+            embedded = int(
+                connection.execute(
+                    "SELECT count(*) FROM chunk_embeddings WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()[0]
+            )
+            return total, embedded
+
+        return await self._read(operation)
+
+    async def search_semantic_chunks(
+        self,
+        profile_id: str,
+        query_vector: tuple[float, ...],
+        min_similarity: float,
+        top_k: int,
+        document_ids: tuple[str, ...] | None = None,
+    ) -> list[RagSearchResult]:
+        def operation(connection: sqlite3.Connection) -> list[RagSearchResult]:
+            profile = connection.execute(
+                "SELECT vector_dimensions FROM embedding_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+            if profile is None:
+                return []
+            dimensions = int(profile["vector_dimensions"])
+            if len(query_vector) != dimensions:
+                return []
+            query_norm = math.sqrt(sum(value * value for value in query_vector))
+            if query_norm == 0:
+                return []
+            rows = connection.execute(
+                """
+                SELECT chunks.*, documents.title AS document_title,
+                       chunk_embeddings.vector_blob
+                FROM chunk_embeddings
+                JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
+                JOIN documents ON documents.id = chunks.document_id
+                WHERE chunk_embeddings.profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchall()
+            allowed_ids = set(document_ids) if document_ids is not None else None
+            results: list[RagSearchResult] = []
+            for row in rows:
+                if allowed_ids is not None and str(row["document_id"]) not in allowed_ids:
+                    continue
+                blob = bytes(row["vector_blob"])
+                if len(blob) != dimensions * 4:
+                    continue
+                vector = struct.unpack(f"<{dimensions}f", blob)
+                if not all(math.isfinite(value) for value in vector):
+                    continue
+                vector_norm = math.sqrt(sum(value * value for value in vector))
+                if vector_norm == 0:
+                    continue
+                score = sum(
+                    left * right for left, right in zip(query_vector, vector, strict=True)
+                ) / (query_norm * vector_norm)
+                if score < min_similarity:
+                    continue
+                results.append(
+                    RagSearchResult(
+                        content=str(row["content_text"]),
+                        citation=RagCitation(
+                            document_id=str(row["document_id"]),
+                            document_title=str(row["document_title"]),
+                            chunk_id=str(row["id"]),
+                            start_offset=int(row["start_offset"]),
+                            end_offset=int(row["end_offset"]),
+                        ),
+                        score=score,
+                    )
+                )
+            results.sort(
+                key=lambda result: (
+                    -result.score,
+                    result.citation.document_title,
+                    result.citation.start_offset,
+                )
+            )
+            return results[:top_k]
+
+        return await self._read(operation)
+
     async def list_documents(self) -> list[DocumentRecord]:
         def operation(connection: sqlite3.Connection) -> list[DocumentRecord]:
             rows = connection.execute(
@@ -4344,6 +4697,25 @@ class SQLiteAppRepository:
             content=str(row["content_text"]),
             content_hash=str(row["content_hash"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _embedding_profile_from_row(row: sqlite3.Row) -> EmbeddingProfile:
+        return EmbeddingProfile(
+            id=str(row["id"]),
+            connection_id=str(row["connection_id"]),
+            provider_name=str(row["provider_name"]),
+            endpoint_fingerprint=str(row["endpoint_fingerprint"]),
+            model_name=str(row["model_name"]),
+            model_digest=str(row["model_digest"]),
+            vector_dimensions=int(row["vector_dimensions"]),
+            min_similarity=float(row["min_similarity"]),
+            state=EmbeddingIndexState(str(row["state"])),
+            total_chunks=int(row["total_chunks"]),
+            embedded_chunks=int(row["embedded_chunks"]),
+            last_error=str(row["last_error"]) if row["last_error"] else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 
     @staticmethod

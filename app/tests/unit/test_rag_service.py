@@ -9,6 +9,7 @@ from local_llm_chat.domain.models import (
     DocumentRecord,
     MessageCitation,
     MessageRagUsage,
+    RagCitation,
     RagSearchResult,
 )
 
@@ -17,6 +18,7 @@ class FakeRagRepository:
     def __init__(self) -> None:
         self.saved_document: DocumentRecord | None = None
         self.saved_chunks: tuple[DocumentChunk, ...] = ()
+        self.search_results: list[RagSearchResult] = []
 
     async def save_document(
         self, document: DocumentRecord, chunks: tuple[DocumentChunk, ...]
@@ -31,7 +33,7 @@ class FakeRagRepository:
         top_k: int,
         document_ids: tuple[str, ...] | None = None,
     ) -> list[RagSearchResult]:
-        return []
+        return self.search_results[:top_k]
 
     async def list_documents(self) -> list[DocumentRecord]:
         return [self.saved_document] if self.saved_document is not None else []
@@ -58,6 +60,28 @@ class FakeRagRepository:
         self, message_ids: list[str]
     ) -> dict[str, MessageRagUsage]:
         return {}
+
+
+class FakeSemanticIndex:
+    def __init__(
+        self, results: list[RagSearchResult], *, fail: bool = False
+    ) -> None:
+        self.results = results
+        self.fail = fail
+        self.changed = False
+
+    async def documents_changed(self) -> None:
+        self.changed = True
+
+    async def search(
+        self,
+        query: str,
+        top_k: int,
+        document_ids: tuple[str, ...] | None = None,
+    ) -> list[RagSearchResult]:
+        if self.fail:
+            raise RuntimeError("embedding endpoint unavailable")
+        return self.results[:top_k]
 
 
 @pytest.mark.asyncio
@@ -117,3 +141,35 @@ async def test_rejects_empty_search_query() -> None:
 
     with pytest.raises(ValidationError, match="検索語"):
         await service.search("   ")
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_uses_rrf_and_semantic_failure_keeps_lexical() -> None:
+    repository = FakeRagRepository()
+    lexical = RagSearchResult(
+        "語句一致",
+        citation=_citation("lexical", "語句.md"),
+        score=3.0,
+    )
+    semantic = RagSearchResult(
+        "意味一致",
+        citation=_citation("semantic", "意味.md"),
+        score=0.9,
+    )
+
+    repository.search_results = [lexical]
+    service = RagService(repository, FakeSemanticIndex([semantic]))
+    results = await service.search("言い換え")
+
+    assert {result.citation.chunk_id for result in results} == {
+        "lexical",
+        "semantic",
+    }
+    assert all(result.score > 0 for result in results)
+
+    fallback = RagService(repository, FakeSemanticIndex([], fail=True))
+    assert await fallback.search("言い換え") == [lexical]
+
+
+def _citation(chunk_id: str, title: str) -> RagCitation:
+    return RagCitation("document", title, chunk_id, 0, 4)

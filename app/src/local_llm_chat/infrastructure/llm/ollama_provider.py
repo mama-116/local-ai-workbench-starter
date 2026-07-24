@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -83,18 +84,56 @@ class OllamaProvider:
         payload = await self._request_json(
             "POST", "/api/show", json_body={"model": model_name, "verbose": False}
         )
-        details = payload.get("details", {})
-        if not isinstance(details, dict):
-            details = {}
-        return ModelInfo(
-            name=tag.name,
-            size_bytes=tag.size_bytes,
-            format=str(details.get("format", tag.format) or ""),
-            family=str(details.get("family", tag.family) or ""),
-            parameter_size=str(details.get("parameter_size", tag.parameter_size) or ""),
-            quantization=str(details.get("quantization_level", tag.quantization) or ""),
-            license_text=str(payload.get("license", "") or ""),
+        return self._model_from_show(tag, payload)
+
+    async def list_embedding_models(self) -> list[ModelInfo]:
+        result: list[ModelInfo] = []
+        for model in await self.list_models():
+            payload = await self._request_json(
+                "POST",
+                "/api/show",
+                json_body={"model": model.name, "verbose": False},
+            )
+            inspected = self._model_from_show(model, payload)
+            if "embedding" in inspected.capabilities:
+                result.append(inspected)
+        return result
+
+    async def inspect_embedding_model(self, model_name: str) -> ModelInfo:
+        model = await self.inspect_model(model_name)
+        if "embedding" not in model.capabilities:
+            raise ModelUnavailable(
+                "選択したモデルは埋め込み生成に対応していません。"
+            )
+        return model
+
+    async def embed(
+        self, model_name: str, inputs: tuple[str, ...]
+    ) -> tuple[tuple[float, ...], ...]:
+        if not inputs:
+            return ()
+        payload = await self._request_json(
+            "POST",
+            "/api/embed",
+            json_body={"model": model_name, "input": list(inputs)},
         )
+        raw_embeddings = payload.get("embeddings")
+        if not isinstance(raw_embeddings, list) or len(raw_embeddings) != len(inputs):
+            raise OllamaUnavailable("Ollamaの埋め込み応答が不正です。")
+        embeddings: list[tuple[float, ...]] = []
+        dimensions: int | None = None
+        for raw_vector in raw_embeddings:
+            if not isinstance(raw_vector, list) or not raw_vector:
+                raise OllamaUnavailable("Ollamaの埋め込みベクトルが不正です。")
+            vector = tuple(float(value) for value in raw_vector)
+            if not all(math.isfinite(value) for value in vector):
+                raise OllamaUnavailable("Ollamaの埋め込みベクトルに不正な値があります。")
+            if dimensions is None:
+                dimensions = len(vector)
+            elif len(vector) != dimensions:
+                raise OllamaUnavailable("Ollamaの埋め込み次元が一致しません。")
+            embeddings.append(vector)
+        return tuple(embeddings)
 
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
         messages: list[dict[str, object]] = [
@@ -209,6 +248,35 @@ class OllamaProvider:
             family=str(details.get("family") or ""),
             parameter_size=str(details.get("parameter_size") or ""),
             quantization=str(details.get("quantization_level") or ""),
+            digest=str(item.get("digest") or ""),
+        )
+
+    @staticmethod
+    def _model_from_show(tag: ModelInfo, payload: dict[str, Any]) -> ModelInfo:
+        details = payload.get("details", {})
+        if not isinstance(details, dict):
+            details = {}
+        capabilities = payload.get("capabilities", [])
+        if not isinstance(capabilities, list):
+            capabilities = []
+        return ModelInfo(
+            name=tag.name,
+            size_bytes=tag.size_bytes,
+            format=str(details.get("format", tag.format) or ""),
+            family=str(details.get("family", tag.family) or ""),
+            parameter_size=str(
+                details.get("parameter_size", tag.parameter_size) or ""
+            ),
+            quantization=str(
+                details.get("quantization_level", tag.quantization) or ""
+            ),
+            license_text=str(payload.get("license", "") or ""),
+            digest=tag.digest,
+            capabilities=tuple(
+                str(capability)
+                for capability in capabilities
+                if isinstance(capability, str)
+            ),
         )
 
     @staticmethod
