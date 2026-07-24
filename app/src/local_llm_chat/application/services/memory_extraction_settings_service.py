@@ -39,11 +39,17 @@ class MemoryExtractionSettingsService:
         self._repository = repository
         self._providers = providers
         self._free_policy = free_policy
+        self._cached_setting: ModelRoleSetting | None = None
+
+    @property
+    def cached_configuration(self) -> ModelRoleSetting | None:
+        return self._cached_setting
 
     async def configuration(self) -> ModelRoleSetting | None:
-        return await self._repository.get_model_role_setting(
+        self._cached_setting = await self._repository.get_model_role_setting(
             ModelRole.MEMORY_EXTRACTION
         )
+        return self._cached_setting
 
     async def list_models(self, provider_name: str) -> list[ModelInfo]:
         provider = self._providers.get(provider_name)
@@ -80,7 +86,10 @@ class MemoryExtractionSettingsService:
             model_digest=model.digest,
             updated_at=datetime.now(UTC),
         )
-        return await self._repository.save_model_role_setting(setting)
+        self._cached_setting = await self._repository.save_model_role_setting(
+            setting
+        )
+        return self._cached_setting
 
     async def validated_configuration(self) -> ModelRoleSetting:
         setting = await self.configuration()

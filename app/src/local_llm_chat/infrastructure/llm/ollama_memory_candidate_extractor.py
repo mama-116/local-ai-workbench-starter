@@ -12,12 +12,14 @@ from local_llm_chat.domain.memory_candidates import (
     MemoryCandidateRequest,
 )
 from local_llm_chat.domain.models import ProviderMetadata
+from local_llm_chat.domain.models import ChatMessageInput, ChatRequest
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.states import (
     CostClass,
     Locality,
     MemoryEvidenceMode,
     MemoryKind,
+    MessageRole,
 )
 
 
@@ -70,6 +72,32 @@ Do not invent facts. Evidence offsets are Python Unicode character indexes into 
 Use explicit for direct current statements; inferred, hypothetical, quoted, or negated otherwise.
 Supported slots: favorite_food, liked_food, food_allergy, personal_goal, club_membership_intent.
 If no candidate exists, return {\"candidates\": []}."""
+
+
+def memory_extraction_chat_request(
+    request: MemoryCandidateRequest, model_name: str
+) -> ChatRequest:
+    return ChatRequest(
+        model=model_name,
+        system_prompt=_SYSTEM_PROMPT,
+        messages=(
+            ChatMessageInput(
+                MessageRole.USER,
+                json.dumps(
+                    {
+                        "content": request.content,
+                        "allowed_subject_ids": sorted(
+                            request.allowed_subject_ids
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            ),
+        ),
+        options={"temperature": 0},
+        response_format=_OUTPUT_SCHEMA,
+    )
 
 
 class OllamaMemoryCandidateExtractor:
@@ -150,15 +178,9 @@ class OllamaMemoryCandidateExtractor:
         return self._parse_response(payload, request.content)
 
     @staticmethod
-    def _parse_response(
-        payload: object, source_content: str
+    def parse_content(
+        content: str, source_content: str
     ) -> tuple[MemoryCandidateDraft, ...]:
-        if not isinstance(payload, dict):
-            raise ValidationError("memory extractor response must be an object")
-        message = payload.get("message")
-        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-            raise ValidationError("memory extractor response has no content")
-        content = message["content"]
         if len(content) > MAX_EXTRACTOR_RESPONSE_CHARACTERS:
             raise ValidationError("memory extractor response is too large")
         try:
@@ -176,6 +198,19 @@ class OllamaMemoryCandidateExtractor:
         return tuple(
             OllamaMemoryCandidateExtractor._parse_candidate(item, source_content)
             for item in raw_candidates
+        )
+
+    @staticmethod
+    def _parse_response(
+        payload: object, source_content: str
+    ) -> tuple[MemoryCandidateDraft, ...]:
+        if not isinstance(payload, dict):
+            raise ValidationError("memory extractor response must be an object")
+        message = payload.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValidationError("memory extractor response has no content")
+        return OllamaMemoryCandidateExtractor.parse_content(
+            message["content"], source_content
         )
 
     @staticmethod

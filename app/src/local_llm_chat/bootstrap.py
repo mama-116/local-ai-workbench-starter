@@ -20,6 +20,9 @@ from local_llm_chat.application.services.memory_candidate_service import (
     DEFAULT_MEMORY_TEMPLATES,
     MemoryCandidateService,
 )
+from local_llm_chat.application.services.memory_extraction_settings_service import (
+    MemoryExtractionSettingsService,
+)
 from local_llm_chat.application.services.memory_capture_service import (
     MemoryCaptureService,
     QueuedMemoryCaptureScheduler,
@@ -51,15 +54,14 @@ from local_llm_chat.application.services.turn_batch_generation_service import (
 from local_llm_chat.application.services.turn_batch_service import TurnBatchService
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.infrastructure.llm.ollama_registry import (
-    LOCAL_ENDPOINT,
     LOCAL_PROVIDER_NAME,
     OllamaProviderRegistry,
 )
 from local_llm_chat.infrastructure.computer_use.fake_action_broker import (
     FakeDesktopActionBroker,
 )
-from local_llm_chat.infrastructure.llm.ollama_memory_candidate_extractor import (
-    OllamaMemoryCandidateExtractor,
+from local_llm_chat.infrastructure.llm.configured_memory_candidate_extractor import (
+    ConfiguredMemoryCandidateExtractor,
 )
 from local_llm_chat.infrastructure.llm.ollama_turn_batch_generator import (
     OllamaTurnBatchGenerator,
@@ -115,7 +117,8 @@ class AppContainer:
     telemetry: TelemetryService
     memory_capture: QueuedMemoryCaptureScheduler
     memory_review: MemoryReviewService
-    memory_extractor: OllamaMemoryCandidateExtractor
+    memory_settings: MemoryExtractionSettingsService
+    memory_extractor: ConfiguredMemoryCandidateExtractor
     chat: ChatCoordinator
     tool_access: ToolAccessService
     scheduler: SchedulerService
@@ -153,9 +156,12 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     translations = TranslationService(
         repository, translation_provider, providers, policy
     )
-    memory_extractor = OllamaMemoryCandidateExtractor(
-        endpoint=LOCAL_ENDPOINT,
-        cloud_is_disabled=lambda: providers.cloud_is_disabled(LOCAL_PROVIDER_NAME),
+    memory_settings = MemoryExtractionSettingsService(
+        repository, providers, policy
+    )
+    await memory_settings.configuration()
+    memory_extractor = ConfiguredMemoryCandidateExtractor(
+        memory_settings, providers
     )
     memory_candidates = MemoryCandidateService(
         memory_extractor, policy, DEFAULT_MEMORY_TEMPLATES
@@ -210,6 +216,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         telemetry=telemetry,
         memory_capture=memory_capture,
         memory_review=MemoryReviewService(repository),
+        memory_settings=memory_settings,
         memory_extractor=memory_extractor,
         tool_access=tool_access,
         scheduler=scheduler,

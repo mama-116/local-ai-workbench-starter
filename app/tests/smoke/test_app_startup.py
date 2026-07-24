@@ -14,8 +14,8 @@ from local_llm_chat.application.services.conversation_group_configuration_servic
     ConversationGroupConfigurationService,
 )
 from local_llm_chat.bootstrap import bootstrap
-from local_llm_chat.infrastructure.llm.ollama_memory_candidate_extractor import (
-    OllamaMemoryCandidateExtractor,
+from local_llm_chat.infrastructure.llm.configured_memory_candidate_extractor import (
+    ConfiguredMemoryCandidateExtractor,
 )
 
 
@@ -30,7 +30,9 @@ async def test_bootstrap_creates_local_database_and_default_character(
         assert len(characters) == 1
         assert isinstance(container.memory_capture, QueuedMemoryCaptureScheduler)
         assert isinstance(container.memory_review, MemoryReviewService)
-        assert isinstance(container.memory_extractor, OllamaMemoryCandidateExtractor)
+        assert isinstance(
+            container.memory_extractor, ConfiguredMemoryCandidateExtractor
+        )
         assert isinstance(container.chat, ChatCoordinator)
         assert isinstance(container.timeline, ConversationTimelineService)
         assert isinstance(

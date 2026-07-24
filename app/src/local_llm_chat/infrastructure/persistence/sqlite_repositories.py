@@ -62,6 +62,7 @@ from local_llm_chat.domain.models import (
     MessageCitation,
     MessageRagUsage,
     ModelProfile,
+    ModelRoleSetting,
     RunRecord,
     RunSession,
     ScheduledJob,
@@ -88,6 +89,7 @@ from local_llm_chat.domain.states import (
     MemoryApprovalState,
     MemoryCardinality,
     MemoryKind,
+    ModelRole,
     MessageRole,
     MessageState,
     ContextSummaryState,
@@ -3300,6 +3302,78 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def get_model_role_setting(
+        self, role: ModelRole
+    ) -> ModelRoleSetting | None:
+        if role is not ModelRole.MEMORY_EXTRACTION:
+            raise ValidationError("直接取得できないモデル用途です。")
+
+        def operation(connection: sqlite3.Connection) -> ModelRoleSetting | None:
+            row = connection.execute(
+                """
+                SELECT role, connection_id, provider_name,
+                       endpoint_fingerprint, model_name, model_digest,
+                       updated_at
+                FROM model_role_settings
+                WHERE role = ?
+                """,
+                (role.value,),
+            ).fetchone()
+            return self._model_role_setting_from_row(row)
+
+        return await self._read(operation)
+
+    async def save_model_role_setting(
+        self, setting: ModelRoleSetting
+    ) -> ModelRoleSetting:
+        if setting.role is not ModelRole.MEMORY_EXTRACTION:
+            raise ValidationError("直接保存できないモデル用途です。")
+
+        def operation(connection: sqlite3.Connection) -> ModelRoleSetting:
+            connection.execute(
+                """
+                INSERT INTO model_role_settings(
+                    role, desired_profile_id, active_profile_id,
+                    connection_id, provider_name, endpoint_fingerprint,
+                    model_name, model_digest, updated_at
+                ) VALUES(?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(role) DO UPDATE SET
+                    desired_profile_id = NULL,
+                    active_profile_id = NULL,
+                    connection_id = excluded.connection_id,
+                    provider_name = excluded.provider_name,
+                    endpoint_fingerprint = excluded.endpoint_fingerprint,
+                    model_name = excluded.model_name,
+                    model_digest = excluded.model_digest,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    setting.role.value,
+                    setting.connection_id,
+                    setting.provider_name,
+                    setting.endpoint_fingerprint,
+                    setting.model_name,
+                    setting.model_digest,
+                    _utc_iso(setting.updated_at),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT role, connection_id, provider_name,
+                       endpoint_fingerprint, model_name, model_digest,
+                       updated_at
+                FROM model_role_settings
+                WHERE role = ?
+                """,
+                (setting.role.value,),
+            ).fetchone()
+            loaded = self._model_role_setting_from_row(row)
+            if loaded is None:
+                raise PersistenceError("記憶抽出設定を保存できませんでした。")
+            return loaded
+
+        return await self._write(operation)
+
     async def update_embedding_profile(
         self,
         profile_id: str,
@@ -4715,6 +4789,22 @@ class SQLiteAppRepository:
             embedded_chunks=int(row["embedded_chunks"]),
             last_error=str(row["last_error"]) if row["last_error"] else None,
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _model_role_setting_from_row(
+        row: sqlite3.Row | None,
+    ) -> ModelRoleSetting | None:
+        if row is None:
+            return None
+        return ModelRoleSetting(
+            role=ModelRole(str(row["role"])),
+            connection_id=str(row["connection_id"]),
+            provider_name=str(row["provider_name"]),
+            endpoint_fingerprint=str(row["endpoint_fingerprint"]),
+            model_name=str(row["model_name"]),
+            model_digest=str(row["model_digest"]),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 

@@ -132,7 +132,6 @@ class MemoryCandidateService:
             return MemoryCandidateGeneration(())
         self._free_policy.require_cloud_disabled(self._extractor.cloud_is_disabled)
         self._free_policy.require_provider(self._extractor.metadata)
-        self._free_policy.require_loopback_endpoint(self._extractor.metadata.endpoint)
         try:
             drafts = await self._extractor.extract(request)
         except OllamaUnavailable:

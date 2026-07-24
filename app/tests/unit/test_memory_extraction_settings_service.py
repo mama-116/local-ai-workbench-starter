@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+import json
 
 import pytest
 
@@ -11,6 +12,7 @@ from local_llm_chat.application.services.memory_extraction_settings_service impo
 from local_llm_chat.domain.errors import (
     FreeOperationBlocked,
     ModelUnavailable,
+    OllamaUnavailable,
     ValidationError,
 )
 from local_llm_chat.domain.models import (
@@ -21,8 +23,12 @@ from local_llm_chat.domain.models import (
     ProviderConnection,
     ProviderMetadata,
 )
+from local_llm_chat.domain.memory_candidates import MemoryCandidateRequest
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.states import CostClass, Locality, ModelRole
+from local_llm_chat.infrastructure.llm.configured_memory_candidate_extractor import (
+    ConfiguredMemoryCandidateExtractor,
+)
 
 
 def model(
@@ -53,6 +59,13 @@ class FakeProvider:
     missing_on_inspect: set[str] = field(default_factory=set)
     list_calls: int = 0
     inspect_calls: list[str] = field(default_factory=list)
+    chat_requests: list[ChatRequest] = field(default_factory=list)
+    response_content: str = field(
+        default_factory=lambda: json.dumps(
+            {"candidates": []}, ensure_ascii=False
+        )
+    )
+    response_completed: bool = True
 
     @property
     def metadata(self) -> ProviderMetadata:
@@ -85,9 +98,11 @@ class FakeProvider:
     async def stream_chat(
         self, request: ChatRequest
     ) -> AsyncIterator[ChatChunk]:
-        if request.model:
-            raise AssertionError("not used")
-        yield ChatChunk()
+        self.chat_requests.append(request)
+        yield ChatChunk(
+            self.response_content,
+            done=self.response_completed,
+        )
 
 
 @dataclass
@@ -326,3 +341,68 @@ async def test_missing_setting_or_registered_connection_is_rejected() -> None:
     ]
     with pytest.raises(ValidationError, match="登録されていない"):
         await configured.validated_configuration()
+
+
+@pytest.mark.asyncio
+async def test_configured_extractor_uses_selected_dgx_model_not_chat_model() -> None:
+    repository = FakeRepository()
+    providers = registry()
+    settings = MemoryExtractionSettingsService(
+        repository, providers, FreeOperationPolicy()
+    )
+    await settings.configure("ollama-dgx", "gemma:31b")
+    extractor = ConfiguredMemoryCandidateExtractor(settings, providers)
+    request = MemoryCandidateRequest(
+        conversation_id="conversation-1",
+        branch_id="branch-1",
+        source_message_id="message-1",
+        model_name="conversation-model-on-another-provider",
+        content="アイスが好き",
+        author_subject_id="user",
+        allowed_subject_ids=frozenset({"user"}),
+        allowed_knowledge_character_ids=frozenset({"character-1"}),
+    )
+
+    assert await extractor.extract(request) == ()
+
+    dgx = providers.providers["ollama-dgx"]
+    assert len(dgx.chat_requests) == 1
+    assert dgx.chat_requests[0].model == "gemma:31b"
+    assert dgx.chat_requests[0].response_format is not None
+    assert providers.providers["ollama-local"].chat_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_content", "response_completed"),
+    (
+        ('{"candidates": []}', False),
+        ("not-json", True),
+    ),
+)
+async def test_configured_extractor_rejects_incomplete_or_invalid_output(
+    response_content: str, response_completed: bool
+) -> None:
+    repository = FakeRepository()
+    providers = registry()
+    settings = MemoryExtractionSettingsService(
+        repository, providers, FreeOperationPolicy()
+    )
+    await settings.configure("ollama-dgx", "gemma:31b")
+    dgx = providers.providers["ollama-dgx"]
+    dgx.response_content = response_content
+    dgx.response_completed = response_completed
+    extractor = ConfiguredMemoryCandidateExtractor(settings, providers)
+    request = MemoryCandidateRequest(
+        "conversation-1",
+        "branch-1",
+        "message-1",
+        "chat-model",
+        "アイスが好き",
+        "user",
+        frozenset({"user"}),
+        frozenset({"character-1"}),
+    )
+
+    with pytest.raises(OllamaUnavailable, match="記憶抽出"):
+        await extractor.extract(request)

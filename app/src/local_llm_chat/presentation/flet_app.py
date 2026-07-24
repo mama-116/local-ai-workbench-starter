@@ -2280,6 +2280,7 @@ class LocalChatApp:
 
     async def show_model_role_dialog(self) -> None:
         configuration = await self.container.embeddings.configuration()
+        memory_setting = await self.container.memory_settings.configuration()
         desired = configuration.desired
         connection = self._dropdown("埋め込み接続先")
         connection.options = [
@@ -2308,6 +2309,35 @@ class LocalChatApp:
             "保存して索引を構築",
             bgcolor=ACCENT,
             color="#17120D",
+        )
+        memory_connection = self._dropdown("記憶抽出の接続先")
+        memory_connection.options = [
+            ft.DropdownOption(item.provider_name, item.display_name)
+            for item in self.connections
+        ]
+        memory_connection.value = (
+            memory_setting.provider_name
+            if memory_setting is not None
+            and any(
+                item.provider_name == memory_setting.provider_name
+                for item in self.connections
+            )
+            else None
+        )
+        memory_model = self._dropdown("記憶抽出モデル")
+        memory_status = ft.Text(
+            (
+                f"利用可能: {memory_setting.model_name}"
+                if memory_setting is not None
+                else "未設定です。安全な簡易抽出を使用します。"
+            ),
+            size=11,
+            color=MINT if memory_setting is not None else MUTED,
+        )
+        memory_save_button = ft.Button(
+            "記憶抽出設定を保存",
+            bgcolor="#34322C",
+            color=ACCENT,
         )
 
         async def load_models() -> None:
@@ -2374,8 +2404,83 @@ class LocalChatApp:
             self.page.update()
             self._toast("埋め込み設定を保存し、索引構築を開始しました。", MINT)
 
+        async def load_memory_models() -> None:
+            provider_name = memory_connection.value
+            memory_model.options = []
+            memory_model.value = None
+            if not provider_name:
+                memory_status.value = "記憶抽出の接続先を選択してください。"
+                memory_status.color = MUTED
+                self.page.update()
+                return
+            memory_status.value = "接続確認中..."
+            memory_status.color = ACCENT
+            memory_save_button.disabled = True
+            self.page.update()
+            try:
+                models = await self.container.memory_settings.list_models(
+                    provider_name
+                )
+            except AppError as error:
+                memory_status.value = str(error)
+                memory_status.color = ERROR
+                self.page.update()
+                return
+            finally:
+                memory_save_button.disabled = False
+            memory_model.options = [
+                ft.DropdownOption(item.name, item.name) for item in models
+            ]
+            if (
+                memory_setting is not None
+                and memory_setting.provider_name == provider_name
+                and any(
+                    item.name == memory_setting.model_name for item in models
+                )
+            ):
+                memory_model.value = memory_setting.model_name
+            memory_status.value = (
+                f"文章生成対応モデル {len(models)}件"
+                if models
+                else "この接続先に記憶抽出対応モデルがありません。"
+            )
+            memory_status.color = MINT if models else ERROR
+            self.page.update()
+
+        async def save_memory_setting() -> None:
+            nonlocal memory_setting
+            if not memory_connection.value or not memory_model.value:
+                memory_status.value = (
+                    "接続先と記憶抽出モデルを選択してください。"
+                )
+                memory_status.color = ERROR
+                self.page.update()
+                return
+            memory_save_button.disabled = True
+            memory_status.value = "接続・モデルを確認中..."
+            memory_status.color = ACCENT
+            self.page.update()
+            try:
+                saved = await self.container.memory_settings.configure(
+                    memory_connection.value, memory_model.value
+                )
+            except AppError as error:
+                memory_status.value = str(error)
+                memory_status.color = ERROR
+                memory_save_button.disabled = False
+                self.page.update()
+                return
+            memory_setting = saved
+            memory_status.value = f"利用可能: {saved.model_name}"
+            memory_status.color = MINT
+            memory_save_button.disabled = False
+            self.page.update()
+            self._toast("記憶抽出モデルを保存しました。", MINT)
+
         connection.on_select = load_models
+        memory_connection.on_select = load_memory_models
         save_button.on_click = save
+        memory_save_button.on_click = save_memory_setting
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
@@ -2416,8 +2521,28 @@ class LocalChatApp:
                                 spacing=8,
                             ),
                         ),
+                        ft.Container(
+                            padding=10,
+                            border=ft.Border.all(1, "#3A3934"),
+                            border_radius=10,
+                            content=ft.Column(
+                                [
+                                    ft.Text(
+                                        "記憶抽出",
+                                        weight=ft.FontWeight.W_600,
+                                        color=MINT,
+                                    ),
+                                    memory_connection,
+                                    memory_model,
+                                    memory_status,
+                                    memory_save_button,
+                                ],
+                                spacing=8,
+                            ),
+                        ),
                         ft.Text(
                             "DGXを選ぶと、選択したRAG資料と検索文を確認済みLAN端末へ送ります。"
+                            "記憶抽出では保存対象となるユーザー発言を送ります。"
                             "モデル変更後は新索引を構築し、完成まで旧索引または語句検索を使います。",
                             size=10,
                             color=MUTED,
@@ -2425,6 +2550,7 @@ class LocalChatApp:
                     ],
                     tight=True,
                     width=520,
+                    scroll=ft.ScrollMode.AUTO,
                 ),
                 actions=[
                     ft.Button("閉じる", on_click=self._close_dialog),
@@ -2434,6 +2560,8 @@ class LocalChatApp:
         )
         if connection.value:
             await load_models()
+        if memory_connection.value:
+            await load_memory_models()
 
     def show_new_character_dialog(self) -> None:
         self.show_character_dialog(create_new=True)

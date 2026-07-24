@@ -362,7 +362,7 @@ async def test_rejects_remote_extractor_before_sending_private_message() -> None
 
 
 @pytest.mark.asyncio
-async def test_rejects_lan_extractor_before_sending_private_message() -> None:
+async def test_allows_confirmed_private_lan_extractor() -> None:
     extractor = FakeExtractor(
         (),
         ProviderMetadata(
@@ -371,6 +371,27 @@ async def test_rejects_lan_extractor_before_sending_private_message() -> None:
             CostClass.NO_CHARGE,
             "http://192.168.1.17:11434",
         ),
+    )
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    await service.generate(request("好きな料理はカレー。"))
+
+    assert extractor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rejects_unconfirmed_private_lan_extractor_before_send() -> None:
+    extractor = FakeExtractor(
+        (),
+        ProviderMetadata(
+            "memory-lan",
+            Locality.LOCAL,
+            CostClass.NO_CHARGE,
+            "http://192.168.1.17:11434",
+        ),
+        disabled=False,
     )
     service = MemoryCandidateService(
         extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
