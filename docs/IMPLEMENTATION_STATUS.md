@@ -60,7 +60,7 @@
 ## 検証済み
 
 - [S-01〜S-09受入記録](acceptance/S01-S09-2026-07-17.md)（独立展開したPhase 0診断と各基準の試験手順・実績）
-- `pytest`: 446件成功（Windows固有条件により1件skip）
+- `pytest`: 447件成功（Windows固有条件により1件skip）
 - `mypy --strict`: 152ファイル、エラー0件
 - 実DGX Sparkの `nomic-embed-text-v2-moe:latest`（768次元、校正閾値0.379767）と `qwen3-embedding:latest`（4096次元、校正閾値0.407890）が、30件の日本語言い換えと20件の無関係質問による品質基準を通過
 - 実DGX Sparkの `nomic-embed-text-v2-moe:latest` で、一時DBへの用途設定保存、索引構築、原文と異なる「日本で一番高い峰」の検索、`public-test.md` のoffset `0-18`取得までを合成資料だけで確認

@@ -1,4 +1,4 @@
-CREATE TABLE embedding_profiles (
+CREATE TABLE IF NOT EXISTS embedding_profiles (
     id TEXT PRIMARY KEY,
     connection_id TEXT NOT NULL,
     provider_name TEXT NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE embedding_profiles (
     )
 );
 
-CREATE TABLE chunk_embeddings (
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
     chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
     content_hash TEXT NOT NULL,
@@ -30,12 +30,12 @@ CREATE TABLE chunk_embeddings (
     PRIMARY KEY(chunk_id, profile_id)
 );
 
-CREATE TABLE model_role_settings (
+CREATE TABLE IF NOT EXISTS model_role_settings (
     role TEXT PRIMARY KEY CHECK (role = 'embedding'),
     desired_profile_id TEXT REFERENCES embedding_profiles(id),
     active_profile_id TEXT REFERENCES embedding_profiles(id),
     updated_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_chunk_embeddings_profile
+CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_profile
 ON chunk_embeddings(profile_id, chunk_id);

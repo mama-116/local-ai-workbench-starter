@@ -73,7 +73,7 @@ async def test_migration_preserves_existing_active_embedding_profile(
     )
     for migration in sorted(migrations.glob("*.sql")):
         version = int(migration.stem.split("_", maxsplit=1)[0])
-        if version >= 18:
+        if version >= 19:
             continue
         connection.executescript(migration.read_text(encoding="utf-8"))
         connection.execute(
@@ -115,3 +115,48 @@ async def test_migration_preserves_existing_active_embedding_profile(
     assert configuration.desired.id == "profile-1"
     assert configuration.active is not None
     assert configuration.active.id == "profile-1"
+
+
+@pytest.mark.asyncio
+async def test_migration_recovers_when_version_17_is_already_occupied(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    migrations = (
+        Path(__file__).parents[2]
+        / "src"
+        / "local_llm_chat"
+        / "infrastructure"
+        / "persistence"
+        / "migrations"
+    )
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE schema_migrations "
+        "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for migration in sorted(migrations.glob("*.sql")):
+        version = int(migration.stem.split("_", maxsplit=1)[0])
+        if version >= 18:
+            continue
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+            (version, datetime.now(UTC).isoformat()),
+        )
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?)",
+        (datetime.now(UTC).isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    repository = SQLiteAppRepository(database_path)
+    await repository.initialize()
+    configuration = await repository.get_embedding_configuration()
+
+    assert configuration.desired is None
+    assert configuration.active is None
+    assert await repository.get_model_role_setting(
+        ModelRole.MEMORY_EXTRACTION
+    ) is None
