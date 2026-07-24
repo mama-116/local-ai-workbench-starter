@@ -1,0 +1,175 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "supercup_progressive_refinement",
+      "messages": [
+        "先輩、私実はアイスが好きなんだ！チョコ味！",
+        "先輩はどのアイスメーカーのやつが好き？意外と店舗派？",
+        "私はスーパーカップのチョコチップ味！",
+        "ちょっと溶けかけが好き！"
+      ],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "auto_save",
+          "item": "アイス",
+          "condition": "",
+          "evidence_messages": [0]
+        },
+        {
+          "after_message": 1,
+          "decision": "no_change",
+          "item": "アイス",
+          "condition": "",
+          "evidence_messages": [0]
+        },
+        {
+          "after_message": 2,
+          "decision": "auto_refine",
+          "item": "スーパーカップのチョコチップ味",
+          "condition": "",
+          "evidence_messages": [0, 2]
+        },
+        {
+          "after_message": 3,
+          "decision": "auto_refine",
+          "item": "スーパーカップのチョコチップ味",
+          "condition": "溶けかけ",
+          "evidence_messages": [0, 2, 3]
+        }
+      ]
+    },
+    {
+      "id": "condition_without_antecedent",
+      "messages": ["ちょっと溶けかけが好き！"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "no_save",
+          "item": "",
+          "condition": "",
+          "evidence_messages": []
+        }
+      ]
+    },
+    {
+      "id": "explicit_low_risk_preference",
+      "messages": ["チョコアイスが好き"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "auto_save",
+          "item": "チョコアイス",
+          "condition": "",
+          "evidence_messages": [0]
+        }
+      ]
+    },
+    {
+      "id": "health_constraint_requires_confirmation",
+      "messages": ["苺アレルギーです"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "require_confirmation",
+          "item": "苺",
+          "condition": "",
+          "evidence_messages": [0]
+        }
+      ]
+    },
+    {
+      "id": "past_only_preference",
+      "messages": ["前はバニラ味が好きだった"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "no_save",
+          "item": "",
+          "condition": "",
+          "evidence_messages": []
+        }
+      ]
+    },
+    {
+      "id": "negated_preference",
+      "messages": ["バニラ味は好きではない"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "no_save",
+          "item": "",
+          "condition": "",
+          "evidence_messages": []
+        }
+      ]
+    },
+    {
+      "id": "quoted_preference",
+      "messages": ["妹が『チョコ味が好き』と言っていた"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "no_save",
+          "item": "",
+          "condition": "",
+          "evidence_messages": []
+        }
+      ]
+    },
+    {
+      "id": "third_party_preference",
+      "messages": ["妹はチョコ味が好き"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "require_confirmation",
+          "item": "チョコ味",
+          "condition": "",
+          "evidence_messages": [0]
+        }
+      ]
+    },
+    {
+      "id": "latest_explicit_correction",
+      "messages": ["チョコアイスが好き", "でも今はバニラアイスが一番好き"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "auto_save",
+          "item": "チョコアイス",
+          "condition": "",
+          "evidence_messages": [0]
+        },
+        {
+          "after_message": 1,
+          "decision": "auto_refine",
+          "item": "バニラアイス",
+          "condition": "",
+          "evidence_messages": [1]
+        }
+      ]
+    },
+    {
+      "id": "ambiguous_cross_turn_target",
+      "messages": ["チョコ味とバニラ味を買った", "少し溶けた方が好き"],
+      "expected_checkpoints": [
+        {
+          "after_message": 0,
+          "decision": "no_save",
+          "item": "",
+          "condition": "",
+          "evidence_messages": []
+        },
+        {
+          "after_message": 1,
+          "decision": "require_confirmation",
+          "item": "",
+          "condition": "少し溶けた",
+          "evidence_messages": [0, 1]
+        }
+      ]
+    }
+  ]
+}

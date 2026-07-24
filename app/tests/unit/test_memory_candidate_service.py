@@ -117,6 +117,70 @@ async def test_unavailable_local_extractor_still_fails_for_unregistered_form() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    (
+        "ちょっと溶けかけが好き！",
+        "少し溶けたのが好き",
+        "焼きたてが好き",
+        "熱々が好き",
+        "冷たいのが好き",
+    ),
+)
+async def test_condition_without_food_target_is_never_auto_saved_as_food(
+    content: str,
+) -> None:
+    extractor = FakeExtractor((), error=OllamaUnavailable("unavailable"))
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    with pytest.raises(OllamaUnavailable):
+        await service.generate(request(content))
+
+
+@pytest.mark.asyncio
+async def test_model_condition_without_food_target_is_blocked() -> None:
+    content = "ちょっと溶けかけが好き！"
+    evidence = "ちょっと溶けかけが好き"
+    extractor = FakeExtractor(
+        (
+            MemoryCandidateDraft(
+                "user",
+                MemoryKind.PREFERENCE,
+                "liked_food",
+                "ちょっと溶けかけ",
+                MemoryEvidenceMode.EXPLICIT,
+                *span(content, evidence),
+            ),
+        )
+    )
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    candidate = (await service.generate(request(content)))[0]
+
+    assert candidate.disposition is MemoryCandidateDisposition.BLOCK
+    assert candidate.reason is MemoryCandidateReason.INVALID_VALUE
+
+
+@pytest.mark.asyncio
+async def test_condition_with_explicit_food_target_remains_supported() -> None:
+    extractor = FakeExtractor(())
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    candidate = (
+        await service.generate(request("溶けかけのアイスが好き"))
+    )[0]
+
+    assert candidate.value == "溶けかけのアイス"
+    assert candidate.disposition is MemoryCandidateDisposition.AUTO_SAVE
+
+
+@pytest.mark.asyncio
 async def test_unavailable_extractor_fallback_keeps_eight_candidate_limit() -> None:
     extractor = FakeExtractor((), error=OllamaUnavailable("unavailable"))
     service = MemoryCandidateService(

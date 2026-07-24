@@ -28,6 +28,18 @@ from local_llm_chat.domain.states import (
 MAX_MEMORY_VALUE_CHARACTERS = 200
 MAX_MEMORY_SOURCE_CHARACTERS = 4_000
 _MEMORY_CLAUSE_PATTERN = re.compile(r"[^。！？!?\r\n]+")
+_FOOD_CONDITION_ONLY_PATTERN = re.compile(
+    r"(?:ちょっと|少し|やや|かなり|完全に)?\s*"
+    r"(?:"
+    r"溶け(?:かけ|た|ている)"
+    r"|冷え(?:かけ|た|ている)"
+    r"|温め(?:た|ている)"
+    r"|焼き(?:たて|かけ)"
+    r"|凍(?:った|らせた)"
+    r"|熱々|あつあつ|ひえひえ|冷たい|温かい|ぬるい|常温"
+    r")"
+    r"(?:状態|もの|方|の)?"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +235,11 @@ class MemoryCandidateService:
             if match is None:
                 continue
             value = match.group("value").strip()
-            if value and MemoryCandidateService._is_conservative_fallback_value(value):
+            if (
+                value
+                and MemoryCandidateService._is_conservative_fallback_value(value)
+                and MemoryCandidateService._is_semantically_valid_value(template, value)
+            ):
                 return value
         return None
 
@@ -246,6 +262,18 @@ class MemoryCandidateService:
             marker in value for marker in ambiguous_subject_markers + quote_markers
         )
 
+    @staticmethod
+    def _is_semantically_valid_value(
+        template: MemoryTemplate, value: str
+    ) -> bool:
+        if (
+            template.kind is MemoryKind.PREFERENCE
+            and template.slot in {"favorite_food", "liked_food"}
+            and _FOOD_CONDITION_ONLY_PATTERN.fullmatch(value)
+        ):
+            return False
+        return True
+
     def _classify(
         self, request: MemoryCandidateRequest, draft: MemoryCandidateDraft
     ) -> MemoryCandidate:
@@ -267,6 +295,18 @@ class MemoryCandidateService:
                 MemoryCandidateReason.NON_EXPLICIT_EVIDENCE,
             )
         if not value or len(value) > MAX_MEMORY_VALUE_CHARACTERS:
+            return self._blocked(
+                request,
+                draft,
+                value,
+                evidence_text,
+                template,
+                MemoryCandidateReason.INVALID_VALUE,
+            )
+        if (
+            template is not None
+            and not self._is_semantically_valid_value(template, value)
+        ):
             return self._blocked(
                 request,
                 draft,
