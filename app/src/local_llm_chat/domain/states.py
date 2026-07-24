@@ -52,6 +52,11 @@ class EmbeddingIndexState(StrEnum):
     FAILED = "failed"
 
 
+class ModelRole(StrEnum):
+    EMBEDDING = "embedding"
+    MEMORY_EXTRACTION = "memory_extraction"
+
+
 class JobRunState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"

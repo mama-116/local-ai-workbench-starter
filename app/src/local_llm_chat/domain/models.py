@@ -27,6 +27,7 @@ from local_llm_chat.domain.states import (
     ComputerUseRunState,
     DesktopIntegrityLevel,
     EmbeddingIndexState,
+    ModelRole,
 )
 
 
@@ -87,6 +88,17 @@ class EmbeddingProfile:
 class EmbeddingConfiguration:
     desired: EmbeddingProfile | None
     active: EmbeddingProfile | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRoleSetting:
+    role: ModelRole
+    connection_id: str
+    provider_name: str
+    endpoint_fingerprint: str
+    model_name: str
+    model_digest: str
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
