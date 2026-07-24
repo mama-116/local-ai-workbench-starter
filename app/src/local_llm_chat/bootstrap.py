@@ -24,6 +24,9 @@ from local_llm_chat.application.services.memory_capture_service import (
 from local_llm_chat.application.services.memory_review_service import (
     MemoryReviewService,
 )
+from local_llm_chat.application.services.explicit_memory_service import (
+    ExplicitMemoryService,
+)
 from local_llm_chat.application.services.builtin_tool_provider import (
     BuiltInToolProvider,
     ToolAccessService,
@@ -111,6 +114,7 @@ class AppContainer:
     telemetry: TelemetryService
     memory_capture: QueuedMemoryCaptureScheduler
     memory_review: MemoryReviewService
+    explicit_memory: ExplicitMemoryService
     memory_extractor: OllamaMemoryCandidateExtractor
     chat: ChatCoordinator
     tool_access: ToolAccessService
@@ -202,6 +206,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         telemetry=telemetry,
         memory_capture=memory_capture,
         memory_review=MemoryReviewService(repository),
+        explicit_memory=ExplicitMemoryService(repository),
         memory_extractor=memory_extractor,
         tool_access=tool_access,
         scheduler=scheduler,

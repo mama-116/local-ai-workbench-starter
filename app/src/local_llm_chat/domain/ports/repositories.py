@@ -17,6 +17,11 @@ from local_llm_chat.domain.group_turns import (
     TurnBatch,
     TurnBatchDraft,
 )
+from local_llm_chat.domain.explicit_memory import (
+    ExplicitMemoryDecision,
+    ExplicitMemoryEvent,
+    ExplicitMemoryReviewItem,
+)
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
@@ -250,6 +255,34 @@ class AppRepository(Protocol):
     async def list_canonical_memory_review_items(
         self, conversation_id: str, branch_id: str
     ) -> tuple[CanonicalMemoryReviewItem, ...]: ...
+
+    async def remember_explicit_memory(
+        self,
+        request_id: str,
+        conversation_id: str,
+        branch_id: str,
+        source_message_id: str,
+        expected_character_id: str,
+        value: str,
+        recorded_at: datetime,
+    ) -> ExplicitMemoryEvent: ...
+
+    async def undo_explicit_memory(
+        self,
+        decision_id: str,
+        conversation_id: str,
+        branch_id: str,
+        target_event_id: str,
+        expected_character_id: str,
+        recorded_at: datetime,
+    ) -> ExplicitMemoryDecision: ...
+
+    async def project_explicit_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        character_id: str,
+    ) -> tuple[ExplicitMemoryReviewItem, ...]: ...
 
     async def start_send(self, conversation_id: str, content: str) -> RunSession: ...
 

@@ -157,3 +157,53 @@ async def test_review_never_mixes_sibling_branch_memory(tmp_path: Path) -> None:
 
     assert [item.event_id for item in root_items.undoable] == ["root-only"]
     assert [item.event_id for item in child_items.undoable] == ["child-only"]
+
+
+@pytest.mark.asyncio
+async def test_review_deduplicates_explicit_and_automatic_memory(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    await repository.initialize()
+    character = await repository.ensure_default_character()
+    profile = await repository.ensure_model_profile("ollama-local", "model", {})
+    conversation = await repository.create_conversation(
+        "deduplicate", character.id, profile.id
+    )
+    session = await repository.start_send(conversation.id, "猫の名前はミケ")
+    await repository.append_canonical_memory_events(
+        (
+            CanonicalMemoryEvent(
+                id="automatic",
+                conversation_id=conversation.id,
+                branch_id=session.branch_id,
+                subject_id="user",
+                kind=MemoryKind.PREFERENCE,
+                slot="pet_name",
+                value="猫の名前はミケ",
+                cardinality=MemoryCardinality.MULTIPLE,
+                approval=MemoryApprovalState.AUTO_SAVED,
+                source_message_id=session.user_message.id,
+                known_by_character_ids=frozenset({character.character_id}),
+                supersedes_event_id=None,
+                effective_at=session.user_message.created_at,
+                recorded_at=session.user_message.created_at,
+            ),
+        )
+    )
+    explicit = await repository.remember_explicit_memory(
+        "dialog-1",
+        conversation.id,
+        session.branch_id,
+        session.user_message.id,
+        character.character_id,
+        "猫の名前はミケ",
+        session.user_message.created_at,
+    )
+
+    snapshot = await MemoryReviewService(repository).list_items(
+        conversation.id, session.branch_id
+    )
+
+    assert snapshot.undoable == ()
+    assert [item.event_id for item in snapshot.explicit_undoable] == [explicit.id]

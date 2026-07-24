@@ -26,8 +26,13 @@ from local_llm_chat.application.services.memory_decision_service import (
 from local_llm_chat.application.services.memory_review_service import (
     MemoryReviewSnapshot,
 )
+from local_llm_chat.application.services.explicit_memory_service import (
+    RememberExplicitMemoryRequest,
+    UndoExplicitMemoryRequest,
+)
 from local_llm_chat.bootstrap import AppContainer
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryReviewItem
+from local_llm_chat.domain.explicit_memory import ExplicitMemoryReviewItem
 from local_llm_chat.domain.errors import AppError
 from local_llm_chat.domain.group_turns import ConversationGroupConfiguration
 from local_llm_chat.domain.models import (
@@ -104,6 +109,7 @@ class LocalChatApp:
         self.group_configuration: ConversationGroupConfiguration | None = None
         self.memory_review = MemoryReviewSnapshot((), ())
         self._new_memory_event_ids: list[str] = []
+        self._new_explicit_memory_event_ids: list[str] = []
         self._memory_notice_conversation_id: str | None = None
         self._memory_notice_branch_id: str | None = None
         self._memory_capture_source_message_id: str | None = None
@@ -881,6 +887,7 @@ class LocalChatApp:
             self.group_configuration = None
             self.memory_review = MemoryReviewSnapshot((), ())
             self._new_memory_event_ids.clear()
+            self._new_explicit_memory_event_ids.clear()
             self._memory_notice_conversation_id = None
             self._memory_notice_branch_id = None
             self._render_memory_review()
@@ -950,6 +957,7 @@ class LocalChatApp:
             or self._memory_notice_branch_id != conversation.active_branch_id
         ):
             self._new_memory_event_ids.clear()
+            self._new_explicit_memory_event_ids.clear()
             self._memory_capture_source_message_id = None
             self.memory_capture_status.value = "記憶確認: 未実行"
             self.memory_capture_status.color = MUTED
@@ -976,6 +984,14 @@ class LocalChatApp:
             event_id
             for event_id in self._new_memory_event_ids
             if event_id in undoable_ids
+        ]
+        explicit_ids = {
+            item.event_id for item in self.memory_review.explicit_undoable
+        }
+        self._new_explicit_memory_event_ids = [
+            event_id
+            for event_id in self._new_explicit_memory_event_ids
+            if event_id in explicit_ids
         ]
         self._render_memory_review()
 
@@ -1131,7 +1147,41 @@ class LocalChatApp:
                 )
             )
         self.memory_saved_count.value = f"保存済み {len(saved_items)}件"
-        self.memory_saved_toggle.disabled = not saved_items
+        explicit_items = self.memory_review.explicit_undoable
+        for explicit_item in explicit_items if self._memory_saved_expanded else ():
+            async def undo_explicit(
+                event_id: str = explicit_item.event_id,
+            ) -> None:
+                await self._undo_explicit_memory(event_id)
+
+            saved_controls.append(
+                ft.Container(
+                    bgcolor="#2A2925",
+                    border_radius=10,
+                    padding=9,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                self._explicit_memory_item_label(explicit_item),
+                                size=11,
+                                color=TEXT,
+                                selectable=True,
+                            ),
+                            ft.Button(
+                                "元に戻す",
+                                color=ACCENT,
+                                bgcolor="#332E27",
+                                on_click=undo_explicit,
+                                disabled=self._memory_decision_in_progress,
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                )
+            )
+        saved_count = len(saved_items) + len(explicit_items)
+        self.memory_saved_count.value = f"保存済み {saved_count}件"
+        self.memory_saved_toggle.disabled = saved_count == 0
         self.memory_saved_toggle.content = (
             "保存済みを隠す" if self._memory_saved_expanded else "保存済みを表示"
         )
@@ -1142,7 +1192,7 @@ class LocalChatApp:
         )
         self.memory_saved_list.controls = saved_controls
         self.memory_saved_list.visible = (
-            self._memory_saved_expanded and bool(saved_items)
+            self._memory_saved_expanded and saved_count > 0
         )
 
         by_id = {item.event_id: item for item in self.memory_review.undoable}
@@ -1170,6 +1220,38 @@ class LocalChatApp:
                             color=ACCENT,
                             bgcolor="#332E27",
                             on_click=undo,
+                            disabled=self._memory_decision_in_progress,
+                        ),
+                    ],
+                    spacing=8,
+                )
+            )
+        explicit_by_id = {
+            item.event_id: item for item in self.memory_review.explicit_undoable
+        }
+        for event_id in self._new_explicit_memory_event_ids:
+            explicit_undo_item = explicit_by_id.get(event_id)
+            if explicit_undo_item is None:
+                continue
+
+            async def undo_explicit_notice(target_id: str = event_id) -> None:
+                await self._undo_explicit_memory(target_id)
+
+            undo_controls.append(
+                ft.Row(
+                    [
+                        ft.Text(
+                            self._explicit_memory_item_label(explicit_undo_item),
+                            size=11,
+                            color=TEXT,
+                            expand=True,
+                            selectable=True,
+                        ),
+                        ft.Button(
+                            "元に戻す",
+                            color=ACCENT,
+                            bgcolor="#332E27",
+                            on_click=undo_explicit_notice,
                             disabled=self._memory_decision_in_progress,
                         ),
                     ],
@@ -1214,6 +1296,7 @@ class LocalChatApp:
             if current is None:
                 self.memory_review = MemoryReviewSnapshot((), ())
                 self._new_memory_event_ids.clear()
+                self._new_explicit_memory_event_ids.clear()
                 self._render_memory_review()
             else:
                 await self._refresh_memory_review(
@@ -1221,8 +1304,47 @@ class LocalChatApp:
                 )
             self.page.update(self.memory_card, self.memory_undo_bar)
 
+    async def _undo_explicit_memory(self, event_id: str) -> None:
+        conversation = self._selected_conversation()
+        character = self._selected_character_version()
+        if (
+            conversation is None
+            or character is None
+            or self._memory_decision_in_progress
+        ):
+            return
+        self._memory_decision_in_progress = True
+        self._render_memory_review()
+        self.page.update(self.memory_card, self.memory_undo_bar)
+        try:
+            await self.container.explicit_memory.undo(
+                UndoExplicitMemoryRequest(
+                    conversation.id,
+                    conversation.active_branch_id,
+                    event_id,
+                    character.character_id,
+                )
+            )
+            self._new_explicit_memory_event_ids = [
+                item
+                for item in self._new_explicit_memory_event_ids
+                if item != event_id
+            ]
+            self._toast("明示記憶を元に戻しました。", MINT)
+        except AppError as error:
+            self._toast(f"明示記憶を元に戻せませんでした。{error}", ERROR)
+        finally:
+            self._memory_decision_in_progress = False
+            current = self._selected_conversation()
+            if current is not None:
+                await self._refresh_memory_review(
+                    current.id, current.active_branch_id
+                )
+            self.page.update(self.memory_card, self.memory_undo_bar)
+
     def dismiss_memory_undo_bar(self) -> None:
         self._new_memory_event_ids.clear()
+        self._new_explicit_memory_event_ids.clear()
         self._render_memory_review()
         self.page.update(self.memory_undo_bar)
 
@@ -1247,6 +1369,10 @@ class LocalChatApp:
             else f"知っている人物 {len(item.known_by_character_ids)}人"
         )
         return f"{subject}の{slot}: {item.value}（{scope}）"
+
+    @staticmethod
+    def _explicit_memory_item_label(item: ExplicitMemoryReviewItem) -> str:
+        return f"明示記憶: {item.value}（この会話・このキャラクターだけ）"
 
     async def _refresh_messages(self, conversation_id: str) -> None:
         timeline_items = await self.container.timeline.list_items(conversation_id)
@@ -1295,9 +1421,19 @@ class LocalChatApp:
 
     def _message_bubble(self, message: Message) -> MessageBubble:
         if message.role is MessageRole.USER:
+            can_remember = (
+                message.state is MessageState.COMPLETED
+                and self.group_configuration is not None
+                and not self.group_configuration.settings.enabled
+            )
             return MessageBubble(
                 message,
                 on_rewrite=lambda: self.show_rewrite_dialog(message),
+                on_remember=(
+                    (lambda: self.show_explicit_memory_dialog(message))
+                    if can_remember
+                    else None
+                ),
             )
         return MessageBubble(
             message,
@@ -2325,6 +2461,119 @@ class LocalChatApp:
             )
         )
 
+    def show_explicit_memory_dialog(self, source: Message) -> None:
+        conversation = self._selected_conversation()
+        character = self._selected_character_version()
+        if (
+            conversation is None
+            or character is None
+            or source.role is not MessageRole.USER
+            or source.state is not MessageState.COMPLETED
+            or self.group_configuration is None
+            or self.group_configuration.settings.enabled
+        ):
+            return
+        request_id = str(uuid4())
+        count = ft.Text(color=MUTED, size=11)
+        error = ft.Text(color=ERROR, size=11)
+        content = ft.TextField(
+            label="覚えておく内容",
+            value=source.content,
+            multiline=True,
+            min_lines=3,
+            max_lines=8,
+            autofocus=True,
+        )
+        save_button = ft.Button(
+            "保存",
+            bgcolor=ACCENT,
+            color="#17120D",
+        )
+
+        def validate() -> bool:
+            length = len((content.value or "").strip())
+            count.value = f"{length} / 200文字"
+            valid = 1 <= length <= 200
+            error.value = (
+                ""
+                if valid
+                else "1文字以上200文字以内に編集してください。"
+            )
+            save_button.disabled = not valid
+            return valid
+
+        def content_changed(_: ft.Event[ft.TextField]) -> None:
+            validate()
+            self.page.update(count, error, save_button)
+
+        async def save() -> None:
+            if save_button.disabled or not validate():
+                return
+            save_button.disabled = True
+            self.page.update(save_button)
+            try:
+                saved = await self.container.explicit_memory.remember(
+                    RememberExplicitMemoryRequest(
+                        request_id,
+                        conversation.id,
+                        conversation.active_branch_id,
+                        source.id,
+                        character.character_id,
+                        content.value or "",
+                    )
+                )
+            except AppError as app_error:
+                save_button.disabled = False
+                error.value = str(app_error)
+                self.page.update(error, save_button)
+                return
+            self.page.pop_dialog()
+            self._new_explicit_memory_event_ids.append(saved.id)
+            current = self._selected_conversation()
+            if current is not None:
+                await self._refresh_memory_review(
+                    current.id, current.active_branch_id
+                )
+            self._toast(
+                "この会話・このキャラクターの明示記憶として保存しました。",
+                MINT,
+            )
+            self.page.update()
+
+        content.on_change = content_changed
+        save_button.on_click = save
+        validate()
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="このキャラクターに覚えさせる",
+                bgcolor="#24231F",
+                content=ft.Column(
+                    [
+                        content,
+                        ft.Row([count, error], wrap=True, spacing=8),
+                        ft.Text(
+                            "範囲: この会話・このキャラクターだけ",
+                            color=TEXT,
+                            size=12,
+                        ),
+                        ft.Text(
+                            "SQLiteは暗号化されていません。保存内容はローカルに残り、"
+                            "再利用時にローカルOllamaへ渡されます。",
+                            color=ACCENT,
+                            size=11,
+                        ),
+                    ],
+                    tight=True,
+                    width=480,
+                ),
+                actions=[
+                    ft.Button("キャンセル", on_click=self._close_dialog),
+                    save_button,
+                ],
+            )
+        )
+
     def confirm_archive(self) -> None:
         if self.selected_conversation_id is None:
             return
@@ -2464,6 +2713,19 @@ class LocalChatApp:
                 conversation
                 for conversation in self.conversations
                 if conversation.id == self.selected_conversation_id
+            ),
+            None,
+        )
+
+    def _selected_character_version(self) -> CharacterVersion | None:
+        conversation = self._selected_conversation()
+        if conversation is None:
+            return None
+        return next(
+            (
+                character
+                for character in self.characters
+                if character.id == conversation.character_version_id
             ),
             None,
         )

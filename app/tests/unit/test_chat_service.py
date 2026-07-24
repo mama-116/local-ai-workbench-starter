@@ -639,6 +639,47 @@ async def test_chat_automatically_compresses_before_second_over_limit_send(
 
 
 @pytest.mark.asyncio
+async def test_explicit_memory_remains_in_system_context_after_summary(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
+    conversation_id = await make_small_context_conversation(repository)
+    registry = FakeRegistry()
+    provider = CompressingProvider()
+    registry.provider = provider
+    service = ChatService(
+        repository,
+        registry,
+        FreeOperationPolicy(),
+        context_window=ContextWindowManager(repository, OneUnitCounter()),
+    )
+    first_response = await service.send_message(conversation_id, "最初の質問")
+    assert first_response.parent_message_id is not None
+    source = await repository.get_message(first_response.parent_message_id)
+    conversation = await repository.get_conversation(conversation_id)
+    character = await repository.get_character_version(
+        conversation.character_version_id
+    )
+    await repository.remember_explicit_memory(
+        "summary-dialog",
+        conversation.id,
+        conversation.active_branch_id,
+        source.id,
+        character.character_id,
+        "EXPLICIT-RECALL-731",
+        source.created_at,
+    )
+
+    await service.send_message(conversation_id, "現在の質問")
+
+    assert len(provider.requests) == 3
+    assert "EXPLICIT-RECALL-731" in provider.requests[-1].system_prompt
+    assert provider.requests[-1].messages[0].content.startswith(
+        "[以前の会話のローカル要約]"
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_warns_and_continues_when_ollama_summary_fails(
     tmp_path: Path,
 ) -> None:
