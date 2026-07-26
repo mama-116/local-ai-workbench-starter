@@ -61,6 +61,9 @@ from local_llm_chat.infrastructure.computer_use.fake_action_broker import (
 from local_llm_chat.infrastructure.llm.ollama_memory_candidate_extractor import (
     OllamaMemoryCandidateExtractor,
 )
+from local_llm_chat.infrastructure.llm.ollama_relationship_candidate_extractor import (
+    OllamaRelationshipCandidateExtractor,
+)
 from local_llm_chat.infrastructure.llm.ollama_turn_batch_generator import (
     OllamaTurnBatchGenerator,
 )
@@ -116,6 +119,7 @@ class AppContainer:
     memory_review: MemoryReviewService
     relationship_profiles: RelationshipProfileService
     memory_extractor: OllamaMemoryCandidateExtractor
+    relationship_extractor: OllamaRelationshipCandidateExtractor
     chat: ChatCoordinator
     tool_access: ToolAccessService
     scheduler: SchedulerService
@@ -129,6 +133,7 @@ class AppContainer:
                 ("translations", self.translations.close),
                 ("telemetry", self.telemetry.close),
                 ("memory_extractor", self.memory_extractor.close),
+                ("relationship_extractor", self.relationship_extractor.close),
                 ("providers", self.providers.close),
             )
         )
@@ -159,8 +164,19 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
     memory_candidates = MemoryCandidateService(
         memory_extractor, policy, DEFAULT_MEMORY_TEMPLATES
     )
+    relationship_profiles = RelationshipProfileService(repository)
+    relationship_extractor = OllamaRelationshipCandidateExtractor(
+        endpoint=LOCAL_ENDPOINT,
+        cloud_is_disabled=lambda: providers.cloud_is_disabled(LOCAL_PROVIDER_NAME),
+    )
     memory_capture = QueuedMemoryCaptureScheduler(
-        MemoryCaptureService(repository, memory_candidates), repository
+        MemoryCaptureService(
+            repository,
+            memory_candidates,
+            relationship_profiles,
+            relationship_extractor,
+        ),
+        repository,
     )
     telemetry = TelemetryService(
         repository, [WindowsSystemCollector(), NvidiaSmiCollector()]
@@ -181,8 +197,6 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         repository,
         ComputerUseCoordinator(FakeDesktopActionBroker(repository)),
     )
-    relationship_profiles = RelationshipProfileService(repository)
-
     single_chat = ChatService(
         repository,
         providers,
@@ -210,6 +224,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         memory_review=MemoryReviewService(repository),
         relationship_profiles=relationship_profiles,
         memory_extractor=memory_extractor,
+        relationship_extractor=relationship_extractor,
         tool_access=tool_access,
         scheduler=scheduler,
         computer_use=computer_use,

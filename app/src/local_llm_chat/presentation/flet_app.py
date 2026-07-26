@@ -385,6 +385,7 @@ class LocalChatApp:
             "AIが思う関係: 再評価前", size=10, color=MUTED
         )
         self.relationship_reason = ft.Text("直近理由: まだありません", size=10, color=MUTED)
+        self.relationship_review = ft.Column(spacing=6)
         self.profile_management_button = ft.Button(
             "Profile管理",
             icon=ft.Icons.MANAGE_ACCOUNTS_ROUNDED,
@@ -426,6 +427,7 @@ class LocalChatApp:
                     ),
                     self.relationship_interpretation,
                     self.relationship_reason,
+                    self.relationship_review,
                     ft.Row(
                         [
                             self.relationship_history_button,
@@ -1113,6 +1115,7 @@ class LocalChatApp:
             self.relationship_tension.value = "緊張 0"
             self.relationship_interpretation.value = "AIが思う関係: 再評価前"
             self.relationship_reason.value = "直近理由: まだありません"
+            self.relationship_review.controls = []
             return
         snapshot = selected_snapshot
         self.relationship_person.value = names.get(snapshot.character_id, "人物")
@@ -1133,6 +1136,89 @@ class LocalChatApp:
             if snapshot.recent_events
             else "直近理由: まだありません"
         )
+        review_controls: list[ft.Control] = []
+        for event in snapshot.pending_events:
+            async def confirm_candidate(target_id: str = event.id) -> None:
+                await self._decide_relationship_candidate(target_id, "confirmed")
+
+            async def reject_candidate(target_id: str = event.id) -> None:
+                await self._decide_relationship_candidate(target_id, "rejected")
+
+            review_controls.append(
+                ft.Container(
+                    bgcolor="#302D27",
+                    border_radius=8,
+                    padding=8,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"関係変化の候補: {event.reason}",
+                                size=11,
+                                color=TEXT,
+                            ),
+                            ft.Text(
+                                f"{event.meaning.value} / 強さ {event.severity.value}"
+                                f" / 出典 {event.source_message_id}",
+                                size=9,
+                                color=MUTED,
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Button(
+                                        "反映",
+                                        icon=ft.Icons.CHECK_ROUNDED,
+                                        bgcolor=MINT,
+                                        color="#17120D",
+                                        on_click=confirm_candidate,
+                                    ),
+                                    ft.Button(
+                                        "反映しない",
+                                        icon=ft.Icons.CLOSE_ROUNDED,
+                                        bgcolor="#292925",
+                                        color=TEXT,
+                                        on_click=reject_candidate,
+                                    ),
+                                ],
+                                spacing=6,
+                            ),
+                        ],
+                        spacing=5,
+                    ),
+                )
+            )
+        if snapshot.undoable_events:
+            last_event = snapshot.undoable_events[0]
+
+            async def undo_candidate(target_id: str = last_event.id) -> None:
+                await self._decide_relationship_candidate(target_id, "undone")
+
+            review_controls.append(
+                ft.TextButton(
+                    "直前の関係変化をUndo",
+                    icon=ft.Icons.UNDO_ROUNDED,
+                    on_click=undo_candidate,
+                )
+            )
+        self.relationship_review.controls = review_controls
+
+    async def _decide_relationship_candidate(
+        self, event_id: str, state: str
+    ) -> None:
+        conversation = self._selected_conversation()
+        if conversation is None:
+            return
+        try:
+            await self.container.relationship_profiles.decide_relationship_candidate(
+                conversation_id=conversation.id,
+                event_id=event_id,
+                state=state,
+                operation_id=str(uuid4()),
+                recorded_at=utc_now(),
+            )
+            await self._refresh_relationship(conversation.id)
+            self.page.update(self.relationship_card, self.relationship_chip_row)
+        except AppError as error:
+            self._toast(str(error), ERROR)
 
     async def show_relationship_history(self) -> None:
         selected_id = self.relationship_selected_character_id
@@ -1227,8 +1313,13 @@ class LocalChatApp:
             return
         if update.state is MemoryCaptureState.PROCESSING:
             self._memory_capture_source_message_id = update.source_message_id
+        total_count = (
+            len(update.persisted_event_ids)
+            + len(update.profile_event_ids)
+            + len(update.relationship_event_ids)
+        )
         self.memory_capture_status.value = self._memory_capture_status_label(
-            update.state, len(update.persisted_event_ids)
+            update.state, total_count
         )
         self.memory_capture_status.color = {
             MemoryCaptureState.PROCESSING: ACCENT,
@@ -1257,7 +1348,14 @@ class LocalChatApp:
             if event_id in undoable_ids and event_id not in self._new_memory_event_ids:
                 self._new_memory_event_ids.append(event_id)
         self._render_memory_review()
-        self.page.update(self.memory_card, self.memory_undo_bar)
+        if update.relationship_event_ids:
+            await self._refresh_relationship(conversation.id)
+        self.page.update(
+            self.memory_card,
+            self.memory_undo_bar,
+            self.relationship_card,
+            self.relationship_chip_row,
+        )
 
     @staticmethod
     def _memory_capture_status_label(

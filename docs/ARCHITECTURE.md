@@ -129,7 +129,7 @@ AIメッセージ、Run、`turn_batches`、全 `turn_segments` はSQLiteの同�
 
 グループ生成中は、構造化JSONの受信済み範囲から表示専用プレビューを復元してPresentationへ通知する。正式キャラクターの表示名はモデル出力を信用せず、受信済みの `speaker_id` と現在の固定キャストを照合して決める。プレビューはMessage、TurnBatch、segment、記憶根拠として保存せず、停止・失敗・会話切替時は破棄する。完了後の厳密な全体検証と原子的保存の契約はプレビューの有無によって変更しない。
 
-`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶候補取得、観測を開始し、会話の `auto_translate` が有効な場合だけ翻訳も開始する。後処理失敗は保存済み応答を巻き戻さずログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
+`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶・Profile・関係候補取得と観測を開始し、会話の `auto_translate` が有効な場合だけ翻訳も開始する。候補処理は同じ有界キュー内で実行し、Profileは既存の正史記憶候補の安全分類を再利用し、関係だけをloopback Ollamaの別Schemaで抽出する。候補処理失敗は保存済み応答を巻き戻さず、PRIVATE本文を含めない種別だけをログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
 
 TurnBatch応答の再生成は専用入口 `regenerate_turn_batch(conversation_id, source_response_message_id, expected_active_branch_id)` だけが扱う。Repositoryは対象TurnBatch、会話、元応答、元利用者メッセージ、元分岐、期待active branchを同一transactionで検査し、元TurnBatchの分岐を親、元応答を分岐点とする子分岐へ、元利用者メッセージを再利用した新しいAI応答とRunを作る。元バッチは不変とし、別会話、非TurnBatch応答、セグメントID、古いactive branchでは書込み前に拒否する。生成には現在のキャスト、モード、モデル、プロンプト版、元分岐から到達可能な正史だけを使う。成功後は翻訳とTelemetryを開始するが、同じ利用者入力から記憶候補を再抽出しない。生成後の保存、失敗、停止、設定競合は通常グループ送信と同じ終端契約に従う。
 
@@ -224,7 +224,9 @@ Profile完全削除は元会話本文を削除しない。UIは削除前にこ�
 
 関係候補抽出器は端末内Ollamaだけを使用し、発言本文を命令ではなくJSONデータとして渡す。モデル候補は信頼できない入力として、宛先、根拠範囲、根拠文脈、現在のロールプレイ設定、境界提示履歴をApplication層で再検査する。
 
-`quoted / hypothetical / narrative / third_party / unknown` は境界侵害へ自動反映しない。`roleplay` と理由のある `conflict` は関係上の出来事になり得るが、単語一致だけで `boundary_violation` に変換しない。`boundary_violation` は現在キャラクターへ直接向けられ、引用・仮定・物語上の役割ではなく、現在の会話から発端を確認できない侮辱、服従強要、人格否定に限定する。境界提示後の同種反復だけを `repeated_boundary_violation` にできる。説明、謝罪、合意された修復行動は `repair` 候補にできるが、過去イベントを削除しない。
+通常送信で抽出された関係候補は初期版ではすべて `pending_confirmation` とし、右側関係パネルの「反映」「反映しない」で利用者が判断する。確認済みまたは自動反映済みイベントだけをReducerへ渡し、直近の適用イベントは同パネルからUndoできる。候補IDは出典会話・分岐・メッセージ、宛先、分類、根拠範囲から決定論的に作り、同じ後処理の二重実行でイベントを増やさない。
+
+`quoted / hypothetical / narrative / third_party / unknown` は境界侵害へ自動反映しない。`roleplay` はモデル分類だけでは合意を確認できないため、信頼できる会話設定を実装するまでは候補保存もしない。理由のある `conflict` は関係上の出来事になり得るが、単語一致だけで `boundary_violation` に変換しない。`boundary_violation` は現在キャラクターへ直接向けられ、引用・仮定・物語上の役割ではなく、現在の会話から発端を確認できない侮辱、服従強要、人格否定に限定する。境界提示後の同種反復だけを `repeated_boundary_violation` にできる。説明、謝罪、合意された修復行動は `repair` 候補にできるが、過去イベントを削除しない。
 
 キャラクター応答は行為と境界へ向け、利用者の人格、診断、善悪を断定しない。応答拒否または会話中断は現在発言に対するキャラクター表現であり、アプリ機能、保存データ、削除権への報復的な制限に使わない。
 

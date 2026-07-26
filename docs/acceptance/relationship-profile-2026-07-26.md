@@ -19,6 +19,8 @@ Profile完全削除: pytestが作成する専用一時SQLiteだけで実施
 - 引用、仮定、物語、第三者、ロールプレイ、喧嘩、直接侵害、反復侵害、修復の境界再検査
 - 単独・グループ生成のloopback限定Relationship Context
 - B案の常時好感度チップ、右側関係パネル、履歴入口、2ペインProfile管理
+- 通常会話からのProfile追記と端末内関係候補抽出、確認前の指標不変、反映・却下・Undo
+- 合意を信頼できる設定から確認できない初期版では、`roleplay` 文脈を安全側に候補保存しない
 
 ## 自動検査
 
@@ -27,9 +29,9 @@ Profile完全削除: pytestが作成する専用一時SQLiteだけで実施
 | 検査 | 結果 |
 |---|---|
 | 関連unit・integration・startup | 成功 |
-| 全pytest | 440成功、1 skip。skipは既存のWindows symlink権限条件 |
+| 全pytest | 453成功、1 skip。skipは既存のWindows symlink権限条件 |
 | distribution pytest | 7成功 |
-| `mypy --strict src tests` | 成功、149 source files |
+| `mypy --strict src tests` | 成功、153 source files |
 | Python compileall | 成功 |
 | Repository秘密情報検査 | 成功 |
 | `git diff --check` | 成功 |
@@ -45,6 +47,7 @@ Profile完全削除: pytestが作成する専用一時SQLiteだけで実施
 - 単独会話の上部に「アシスタント 50%」チップが常時表示される
 - 右側関係カードに関係名、好感度50%、信頼30、緊張0、AI解釈、直近理由が表示される
 - 「履歴を確認」と「Profile管理」へ1クリックで到達できる
+- 専用一時DBの確認待ちイベントで、右側関係パネル内に出典・分類・強さ、「反映」「反映しない」が同時表示される
 - Profile管理は左一覧・右詳細の2ペインで、共有範囲、作成者、出典、履歴を確認できる
 - 完全削除までスクロールでき、全Profile項目が対象であることと「元会話本文は残る」が同時に表示される
 - 実データの完全削除操作は行わず、削除の原子性と再取得防止は専用一時SQLiteの統合試験で確認した
@@ -55,6 +58,8 @@ Profile完全削除: pytestが作成する専用一時SQLiteだけで実施
 
 ## high-level-review
 
-初回自己レビューではCritical 1件（既存世界線を選ぶUIがない）、Should 1件（関係候補の宛先が現在キャストかを再検査していない）を検出した。新規会話の世界線選択欄、Conversation Serviceの世界線一覧、現在キャスト照合と壊れる試験を追加し、全検査を再実行した。
+初回自己レビューではCritical 1件（既存世界線を選ぶUIがない）、Should 1件（関係候補の宛先が現在キャストかを再検査していない）を検出した。新規会話の世界線選択欄、Conversation Serviceの世界線一覧、現在キャスト照合と壊れる試験を追加した。
+
+通常会話からの候補取得を接続した後の再レビューではCritical 2件（判断APIが操作対象の世界線・現在キャストを再照合しない、同じProfile項目を二重追記できる）とShould 1件（モデル分類だけで合意済みロールプレイとして扱う）を検出した。操作直前の候補所属照合、同値の再保存抑止、AI作成値だけを確認待ちで置換する契約、利用者確定値の維持、信頼できる設定がない `roleplay` の保存拒否と壊れる試験を追加し、全検査を再実行した。
 
 最終判定: Ready。Critical 0件、今回の完了条件に関係するShould 0件。

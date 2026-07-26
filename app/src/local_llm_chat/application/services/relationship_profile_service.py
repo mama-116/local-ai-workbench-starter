@@ -23,6 +23,8 @@ from local_llm_chat.domain.relationship_profile import (
     RelationshipApproval,
     RelationshipAssignmentState,
     RelationshipCandidate,
+    RelationshipCandidateDraft,
+    RelationshipCandidateRequest,
     RelationshipDefinition,
     RelationshipEvent,
     RelationshipInterpretation,
@@ -32,6 +34,9 @@ from local_llm_chat.domain.relationship_profile import (
     RelationshipSeverity,
     revalidate_relationship_candidate,
     reduce_relationship_events,
+)
+from local_llm_chat.domain.ports.relationship_candidate_extractor import (
+    RelationshipCandidateExtractor,
 )
 
 
@@ -52,6 +57,8 @@ class CharacterRelationshipSnapshot:
     active_definitions: tuple[RelationshipDefinition, ...]
     interpretation: RelationshipInterpretation | None
     recent_events: tuple[RelationshipEvent, ...]
+    pending_events: tuple[RelationshipEvent, ...] = ()
+    undoable_events: tuple[RelationshipEvent, ...] = ()
 
 
 class RelationshipProfileService:
@@ -140,6 +147,7 @@ class RelationshipProfileService:
         value: str,
         low_risk_explicit: bool,
         recorded_at: datetime,
+        supersedes_event_id: str | None = None,
     ) -> ProfileEvent:
         continuity = await self._repository.get_continuity_for_conversation(
             conversation_id
@@ -174,7 +182,7 @@ class RelationshipProfileService:
             source_branch_id=branch_id,
             source_message_id=source_message_id,
             manual_operation_id=None,
-            supersedes_event_id=None,
+            supersedes_event_id=supersedes_event_id,
             effective_at=recorded_at,
             recorded_at=recorded_at,
         )
@@ -263,6 +271,134 @@ class RelationshipProfileService:
         await self._repository.append_relationship_event(event, LedgerActor.AI)
         return event
 
+    async def capture_relationship_candidates(
+        self,
+        *,
+        request: RelationshipCandidateRequest,
+        extractor: RelationshipCandidateExtractor,
+        recorded_at: datetime,
+    ) -> tuple[str, ...]:
+        drafts = await extractor.extract(request)
+        persisted: list[str] = []
+        for draft in drafts:
+            candidate = await self._trusted_candidate(request, draft)
+            event = await self.add_relationship_candidate(
+                conversation_id=request.conversation_id,
+                branch_id=request.branch_id,
+                source_message_id=request.source_message_id,
+                source_text=request.content,
+                candidate=candidate,
+                recorded_at=recorded_at,
+            )
+            if event is not None and event.id not in persisted:
+                persisted.append(event.id)
+        return tuple(persisted)
+
+    async def _trusted_candidate(
+        self,
+        request: RelationshipCandidateRequest,
+        draft: RelationshipCandidateDraft,
+    ) -> RelationshipCandidate:
+        continuity = await self._repository.get_continuity_for_conversation(
+            request.conversation_id
+        )
+        applied = await self._repository.list_relationship_events(
+            continuity.id, continuity.user_profile_id, draft.character_id
+        )
+        boundary_previously_set = any(
+            event.meaning
+            in {
+                RelationshipMeaning.BOUNDARY_VIOLATION,
+                RelationshipMeaning.REPEATED_BOUNDARY_VIOLATION,
+            }
+            for event in applied
+        )
+        evidence = request.content[draft.evidence_start : draft.evidence_end]
+        normalized = evidence.casefold()
+        is_apology = any(
+            marker in normalized
+            for marker in ("ごめん", "すみません", "申し訳", "謝", "sorry", "apolog")
+        )
+        identity = json.dumps(
+            {
+                "conversation_id": request.conversation_id,
+                "branch_id": request.branch_id,
+                "source_message_id": request.source_message_id,
+                "character_id": draft.character_id,
+                "meaning": draft.meaning.value,
+                "severity": draft.severity.value,
+                "context": draft.evidence_context.value,
+                "start": draft.evidence_start,
+                "end": draft.evidence_end,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return RelationshipCandidate(
+            event_id=str(uuid5(NAMESPACE_URL, f"relationship-source:{identity}")),
+            character_id=draft.character_id,
+            meaning=draft.meaning,
+            severity=draft.severity,
+            evidence_context=draft.evidence_context,
+            evidence_start=draft.evidence_start,
+            evidence_end=draft.evidence_end,
+            evidence_text=evidence,
+            conflict_has_reason=(
+                draft.meaning is RelationshipMeaning.CONFLICT
+                and draft.evidence_context is EvidenceContext.DIRECT
+            ),
+            # The extractor cannot establish that roleplay was agreed. Until a
+            # trusted conversation setting exists, roleplay candidates fail closed.
+            roleplay_active=False,
+            boundary_previously_set=boundary_previously_set,
+            is_apology=is_apology,
+            is_agreed_repair=False,
+        )
+
+    async def decide_relationship_candidate(
+        self,
+        *,
+        conversation_id: str,
+        event_id: str,
+        state: str,
+        operation_id: str,
+        recorded_at: datetime,
+    ) -> None:
+        continuity = await self._repository.get_continuity_for_conversation(
+            conversation_id
+        )
+        cast = await self._repository.get_conversation_cast(conversation_id)
+        allowed_event_ids: set[str] = set()
+        for member in cast.members:
+            events = await self._repository.list_relationship_events(
+                continuity.id,
+                continuity.user_profile_id,
+                member.character_id,
+                include_unapplied=True,
+            )
+            allowed_event_ids.update(event.id for event in events)
+        if event_id not in allowed_event_ids:
+            raise ValidationError(
+                "この世界線と現在のキャストに属する関係候補ではありません。"
+            )
+        await self._repository.decide_relationship_event(
+            decision_id=str(
+                uuid5(
+                    NAMESPACE_URL,
+                    (
+                        f"relationship-decision:{continuity.user_profile_id}:"
+                        f"{event_id}:{operation_id}"
+                    ),
+                )
+            ),
+            user_profile_id=continuity.user_profile_id,
+            target_event_id=event_id,
+            state=state,
+            actor=LedgerActor.USER,
+            recorded_at=recorded_at,
+        )
+
     async def set_relationship(
         self,
         *,
@@ -335,6 +471,12 @@ class RelationshipProfileService:
         events = await self._repository.list_relationship_events(
             continuity.id, continuity.user_profile_id, character_id
         )
+        review_events = await self._repository.list_relationship_events(
+            continuity.id,
+            continuity.user_profile_id,
+            character_id,
+            include_unapplied=True,
+        )
         definitions = {
             item.id: item
             for item in await self._repository.list_relationship_definitions()
@@ -364,6 +506,34 @@ class RelationshipProfileService:
                 )
             ),
             recent_events=tuple(reversed(events[-5:])),
+            pending_events=tuple(
+                reversed(
+                    [
+                        event
+                        for event in review_events
+                        if event.approval
+                        is RelationshipApproval.PENDING_CONFIRMATION
+                    ][-5:]
+                )
+            ),
+            undoable_events=tuple(
+                reversed(
+                    [
+                        event
+                        for event in review_events
+                        if event.approval
+                        in {
+                            RelationshipApproval.AUTO_APPLIED,
+                            RelationshipApproval.CONFIRMED,
+                        }
+                        and event.meaning
+                        not in {
+                            RelationshipMeaning.RELATIONSHIP_SET,
+                            RelationshipMeaning.RELATIONSHIP_RETIRED,
+                        }
+                    ][-5:]
+                )
+            ),
         )
 
     async def recompute_interpretation(

@@ -203,6 +203,7 @@ class AppRepository(Protocol):
         character_id: str,
         *,
         visible_to_character_ids: tuple[str, ...] = (),
+        include_unapplied: bool = False,
     ) -> tuple[RelationshipEvent, ...]: ...
 
     async def project_relationship_metrics(

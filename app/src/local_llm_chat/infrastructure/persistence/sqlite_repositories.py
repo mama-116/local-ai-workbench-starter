@@ -2963,6 +2963,7 @@ class SQLiteAppRepository:
         character_id: str,
         *,
         visible_to_character_ids: tuple[str, ...] = (),
+        include_unapplied: bool = False,
     ) -> tuple[RelationshipEvent, ...]:
         def operation(connection: sqlite3.Connection) -> tuple[RelationshipEvent, ...]:
             rows = connection.execute(
@@ -2980,7 +2981,7 @@ class SQLiteAppRepository:
                 approval = self._relationship_event_approval(
                     connection, item.id, item.approval
                 )
-                if approval not in {
+                if not include_unapplied and approval not in {
                     RelationshipApproval.AUTO_APPLIED,
                     RelationshipApproval.CONFIRMED,
                 }:

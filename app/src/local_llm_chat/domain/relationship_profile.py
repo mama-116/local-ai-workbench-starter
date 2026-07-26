@@ -8,6 +8,7 @@ from local_llm_chat.domain.errors import ValidationError
 
 
 RELATIONSHIP_POLICY_VERSION = "relationship-v1"
+MAX_RELATIONSHIP_CANDIDATES_PER_MESSAGE = 8
 INITIAL_AFFINITY = 50
 INITIAL_TRUST = 30
 INITIAL_TENSION = 0
@@ -240,6 +241,26 @@ class RelationshipCandidate:
     boundary_previously_set: bool = False
     is_apology: bool = False
     is_agreed_repair: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipCandidateRequest:
+    conversation_id: str
+    branch_id: str
+    source_message_id: str
+    model_name: str
+    content: str
+    allowed_character_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipCandidateDraft:
+    character_id: str
+    meaning: RelationshipMeaning
+    severity: RelationshipSeverity
+    evidence_context: EvidenceContext
+    evidence_start: int
+    evidence_end: int
 
 
 @dataclass(frozen=True, slots=True)
