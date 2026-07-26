@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from local_llm_chat.infrastructure.packaged_pywin32_paths import (
+    activate_packaged_pywin32_paths,
+)
+
+activate_packaged_pywin32_paths()
+
 import flet as ft
 
 from local_llm_chat.bootstrap import bootstrap

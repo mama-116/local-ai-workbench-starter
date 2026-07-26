@@ -40,6 +40,10 @@ def test_portable_build_has_privacy_guard_and_user_instructions() -> None:
     assert "LocalLLMChatBuild" in script_text
     assert "'/utf-8'" in script_text
     assert "PRIVATE KEY" in script_text
+    assert "LOCAL_LLM_CHAT_RESTART_READY_FILE" in script_text
+    assert "LOCAL_LLM_CHAT_RESTART_TOKEN" in script_text
+    assert "Stop-Process" in script_text
+    assert "Portable app did not finish initialization" in script_text
 
     assert instructions.is_file()
     instructions_text = instructions.read_text(encoding="utf-8")
@@ -47,3 +51,14 @@ def test_portable_build_has_privacy_guard_and_user_instructions() -> None:
     assert "LocalLLMChat.exe" in instructions_text
     assert "disable_ollama_cloud" in instructions_text
     assert "Ollamaとモデルは同梱されていません" in instructions_text
+
+
+def test_windows_entrypoint_activates_pywin32_before_bootstrap_import() -> None:
+    entrypoint = (APP_ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+    activation = entrypoint.index("activate_packaged_pywin32_paths()")
+    bootstrap_import = entrypoint.index(
+        "from local_llm_chat.bootstrap import bootstrap"
+    )
+
+    assert activation < bootstrap_import
