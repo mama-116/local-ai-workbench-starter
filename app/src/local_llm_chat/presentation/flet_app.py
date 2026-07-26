@@ -1979,22 +1979,43 @@ class LocalChatApp:
             selected = conversation.id == self.selected_conversation_id
             controls.append(
                 ft.Container(
-                    content=ft.Column(
+                    content=ft.Row(
                         [
-                            ft.Text(
-                                conversation.title,
-                                size=13,
-                                color=TEXT if selected else "#B8B3AA",
-                                max_lines=1,
-                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        conversation.title,
+                                        size=13,
+                                        color=TEXT if selected else "#B8B3AA",
+                                        max_lines=1,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                    ),
+                                    ft.Text(
+                                        conversation.updated_at.astimezone().strftime(
+                                            "%m/%d %H:%M"
+                                        ),
+                                        size=9,
+                                        color="#706C65",
+                                    ),
+                                ],
+                                spacing=2,
+                                expand=True,
                             ),
-                            ft.Text(
-                                conversation.updated_at.astimezone().strftime("%m/%d %H:%M"),
-                                size=9,
-                                color="#706C65",
+                            ft.PopupMenuButton(
+                                icon=ft.Icons.MORE_HORIZ_ROUNDED,
+                                tooltip="会話の操作",
+                                items=[
+                                    ft.PopupMenuItem(
+                                        content="名前を変更",
+                                        icon=ft.Icons.EDIT_OUTLINED,
+                                        on_click=lambda _, item=conversation: (
+                                            self.show_rename_conversation_dialog(item)
+                                        ),
+                                    )
+                                ],
                             ),
                         ],
-                        spacing=2,
+                        spacing=4,
                     ),
                     bgcolor="#2A2925" if selected else None,
                     border_radius=12,
@@ -2803,6 +2824,44 @@ class LocalChatApp:
             ],
         )
         self.page.show_dialog(dialog)
+
+    def show_rename_conversation_dialog(self, conversation: Conversation) -> None:
+        title = ft.TextField(
+            label="会話名",
+            value=conversation.title,
+            autofocus=True,
+            max_length=120,
+        )
+
+        async def rename() -> None:
+            try:
+                await self.container.conversations.rename(
+                    conversation.id, title.value or ""
+                )
+            except AppError as error:
+                self._toast(str(error), ERROR)
+                return
+            self.page.pop_dialog()
+            await self.refresh_all()
+            self._toast("会話名を変更しました。", MINT)
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="会話名を変更",
+                bgcolor="#24231F",
+                content=ft.Container(width=420, content=title),
+                actions=[
+                    ft.Button("キャンセル", on_click=self._close_dialog),
+                    ft.Button(
+                        "変更",
+                        bgcolor=ACCENT,
+                        color="#17120D",
+                        on_click=rename,
+                    ),
+                ],
+            )
+        )
 
     def show_connection_dialog(self) -> None:
         selected = self._selected_connection()

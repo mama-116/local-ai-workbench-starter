@@ -1646,6 +1646,24 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def rename_conversation(
+        self, conversation_id: str, title: str
+    ) -> Conversation:
+        def operation(connection: sqlite3.Connection) -> Conversation:
+            cursor = connection.execute(
+                """
+                UPDATE conversations
+                SET title = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                """,
+                (title, _now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationNotFound("会話が見つかりません。")
+            return self._require_conversation(connection, conversation_id)
+
+        return await self._write(operation)
+
     async def get_continuity_for_conversation(
         self, conversation_id: str
     ) -> Continuity:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from local_llm_chat.domain.errors import ValidationError
 from local_llm_chat.domain.models import (
     BranchInfo,
     Conversation,
@@ -17,6 +18,7 @@ _DEFAULT_CHAT_PARAMETERS: dict[str, Any] = {
     "num_ctx": 4096,
     "temperature": 0.3,
 }
+_MAX_CONVERSATION_TITLE_LENGTH = 120
 
 
 class ConversationService:
@@ -35,6 +37,18 @@ class ConversationService:
 
     async def list_archived_conversations(self) -> list[Conversation]:
         return await self._repository.list_archived_conversations()
+
+    async def rename(self, conversation_id: str, title: str) -> Conversation:
+        normalized_title = title.strip()
+        if not normalized_title:
+            raise ValidationError("会話名を入力してください。")
+        if len(normalized_title) > _MAX_CONVERSATION_TITLE_LENGTH:
+            raise ValidationError(
+                f"会話名は{_MAX_CONVERSATION_TITLE_LENGTH}文字以内で入力してください。"
+            )
+        return await self._repository.rename_conversation(
+            conversation_id, normalized_title
+        )
 
     async def list_continuities(self) -> tuple[Continuity, ...]:
         return await self._repository.list_continuities()

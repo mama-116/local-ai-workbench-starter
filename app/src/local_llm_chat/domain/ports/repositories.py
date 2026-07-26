@@ -135,6 +135,10 @@ class AppRepository(Protocol):
 
     async def get_conversation(self, conversation_id: str) -> Conversation: ...
 
+    async def rename_conversation(
+        self, conversation_id: str, title: str
+    ) -> Conversation: ...
+
     async def get_continuity_for_conversation(
         self, conversation_id: str
     ) -> Continuity: ...
