@@ -27,6 +27,7 @@ MAX_SPEAKER_DISPLAY_NAME_CHARACTERS = 100
 MAX_TURN_GENERATION_CONTEXT_CHARACTERS = 200_000
 MAX_SHARED_MEMORY_FACTS = MAX_CANONICAL_MEMORY_FACTS
 MAX_SHARED_MEMORY_CONTEXT_CHARACTERS = MAX_CANONICAL_MEMORY_CONTEXT_CHARACTERS
+MAX_RELATIONSHIP_CONTEXT_CHARACTERS = 8_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,7 @@ class TurnBatchGenerationRequest:
     prompt_version: str
     spotlight_character_id: str | None = None
     shared_memory_facts: tuple[TurnBatchMemoryFact, ...] = ()
+    relationship_context: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +316,8 @@ def validate_turn_batch_generation_request(
         memory_characters += sum(len(value) for value in values) + len(fact.kind.value)
     if memory_characters > MAX_SHARED_MEMORY_CONTEXT_CHARACTERS:
         raise ValidationError("turn batch shared memory context is too large")
+    if len(request.relationship_context) > MAX_RELATIONSHIP_CONTEXT_CHARACTERS:
+        raise ValidationError("turn batch relationship context is too large")
     if not request.messages or not request.messages[-1].content.strip():
         raise ValidationError("turn batch generation context must not be empty")
     total_input_characters = sum(
@@ -321,7 +325,7 @@ def validate_turn_batch_generation_request(
     ) + sum(
         len(character.display_name) + len(character.system_prompt)
         for character in request.formal_characters
-    ) + memory_characters
+    ) + memory_characters + len(request.relationship_context)
     if total_input_characters > MAX_TURN_GENERATION_CONTEXT_CHARACTERS:
         raise ValidationError("turn batch generation context is too large")
 

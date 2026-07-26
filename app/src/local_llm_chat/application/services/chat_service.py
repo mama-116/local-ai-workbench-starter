@@ -12,6 +12,9 @@ from local_llm_chat.application.services.memory_capture_service import (
 from local_llm_chat.application.services.canonical_memory_context import (
     render_single_chat_memory_context,
 )
+from local_llm_chat.application.services.relationship_profile_service import (
+    RelationshipProfileService,
+)
 from local_llm_chat.application.services.translation_service import (
     TranslationScheduler,
 )
@@ -64,6 +67,7 @@ class ChatService:
         tools: ToolCoordinator | None = None,
         context_window: ContextWindowManager | None = None,
         memory_capture_scheduler: MemoryCaptureScheduler | None = None,
+        relationship_profiles: RelationshipProfileService | None = None,
     ) -> None:
         self._repository = repository
         self._providers = providers
@@ -74,6 +78,7 @@ class ChatService:
         self._tools = tools
         self._context_window = context_window or ContextWindowManager(repository)
         self._memory_capture_scheduler = memory_capture_scheduler
+        self._relationship_profiles = relationship_profiles
 
     async def send_message(
         self,
@@ -173,6 +178,16 @@ class ChatService:
         system_prompt = character.system_prompt
         if memory_context:
             system_prompt = f"{system_prompt}\n\n{memory_context}"
+        if self._relationship_profiles is not None:
+            relationship_context = (
+                await self._relationship_profiles.render_generation_context(
+                    conversation_id=conversation.id,
+                    character_ids=(character.character_id,),
+                    provider_endpoint=provider.metadata.endpoint,
+                )
+            )
+            if relationship_context:
+                system_prompt = f"{system_prompt}\n\n{relationship_context}"
         rag_context = ""
         if self._rag is not None:
             selected_document_count, rag_results = await self._rag.prepare_for_conversation(

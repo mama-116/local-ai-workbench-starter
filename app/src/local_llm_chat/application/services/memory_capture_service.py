@@ -13,13 +13,24 @@ from uuid import UUID, uuid5
 from local_llm_chat.application.services.memory_candidate_service import (
     MemoryCandidateService,
 )
+from local_llm_chat.application.services.relationship_profile_service import (
+    RelationshipProfileService,
+)
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryEvent
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import AppError, ValidationError
 from local_llm_chat.domain.memory_candidates import (
     MemoryCandidate,
     MemoryCandidateRequest,
 )
 from local_llm_chat.domain.ports.repositories import AppRepository
+from local_llm_chat.domain.ports.relationship_candidate_extractor import (
+    RelationshipCandidateExtractor,
+)
+from local_llm_chat.domain.relationship_profile import (
+    ProfileApproval,
+    ProfileOrigin,
+    RelationshipCandidateRequest,
+)
 from local_llm_chat.domain.states import MemoryCandidateDisposition
 
 
@@ -43,6 +54,10 @@ class MemoryCaptureResult:
     candidates: tuple[MemoryCandidate, ...]
     persisted_event_ids: tuple[str, ...]
     extractor_unavailable: bool = False
+    profile_event_ids: tuple[str, ...] = ()
+    relationship_event_ids: tuple[str, ...] = ()
+    profile_capture_failed: bool = False
+    relationship_capture_failed: bool = False
 
 
 class MemoryCaptureState(StrEnum):
@@ -59,6 +74,8 @@ class MemoryCaptureUpdate:
     source_message_id: str
     state: MemoryCaptureState
     persisted_event_ids: tuple[str, ...] = ()
+    profile_event_ids: tuple[str, ...] = ()
+    relationship_event_ids: tuple[str, ...] = ()
 
 
 MemoryCaptureSubscriber = Callable[[MemoryCaptureUpdate], Awaitable[None]]
@@ -78,10 +95,16 @@ class MemoryCaptureService:
     """Captures source-backed candidates from one persisted user message."""
 
     def __init__(
-        self, repository: AppRepository, candidate_service: MemoryCandidateService
+        self,
+        repository: AppRepository,
+        candidate_service: MemoryCandidateService,
+        relationship_profiles: RelationshipProfileService | None = None,
+        relationship_extractor: RelationshipCandidateExtractor | None = None,
     ) -> None:
         self._repository = repository
         self._candidate_service = candidate_service
+        self._relationship_profiles = relationship_profiles
+        self._relationship_extractor = relationship_extractor
 
     async def capture(self, request: MemoryCaptureRequest) -> MemoryCaptureResult:
         source = await self._repository.get_memory_source_message(
@@ -114,8 +137,97 @@ class MemoryCaptureService:
         persisted_event_ids = await self._repository.append_captured_memory_events(
             events
         )
+        profile_event_ids: list[str] = []
+        profile_capture_failed = False
+        if self._relationship_profiles is not None:
+            existing_items = await self._relationship_profiles.list_profile_items(
+                request.conversation_id
+            )
+            for candidate in candidates:
+                if (
+                    candidate.disposition is MemoryCandidateDisposition.BLOCK
+                    or candidate.subject_id != "user"
+                ):
+                    continue
+                matching = [
+                    item
+                    for item in existing_items
+                    if item.item_kind == candidate.kind.value
+                    and item.item_name == candidate.slot
+                ]
+                current = matching[-1] if matching else None
+                if current is not None and current.value == candidate.value:
+                    continue
+                if current is not None and (
+                    current.origin is ProfileOrigin.USER_ASSERTED
+                    or current.approval is ProfileApproval.PENDING_CONFIRMATION
+                ):
+                    continue
+                try:
+                    profile_event = (
+                        await self._relationship_profiles.propose_ai_profile_item(
+                            conversation_id=request.conversation_id,
+                            branch_id=request.branch_id,
+                            source_message_id=request.source_message_id,
+                            item_kind=candidate.kind.value,
+                            item_name=candidate.slot,
+                            value=candidate.value,
+                            low_risk_explicit=(
+                                current is None
+                                and candidate.disposition
+                                is MemoryCandidateDisposition.AUTO_SAVE
+                            ),
+                            recorded_at=source.created_at,
+                            supersedes_event_id=(
+                                current.event_id if current is not None else None
+                            ),
+                        )
+                    )
+                except AppError:
+                    profile_capture_failed = True
+                    continue
+                if profile_event.id not in profile_event_ids:
+                    profile_event_ids.append(profile_event.id)
+                    existing_items = (
+                        await self._relationship_profiles.list_profile_items(
+                            request.conversation_id
+                        )
+                    )
+        relationship_event_ids: tuple[str, ...] = ()
+        relationship_capture_failed = False
+        if (
+            self._relationship_profiles is not None
+            and self._relationship_extractor is not None
+        ):
+            try:
+                relationship_event_ids = (
+                    await self._relationship_profiles.capture_relationship_candidates(
+                        request=RelationshipCandidateRequest(
+                            conversation_id=request.conversation_id,
+                            branch_id=request.branch_id,
+                            source_message_id=request.source_message_id,
+                            model_name=request.model_name,
+                            content=source.content,
+                            allowed_character_ids=(
+                                request.allowed_knowledge_character_ids
+                            ),
+                        ),
+                        extractor=self._relationship_extractor,
+                        recorded_at=source.created_at,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except AppError:
+                relationship_capture_failed = True
         return MemoryCaptureResult(
-            candidates, persisted_event_ids, generation.extractor_unavailable
+            candidates,
+            persisted_event_ids,
+            generation.extractor_unavailable,
+            tuple(profile_event_ids),
+            relationship_event_ids,
+            profile_capture_failed,
+            relationship_capture_failed,
         )
 
     @staticmethod
@@ -260,9 +372,27 @@ class QueuedMemoryCaptureScheduler:
                         {"error_type": "OllamaUnavailable"},
                         run_id,
                     )
+                if result.relationship_capture_failed:
+                    await self._log_best_effort(
+                        "warning",
+                        "relationship_capture_failed",
+                        {"error_type": "RelationshipCaptureError"},
+                        run_id,
+                    )
+                if result.profile_capture_failed:
+                    await self._log_best_effort(
+                        "warning",
+                        "profile_capture_skipped",
+                        {"error_type": "ProfileCapturePolicyError"},
+                        run_id,
+                    )
                 state = (
                     MemoryCaptureState.SAVED
-                    if result.persisted_event_ids
+                    if (
+                        result.persisted_event_ids
+                        or result.profile_event_ids
+                        or result.relationship_event_ids
+                    )
                     else MemoryCaptureState.NO_CANDIDATES
                 )
                 await self._notify(
@@ -272,6 +402,8 @@ class QueuedMemoryCaptureScheduler:
                         request.source_message_id,
                         state,
                         result.persisted_event_ids,
+                        result.profile_event_ids,
+                        result.relationship_event_ids,
                     ),
                     run_id,
                 )

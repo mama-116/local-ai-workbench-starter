@@ -36,6 +36,30 @@ from local_llm_chat.domain.group_turns import (
     TurnSegment,
     validate_conversation_group_settings,
 )
+from local_llm_chat.domain.relationship_profile import (
+    Continuity,
+    EvidenceContext,
+    LedgerActor,
+    ProfileApproval,
+    ProfileEvent,
+    ProfileItem,
+    ProfileOrigin,
+    ProfilePurgeReceipt,
+    ProfileScope,
+    ProfileUsageState,
+    RelationshipApproval,
+    RelationshipAssignmentState,
+    RelationshipDefinition,
+    RelationshipDirection,
+    RelationshipEvent,
+    RelationshipInterpretation,
+    RelationshipInterpretationState,
+    RelationshipMeaning,
+    RelationshipMetrics,
+    RelationshipSeverity,
+    UserProfile,
+    reduce_relationship_events,
+)
 from local_llm_chat.domain.models import (
     AgentExecutionLimits,
     AgentRun,
@@ -173,11 +197,46 @@ class SQLiteAppRepository:
                 version = int(migration_path.stem.split("_", maxsplit=1)[0])
                 if version in applied:
                     continue
-                connection.executescript(migration_path.read_text(encoding="utf-8"))
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
-                    (version, _now()),
+                applied_at = _now().replace("'", "''")
+                migration_sql = migration_path.read_text(encoding="utf-8")
+                dependent_trigger_rows: list[sqlite3.Row] = []
+                if version == 22:
+                    dependent_trigger_rows = connection.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_master
+                        WHERE type = 'trigger'
+                          AND sql IS NOT NULL
+                          AND lower(sql) LIKE '%conversations%'
+                        ORDER BY name
+                        """
+                    ).fetchall()
+                drop_dependent_triggers = "\n".join(
+                    f'DROP TRIGGER "{str(row["name"]).replace('"', '""')}";'
+                    for row in dependent_trigger_rows
                 )
+                restore_dependent_triggers = "\n".join(
+                    str(row["sql"]) + ";" for row in dependent_trigger_rows
+                )
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    f"{drop_dependent_triggers}\n"
+                    f"{migration_sql}\n"
+                    f"{restore_dependent_triggers}\n"
+                    "INSERT INTO schema_migrations(version, applied_at) "
+                    f"VALUES({version}, '{applied_at}');\n"
+                    "COMMIT;"
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+                foreign_key_error = connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchone()
+                if foreign_key_error is not None:
+                    raise sqlite3.IntegrityError(
+                        f"migration {version} left an invalid foreign key"
+                    )
 
         await self._write(operation)
 
@@ -1440,16 +1499,52 @@ class SQLiteAppRepository:
         title: str,
         character_version_id: str,
         model_profile_id: str,
+        continuity_id: str | None = None,
     ) -> Conversation:
         def operation(connection: sqlite3.Connection) -> Conversation:
             now = _now()
             conversation_id = str(uuid4())
             branch_id = str(uuid4())
+            selected_continuity_id = continuity_id
+            if selected_continuity_id is None:
+                user_profile_id = str(uuid4())
+                selected_continuity_id = str(uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO user_profiles(id, display_name, created_at)
+                    VALUES(?, '利用者', ?)
+                    """,
+                    (user_profile_id, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO continuities(
+                        id, display_name, user_profile_id, created_at
+                    ) VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        selected_continuity_id,
+                        title.strip() or "新しい世界線",
+                        user_profile_id,
+                        now,
+                    ),
+                )
+            else:
+                continuity_row = connection.execute(
+                    """
+                    SELECT id FROM continuities
+                    WHERE id = ? AND archived_at IS NULL
+                    """,
+                    (selected_continuity_id,),
+                ).fetchone()
+                if continuity_row is None:
+                    raise ValidationError("世界線が見つかりません。")
             connection.execute(
                 """
                 INSERT INTO conversations(
-                    id, title, character_version_id, model_profile_id, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
+                    id, title, character_version_id, model_profile_id,
+                    created_at, updated_at, continuity_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -1458,6 +1553,7 @@ class SQLiteAppRepository:
                     model_profile_id,
                     now,
                     now,
+                    selected_continuity_id,
                 ),
             )
             connection.execute(
@@ -1505,6 +1601,7 @@ class SQLiteAppRepository:
                 model_profile_id=model_profile_id,
                 created_at=datetime.fromisoformat(now),
                 updated_at=datetime.fromisoformat(now),
+                continuity_id=selected_continuity_id,
             )
 
         return await self._write(operation)
@@ -1538,6 +1635,51 @@ class SQLiteAppRepository:
     async def get_conversation(self, conversation_id: str) -> Conversation:
         def operation(connection: sqlite3.Connection) -> Conversation:
             return self._require_conversation(connection, conversation_id)
+
+        return await self._read(operation)
+
+    async def get_continuity_for_conversation(
+        self, conversation_id: str
+    ) -> Continuity:
+        def operation(connection: sqlite3.Connection) -> Continuity:
+            row = connection.execute(
+                """
+                SELECT continuity.*
+                FROM continuities continuity
+                JOIN conversations conversation
+                  ON conversation.continuity_id = continuity.id
+                WHERE conversation.id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise ConversationNotFound("会話または世界線が見つかりません。")
+            return self._continuity_from_row(row)
+
+        return await self._read(operation)
+
+    async def list_continuities(self) -> tuple[Continuity, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[Continuity, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM continuities
+                WHERE archived_at IS NULL
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+            return tuple(self._continuity_from_row(row) for row in rows)
+
+        return await self._read(operation)
+
+    async def get_user_profile(self, user_profile_id: str) -> UserProfile:
+        def operation(connection: sqlite3.Connection) -> UserProfile:
+            row = connection.execute(
+                "SELECT * FROM user_profiles WHERE id = ?",
+                (user_profile_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("Profileが見つかりません。")
+            return self._user_profile_from_row(row)
 
         return await self._read(operation)
 
@@ -1702,7 +1844,146 @@ class SQLiteAppRepository:
                     for conversation_id in conversation_ids
                 ),
             )
+            affected_profile_rows = connection.execute(
+                """
+                WITH RECURSIVE affected_profile_events(id, user_profile_id) AS (
+                    SELECT id, user_profile_id
+                    FROM profile_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id
+                        FROM conversation_deletion_guards
+                    )
+                    UNION
+                    SELECT child.id, child.user_profile_id
+                    FROM profile_events child
+                    JOIN affected_profile_events parent
+                      ON child.supersedes_event_id = parent.id
+                )
+                SELECT DISTINCT user_profile_id
+                FROM affected_profile_events
+                UNION
+                SELECT DISTINCT user_profile_id
+                FROM relationship_events
+                WHERE source_conversation_id IN (
+                    SELECT conversation_id
+                    FROM conversation_deletion_guards
+                )
+                """
+            ).fetchall()
+            profile_authorizations = tuple(
+                (str(uuid4()), str(row["user_profile_id"]))
+                for row in affected_profile_rows
+            )
+            connection.executemany(
+                """
+                INSERT INTO profile_purge_authorizations(
+                    request_id, user_profile_id
+                ) VALUES(?, ?)
+                """,
+                profile_authorizations,
+            )
             statements = (
+                """
+                DELETE FROM profile_capture_suppressions
+                WHERE source_message_id IN (
+                    SELECT id FROM messages
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_interpretations
+                WHERE user_profile_id IN (
+                    SELECT user_profile_id
+                    FROM profile_purge_authorizations
+                )
+                """,
+                """
+                DELETE FROM profile_derived_data
+                WHERE user_profile_id IN (
+                    SELECT user_profile_id
+                    FROM profile_purge_authorizations
+                )
+                """,
+                """
+                DELETE FROM relationship_decisions
+                WHERE target_event_id IN (
+                    SELECT id FROM relationship_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_event_knowledge
+                WHERE event_id IN (
+                    SELECT id FROM relationship_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_events
+                WHERE source_conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM profile_decisions
+                WHERE target_event_id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
+                """
+                DELETE FROM profile_event_scopes
+                WHERE event_id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
+                """
+                DELETE FROM profile_events
+                WHERE id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
                 """
                 DELETE FROM computer_actions
                 WHERE run_id IN (
@@ -1892,6 +2173,13 @@ class SQLiteAppRepository:
             )
             for statement in statements:
                 connection.execute(statement)
+            connection.executemany(
+                """
+                DELETE FROM profile_purge_authorizations
+                WHERE request_id = ?
+                """,
+                ((request_id,) for request_id, _ in profile_authorizations),
+            )
             cursor = connection.execute(
                 """
                 DELETE FROM conversations
@@ -2409,6 +2697,819 @@ class SQLiteAppRepository:
             )
 
         return await self._write(operation)
+
+    async def append_profile_event(
+        self, event: ProfileEvent, actor: LedgerActor
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_profile_event_actor(connection, event, actor)
+            existing = connection.execute(
+                "SELECT * FROM profile_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            if existing is not None:
+                existing_event = self._profile_event_from_row(connection, existing)
+                if existing_event == event:
+                    return
+                raise ValidationError("ProfileイベントIDは既に使われています。")
+            self._validate_profile_source(connection, event)
+            connection.execute(
+                """
+                INSERT INTO profile_events(
+                    id, user_profile_id, item_kind, item_name, value,
+                    origin, approval, scope, scope_count,
+                    source_conversation_id, source_branch_id, source_message_id,
+                    manual_operation_id, supersedes_event_id,
+                    effective_at, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.user_profile_id,
+                    event.item_kind.strip(),
+                    event.item_name.strip(),
+                    event.value.strip(),
+                    event.origin.value,
+                    event.approval.value,
+                    event.scope.value,
+                    len(event.known_by_character_ids),
+                    event.source_conversation_id,
+                    event.source_branch_id,
+                    event.source_message_id,
+                    event.manual_operation_id,
+                    event.supersedes_event_id,
+                    _utc_iso(event.effective_at),
+                    _utc_iso(event.recorded_at),
+                ),
+            )
+            for character_id in event.known_by_character_ids:
+                connection.execute(
+                    """
+                    INSERT INTO profile_event_scopes(event_id, character_id)
+                    VALUES(?, ?)
+                    """,
+                    (event.id, character_id),
+                )
+            if event.approval in {
+                ProfileApproval.AUTO_SAVED,
+                ProfileApproval.CONFIRMED,
+            }:
+                connection.execute(
+                    """
+                    UPDATE relationship_interpretations
+                    SET state = 'invalidated'
+                    WHERE user_profile_id = ? AND state = 'current'
+                    """,
+                    (event.user_profile_id,),
+                )
+
+        await self._write(operation)
+
+    async def decide_profile_event(
+        self,
+        *,
+        decision_id: str,
+        user_profile_id: str,
+        target_event_id: str,
+        state: str,
+        actor: LedgerActor,
+        recorded_at: datetime,
+    ) -> None:
+        allowed_states = {"confirmed", "rejected", "undone", "disabled", "active"}
+        if state not in allowed_states:
+            raise ValidationError("Profile判断状態が不正です。")
+        if actor is not LedgerActor.USER and state in {
+            "confirmed",
+            "rejected",
+            "disabled",
+            "active",
+        }:
+            raise ValidationError("このProfile操作は利用者だけが実行できます。")
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM profile_decisions WHERE id = ?", (decision_id,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["user_profile_id"]) == user_profile_id
+                    and str(existing["target_event_id"]) == target_event_id
+                    and str(existing["state"]) == state
+                    and str(existing["actor"]) == actor.value
+                ):
+                    return
+                raise ValidationError("Profile判断IDは既に使われています。")
+            event = connection.execute(
+                """
+                SELECT * FROM profile_events
+                WHERE id = ? AND user_profile_id = ?
+                """,
+                (target_event_id, user_profile_id),
+            ).fetchone()
+            if event is None:
+                raise ValidationError("Profile項目が見つかりません。")
+            current_approval, current_usage = self._profile_event_state(
+                connection, target_event_id, ProfileApproval(str(event["approval"]))
+            )
+            if state in {"confirmed", "rejected"} and (
+                current_approval is not ProfileApproval.PENDING_CONFIRMATION
+            ):
+                raise ValidationError("確認待ちではないProfile項目です。")
+            if state == "undone" and current_approval not in {
+                ProfileApproval.AUTO_SAVED,
+                ProfileApproval.CONFIRMED,
+            }:
+                raise ValidationError("このProfile項目はUndoできません。")
+            if state == "disabled" and current_usage is ProfileUsageState.DISABLED:
+                raise ValidationError("Profile項目は既に利用停止中です。")
+            if state == "active" and current_usage is ProfileUsageState.ACTIVE:
+                raise ValidationError("Profile項目は既に利用中です。")
+            connection.execute(
+                """
+                INSERT INTO profile_decisions(
+                    id, user_profile_id, target_event_id, state, actor, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    user_profile_id,
+                    target_event_id,
+                    state,
+                    actor.value,
+                    _utc_iso(recorded_at),
+                ),
+            )
+            if state in {"confirmed", "rejected", "undone", "disabled"}:
+                connection.execute(
+                    """
+                    UPDATE relationship_interpretations
+                    SET state = 'invalidated'
+                    WHERE user_profile_id = ? AND state = 'current'
+                    """,
+                    (user_profile_id,),
+                )
+
+        await self._write(operation)
+
+    async def project_profile(
+        self,
+        user_profile_id: str,
+        *,
+        character_ids: tuple[str, ...] = (),
+        include_disabled: bool = False,
+    ) -> tuple[ProfileItem, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[ProfileItem, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM profile_events
+                WHERE user_profile_id = ?
+                ORDER BY recorded_at, rowid
+                """,
+                (user_profile_id,),
+            ).fetchall()
+            projected: list[ProfileItem] = []
+            active_events: list[ProfileEvent] = []
+            states: dict[
+                str, tuple[ProfileApproval, ProfileUsageState]
+            ] = {}
+            for row in rows:
+                event = self._profile_event_from_row(connection, row)
+                approval, usage = self._profile_event_state(
+                    connection, event.id, event.approval
+                )
+                states[event.id] = (approval, usage)
+                if approval in {
+                    ProfileApproval.AUTO_SAVED,
+                    ProfileApproval.CONFIRMED,
+                }:
+                    active_events.append(event)
+            superseded = {
+                event.supersedes_event_id
+                for event in active_events
+                if event.supersedes_event_id is not None
+            }
+            requested = set(character_ids)
+            for event in active_events:
+                approval, usage = states[event.id]
+                if event.id in superseded:
+                    continue
+                if not include_disabled and usage is ProfileUsageState.DISABLED:
+                    continue
+                if not self._profile_scope_is_visible(event, requested):
+                    continue
+                projected.append(
+                    ProfileItem(
+                        event_id=event.id,
+                        user_profile_id=event.user_profile_id,
+                        item_kind=event.item_kind,
+                        item_name=event.item_name,
+                        value=event.value,
+                        origin=event.origin,
+                        approval=approval,
+                        usage=usage,
+                        scope=event.scope,
+                        known_by_character_ids=event.known_by_character_ids,
+                        source_conversation_id=event.source_conversation_id,
+                        source_message_id=event.source_message_id,
+                        recorded_at=event.recorded_at,
+                    )
+                )
+            return tuple(projected)
+
+        return await self._read(operation)
+
+    async def list_profile_history(
+        self, user_profile_id: str, item_kind: str, item_name: str
+    ) -> tuple[ProfileItem, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[ProfileItem, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM profile_events
+                WHERE user_profile_id = ? AND item_kind = ? AND item_name = ?
+                ORDER BY recorded_at DESC, rowid DESC
+                """,
+                (user_profile_id, item_kind, item_name),
+            ).fetchall()
+            items: list[ProfileItem] = []
+            for row in rows:
+                event = self._profile_event_from_row(connection, row)
+                approval, usage = self._profile_event_state(
+                    connection, event.id, event.approval
+                )
+                items.append(
+                    ProfileItem(
+                        event_id=event.id,
+                        user_profile_id=event.user_profile_id,
+                        item_kind=event.item_kind,
+                        item_name=event.item_name,
+                        value=event.value,
+                        origin=event.origin,
+                        approval=approval,
+                        usage=usage,
+                        scope=event.scope,
+                        known_by_character_ids=event.known_by_character_ids,
+                        source_conversation_id=event.source_conversation_id,
+                        source_message_id=event.source_message_id,
+                        recorded_at=event.recorded_at,
+                    )
+                )
+            return tuple(items)
+
+        return await self._read(operation)
+
+    async def list_profile_items_for_management(
+        self, user_profile_id: str
+    ) -> tuple[ProfileItem, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[ProfileItem, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM profile_events
+                WHERE user_profile_id = ? ORDER BY recorded_at, rowid
+                """,
+                (user_profile_id,),
+            ).fetchall()
+            events = [
+                self._profile_event_from_row(connection, row) for row in rows
+            ]
+            superseded = {
+                event.supersedes_event_id
+                for event in events
+                if event.supersedes_event_id is not None
+                and self._profile_event_state(
+                    connection, event.id, event.approval
+                )[0]
+                in {ProfileApproval.AUTO_SAVED, ProfileApproval.CONFIRMED}
+            }
+            items: list[ProfileItem] = []
+            for event in events:
+                if event.id in superseded:
+                    continue
+                approval, usage = self._profile_event_state(
+                    connection, event.id, event.approval
+                )
+                if approval in {ProfileApproval.REJECTED, ProfileApproval.UNDONE}:
+                    continue
+                items.append(
+                    ProfileItem(
+                        event_id=event.id,
+                        user_profile_id=event.user_profile_id,
+                        item_kind=event.item_kind,
+                        item_name=event.item_name,
+                        value=event.value,
+                        origin=event.origin,
+                        approval=approval,
+                        usage=usage,
+                        scope=event.scope,
+                        known_by_character_ids=event.known_by_character_ids,
+                        source_conversation_id=event.source_conversation_id,
+                        source_message_id=event.source_message_id,
+                        recorded_at=event.recorded_at,
+                    )
+                )
+            return tuple(items)
+
+        return await self._read(operation)
+
+    async def purge_profile(
+        self,
+        *,
+        request_id: str,
+        user_profile_id: str,
+        actor: LedgerActor,
+    ) -> ProfilePurgeReceipt:
+        if actor is not LedgerActor.USER:
+            raise ValidationError("Profile完全削除は利用者だけが実行できます。")
+
+        def operation(connection: sqlite3.Connection) -> ProfilePurgeReceipt:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM profile_purge_receipts WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["user_profile_id"]) != user_profile_id:
+                    raise ValidationError("削除要求IDは既に使われています。")
+                return self._profile_purge_receipt_from_row(existing)
+            profile = connection.execute(
+                "SELECT id FROM user_profiles WHERE id = ?", (user_profile_id,)
+            ).fetchone()
+            if profile is None:
+                raise ValidationError("Profileが見つかりません。")
+            event_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM profile_events
+                    WHERE user_profile_id = ?
+                    """,
+                    (user_profile_id,),
+                ).fetchone()["count"]
+            )
+            relationship_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM relationship_events
+                    WHERE user_profile_id = ?
+                    """,
+                    (user_profile_id,),
+                ).fetchone()["count"]
+            )
+            connection.execute(
+                """
+                INSERT INTO profile_purge_authorizations(request_id, user_profile_id)
+                VALUES(?, ?)
+                """,
+                (request_id, user_profile_id),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO profile_capture_suppressions(
+                    user_profile_id, source_message_id, item_kind, item_name
+                )
+                SELECT user_profile_id, source_message_id, item_kind, item_name
+                FROM profile_events
+                WHERE user_profile_id = ? AND source_message_id IS NOT NULL
+                """,
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM relationship_interpretations WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM profile_derived_data WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM relationship_decisions WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM relationship_event_knowledge
+                WHERE event_id IN (
+                    SELECT id FROM relationship_events WHERE user_profile_id = ?
+                )
+                """,
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM relationship_events WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM profile_decisions WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM profile_event_scopes
+                WHERE event_id IN (
+                    SELECT id FROM profile_events WHERE user_profile_id = ?
+                )
+                """,
+                (user_profile_id,),
+            )
+            connection.execute(
+                "DELETE FROM profile_events WHERE user_profile_id = ?",
+                (user_profile_id,),
+            )
+            completed_at = _now()
+            connection.execute(
+                """
+                INSERT INTO profile_purge_receipts(
+                    request_id, user_profile_id, deleted_event_count,
+                    deleted_relationship_event_count, completed_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    user_profile_id,
+                    event_count,
+                    relationship_count,
+                    completed_at,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM profile_purge_authorizations WHERE request_id = ?",
+                (request_id,),
+            )
+            return ProfilePurgeReceipt(
+                request_id=request_id,
+                user_profile_id=user_profile_id,
+                deleted_event_count=event_count,
+                deleted_relationship_event_count=relationship_count,
+                completed_at=datetime.fromisoformat(completed_at),
+            )
+
+        return await self._write(operation)
+
+    async def list_relationship_definitions(
+        self,
+    ) -> tuple[RelationshipDefinition, ...]:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[RelationshipDefinition, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM relationship_definitions
+                WHERE archived_at IS NULL
+                ORDER BY category, group_name, display_name, id
+                """
+            ).fetchall()
+            return tuple(self._relationship_definition_from_row(row) for row in rows)
+
+        return await self._read(operation)
+
+    async def append_relationship_event(
+        self, event: RelationshipEvent, actor: LedgerActor
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            if actor is LedgerActor.AI and event.approval is not (
+                RelationshipApproval.PENDING_CONFIRMATION
+            ):
+                raise ValidationError(
+                    "初期版ではAIの関係イベントを自動反映できません。"
+                )
+            existing = connection.execute(
+                "SELECT * FROM relationship_events WHERE id = ?", (event.id,)
+            ).fetchone()
+            if existing is not None:
+                if self._relationship_event_from_row(connection, existing) == event:
+                    return
+                raise ValidationError("関係イベントIDは既に使われています。")
+            self._validate_relationship_source(connection, event)
+            if (
+                actor is LedgerActor.AI
+                and event.relationship_definition_id is not None
+            ):
+                definition = connection.execute(
+                    """
+                    SELECT caution_tags_json FROM relationship_definitions
+                    WHERE id = ?
+                    """,
+                    (event.relationship_definition_id,),
+                ).fetchone()
+                if definition is None:
+                    raise ValidationError("関係定義が見つかりません。")
+                caution_tags = set(
+                    self._string_tuple_from_json(
+                        str(definition["caution_tags_json"]),
+                        "関係定義の注意タグ",
+                    )
+                )
+                if caution_tags.intersection(
+                    {
+                        "sexual_or_romantic",
+                        "power_imbalance",
+                        "coercion_or_confinement",
+                        "harm_history",
+                    }
+                ):
+                    raise ValidationError("この関係はAIから提案できません。")
+            connection.execute(
+                """
+                INSERT INTO relationship_events(
+                    id, continuity_id, user_profile_id, character_id,
+                    source_conversation_id, source_branch_id, source_message_id,
+                    meaning, severity, evidence_context,
+                    evidence_start, evidence_end, reason, approval,
+                    policy_version, knowledge_count,
+                    relationship_definition_id, assignment_state, role,
+                    recorded_at
+                ) VALUES(
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    event.id,
+                    event.continuity_id,
+                    event.user_profile_id,
+                    event.character_id,
+                    event.source_conversation_id,
+                    event.source_branch_id,
+                    event.source_message_id,
+                    event.meaning.value,
+                    event.severity.value,
+                    event.evidence_context.value,
+                    event.evidence_start,
+                    event.evidence_end,
+                    event.reason.strip(),
+                    event.approval.value,
+                    event.policy_version,
+                    len(event.known_by_character_ids),
+                    event.relationship_definition_id,
+                    (
+                        event.assignment_state.value
+                        if event.assignment_state is not None
+                        else None
+                    ),
+                    event.role,
+                    _utc_iso(event.recorded_at),
+                ),
+            )
+            for character_id in event.known_by_character_ids:
+                connection.execute(
+                    """
+                    INSERT INTO relationship_event_knowledge(event_id, character_id)
+                    VALUES(?, ?)
+                    """,
+                    (event.id, character_id),
+                )
+            if event.approval in {
+                RelationshipApproval.AUTO_APPLIED,
+                RelationshipApproval.CONFIRMED,
+            }:
+                connection.execute(
+                    """
+                    UPDATE relationship_interpretations
+                    SET state = 'invalidated'
+                    WHERE continuity_id = ? AND user_profile_id = ?
+                      AND character_id = ? AND state = 'current'
+                    """,
+                    (
+                        event.continuity_id,
+                        event.user_profile_id,
+                        event.character_id,
+                    ),
+                )
+
+        await self._write(operation)
+
+    async def decide_relationship_event(
+        self,
+        *,
+        decision_id: str,
+        user_profile_id: str,
+        target_event_id: str,
+        state: str,
+        actor: LedgerActor,
+        recorded_at: datetime,
+    ) -> None:
+        if state not in {"confirmed", "rejected", "undone"}:
+            raise ValidationError("関係判断状態が不正です。")
+        if actor is not LedgerActor.USER:
+            raise ValidationError("関係判断は利用者だけが実行できます。")
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM relationship_decisions WHERE id = ?",
+                (decision_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["user_profile_id"]) == user_profile_id
+                    and str(existing["target_event_id"]) == target_event_id
+                    and str(existing["state"]) == state
+                ):
+                    return
+                raise ValidationError("関係判断IDは既に使われています。")
+            event = connection.execute(
+                """
+                SELECT approval FROM relationship_events
+                WHERE id = ? AND user_profile_id = ?
+                """,
+                (target_event_id, user_profile_id),
+            ).fetchone()
+            if event is None:
+                raise ValidationError("関係イベントが見つかりません。")
+            current = self._relationship_event_approval(
+                connection,
+                target_event_id,
+                RelationshipApproval(str(event["approval"])),
+            )
+            if state in {"confirmed", "rejected"} and current is not (
+                RelationshipApproval.PENDING_CONFIRMATION
+            ):
+                raise ValidationError("確認待ちではない関係イベントです。")
+            if state == "undone" and current not in {
+                RelationshipApproval.AUTO_APPLIED,
+                RelationshipApproval.CONFIRMED,
+            }:
+                raise ValidationError("この関係イベントはUndoできません。")
+            connection.execute(
+                """
+                INSERT INTO relationship_decisions(
+                    id, user_profile_id, target_event_id, state, actor, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    user_profile_id,
+                    target_event_id,
+                    state,
+                    actor.value,
+                    _utc_iso(recorded_at),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE relationship_interpretations
+                SET state = 'invalidated'
+                WHERE user_profile_id = ? AND state = 'current'
+                  AND evidence_event_ids_json LIKE ?
+                """,
+                (user_profile_id, f'%"{target_event_id}"%'),
+            )
+
+        await self._write(operation)
+
+    async def list_relationship_events(
+        self,
+        continuity_id: str,
+        user_profile_id: str,
+        character_id: str,
+        *,
+        visible_to_character_ids: tuple[str, ...] = (),
+        include_unapplied: bool = False,
+    ) -> tuple[RelationshipEvent, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[RelationshipEvent, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM relationship_events
+                WHERE continuity_id = ? AND user_profile_id = ? AND character_id = ?
+                ORDER BY recorded_at, rowid
+                """,
+                (continuity_id, user_profile_id, character_id),
+            ).fetchall()
+            requested = set(visible_to_character_ids)
+            selected: list[RelationshipEvent] = []
+            for row in rows:
+                item = self._relationship_event_from_row(connection, row)
+                approval = self._relationship_event_approval(
+                    connection, item.id, item.approval
+                )
+                if not include_unapplied and approval not in {
+                    RelationshipApproval.AUTO_APPLIED,
+                    RelationshipApproval.CONFIRMED,
+                }:
+                    continue
+                if (
+                    requested
+                    and item.known_by_character_ids
+                    and not requested.issubset(item.known_by_character_ids)
+                ):
+                    continue
+                selected.append(replace(item, approval=approval))
+            return tuple(selected)
+
+        return await self._read(operation)
+
+    async def project_relationship_metrics(
+        self, continuity_id: str, user_profile_id: str, character_id: str
+    ) -> RelationshipMetrics:
+        events = await self.list_relationship_events(
+            continuity_id, user_profile_id, character_id
+        )
+        return reduce_relationship_events(events)
+
+    async def save_relationship_interpretation(
+        self, interpretation: RelationshipInterpretation, actor: LedgerActor
+    ) -> None:
+        if actor not in {LedgerActor.AI, LedgerActor.SYSTEM}:
+            raise ValidationError("関係解釈は再評価処理だけが保存できます。")
+        if interpretation.state not in {
+            RelationshipInterpretationState.CURRENT,
+            RelationshipInterpretationState.RECOMPUTING,
+        }:
+            raise ValidationError("新しい関係解釈の状態が不正です。")
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            evidence_ids = interpretation.evidence_event_ids
+            if evidence_ids:
+                placeholders = ",".join("?" for _ in evidence_ids)
+                rows = connection.execute(
+                    f"""
+                    SELECT id FROM relationship_events
+                    WHERE continuity_id = ? AND user_profile_id = ?
+                      AND character_id = ? AND id IN ({placeholders})
+                    """,
+                    (
+                        interpretation.continuity_id,
+                        interpretation.user_profile_id,
+                        interpretation.character_id,
+                        *evidence_ids,
+                    ),
+                ).fetchall()
+                if {str(row["id"]) for row in rows} != set(evidence_ids):
+                    raise ValidationError("関係解釈の根拠が台帳にありません。")
+            existing = connection.execute(
+                "SELECT * FROM relationship_interpretations WHERE id = ?",
+                (interpretation.id,),
+            ).fetchone()
+            if existing is not None:
+                if self._relationship_interpretation_from_row(existing) == interpretation:
+                    return
+                raise ValidationError("関係解釈IDは既に使われています。")
+            connection.execute(
+                """
+                UPDATE relationship_interpretations
+                SET state = 'superseded'
+                WHERE continuity_id = ? AND user_profile_id = ?
+                  AND character_id = ? AND state = 'current'
+                """,
+                (
+                    interpretation.continuity_id,
+                    interpretation.user_profile_id,
+                    interpretation.character_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO relationship_interpretations(
+                    id, continuity_id, user_profile_id, character_id,
+                    character_version_id, relationship_definition_ids_json,
+                    summary, evidence_event_ids_json, state, generated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    interpretation.id,
+                    interpretation.continuity_id,
+                    interpretation.user_profile_id,
+                    interpretation.character_id,
+                    interpretation.character_version_id,
+                    json.dumps(
+                        interpretation.relationship_definition_ids,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    interpretation.summary.strip(),
+                    json.dumps(
+                        interpretation.evidence_event_ids,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    interpretation.state.value,
+                    _utc_iso(interpretation.generated_at),
+                ),
+            )
+
+        await self._write(operation)
+
+    async def get_current_relationship_interpretation(
+        self, continuity_id: str, user_profile_id: str, character_id: str
+    ) -> RelationshipInterpretation | None:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> RelationshipInterpretation | None:
+            row = connection.execute(
+                """
+                SELECT * FROM relationship_interpretations
+                WHERE continuity_id = ? AND user_profile_id = ?
+                  AND character_id = ? AND state = 'current'
+                """,
+                (continuity_id, user_profile_id, character_id),
+            ).fetchone()
+            return (
+                self._relationship_interpretation_from_row(row)
+                if row is not None
+                else None
+            )
+
+        return await self._read(operation)
 
     async def append_canonical_memory_event(
         self, event: CanonicalMemoryEvent
@@ -4305,6 +5406,408 @@ class SQLiteAppRepository:
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 
+    def _validate_profile_event_actor(
+        self,
+        connection: sqlite3.Connection,
+        event: ProfileEvent,
+        actor: LedgerActor,
+    ) -> None:
+        if not event.item_kind.strip() or not event.item_name.strip() or not event.value.strip():
+            raise ValidationError("Profile項目は空にできません。")
+        if len(set(event.known_by_character_ids)) != len(event.known_by_character_ids):
+            raise ValidationError("Profile共有先が重複しています。")
+        if event.scope in {ProfileScope.PROFILE_ONLY, ProfileScope.CONTINUITY}:
+            if event.known_by_character_ids:
+                raise ValidationError("この共有範囲は個別の共有先を持ちません。")
+        elif not event.known_by_character_ids:
+            raise ValidationError("選択共有には共有先が必要です。")
+        if actor is LedgerActor.USER:
+            if (
+                event.origin is not ProfileOrigin.USER_ASSERTED
+                or event.approval is not ProfileApproval.CONFIRMED
+            ):
+                raise ValidationError("利用者Profileの作成元と判断が一致しません。")
+        elif actor is LedgerActor.AI:
+            if event.origin is ProfileOrigin.AI_AUTO_SAVED:
+                if (
+                    event.approval is not ProfileApproval.AUTO_SAVED
+                    or event.scope is not ProfileScope.PROFILE_ONLY
+                ):
+                    raise ValidationError(
+                        "AIの自動追記は本人管理の低リスク項目だけです。"
+                    )
+            elif event.origin is ProfileOrigin.AI_PROPOSED:
+                if event.approval is not ProfileApproval.PENDING_CONFIRMATION:
+                    raise ValidationError("AI提案は確認待ちにする必要があります。")
+            else:
+                raise ValidationError("AIは利用者確定Profileを作成できません。")
+        else:
+            raise ValidationError("Profileイベントの作成者が不正です。")
+        if event.supersedes_event_id is not None:
+            previous = connection.execute(
+                """
+                SELECT user_profile_id, item_kind, item_name, origin, scope
+                FROM profile_events WHERE id = ?
+                """,
+                (event.supersedes_event_id,),
+            ).fetchone()
+            if previous is None:
+                raise ValidationError("更新元のProfile項目が見つかりません。")
+            if (
+                str(previous["user_profile_id"]) != event.user_profile_id
+                or str(previous["item_kind"]) != event.item_kind
+                or str(previous["item_name"]) != event.item_name
+            ):
+                raise ValidationError("別のProfile項目を更新元にできません。")
+            if actor is not LedgerActor.USER and (
+                str(previous["origin"]) == ProfileOrigin.USER_ASSERTED.value
+                or (
+                    str(previous["scope"]) == ProfileScope.PROFILE_ONLY.value
+                    and event.scope is not ProfileScope.PROFILE_ONLY
+                )
+            ):
+                raise ValidationError(
+                    "AIは利用者確定値の上書きや共有範囲拡大を実行できません。"
+                )
+
+    def _validate_profile_source(
+        self, connection: sqlite3.Connection, event: ProfileEvent
+    ) -> None:
+        profile = connection.execute(
+            "SELECT id FROM user_profiles WHERE id = ?", (event.user_profile_id,)
+        ).fetchone()
+        if profile is None:
+            raise ValidationError("Profileが見つかりません。")
+        source_values = (
+            event.source_conversation_id,
+            event.source_branch_id,
+            event.source_message_id,
+        )
+        if all(value is None for value in source_values):
+            if event.manual_operation_id is None:
+                raise ValidationError("Profile項目には手動操作IDまたは出典が必要です。")
+            return
+        if any(value is None for value in source_values):
+            raise ValidationError("Profileの会話出典が不完全です。")
+        assert event.source_conversation_id is not None
+        assert event.source_branch_id is not None
+        assert event.source_message_id is not None
+        continuity = connection.execute(
+            """
+            SELECT continuity.user_profile_id
+            FROM conversations conversation
+            JOIN continuities continuity ON continuity.id = conversation.continuity_id
+            WHERE conversation.id = ?
+            """,
+            (event.source_conversation_id,),
+        ).fetchone()
+        if continuity is None or str(continuity["user_profile_id"]) != event.user_profile_id:
+            raise ValidationError("Profile出典が別世界線に属しています。")
+        visible = {
+            item.id for item in self._message_path(connection, event.source_branch_id)
+        }
+        if event.source_message_id not in visible:
+            raise ValidationError("Profile出典が指定分岐から到達できません。")
+
+    def _validate_relationship_source(
+        self, connection: sqlite3.Connection, event: RelationshipEvent
+    ) -> None:
+        ledger = connection.execute(
+            "SELECT 1 FROM continuities WHERE id = ? AND user_profile_id = ?",
+            (event.continuity_id, event.user_profile_id),
+        ).fetchone()
+        if ledger is None:
+            raise ValidationError("関係台帳の世界線とProfileが一致しません。")
+        character = connection.execute(
+            "SELECT id FROM characters WHERE id = ? AND archived_at IS NULL",
+            (event.character_id,),
+        ).fetchone()
+        if character is None:
+            raise ValidationError("関係台帳のキャラクターが見つかりません。")
+        if len(set(event.known_by_character_ids)) != len(
+            event.known_by_character_ids
+        ):
+            raise ValidationError("関係イベントの知識範囲が重複しています。")
+        source_values = (
+            event.source_conversation_id,
+            event.source_branch_id,
+            event.source_message_id,
+        )
+        if all(value is None for value in source_values):
+            if event.evidence_start is not None or event.evidence_end is not None:
+                raise ValidationError("手動関係イベントは本文範囲を持てません。")
+            return
+        if any(value is None for value in source_values):
+            raise ValidationError("関係イベントの会話出典が不完全です。")
+        assert event.source_conversation_id is not None
+        assert event.source_branch_id is not None
+        assert event.source_message_id is not None
+        conversation = connection.execute(
+            "SELECT continuity_id FROM conversations WHERE id = ?",
+            (event.source_conversation_id,),
+        ).fetchone()
+        if conversation is None or str(conversation["continuity_id"]) != event.continuity_id:
+            raise ValidationError("関係イベントの出典が別世界線に属しています。")
+        source = next(
+            (
+                item
+                for item in self._message_path(connection, event.source_branch_id)
+                if item.id == event.source_message_id
+            ),
+            None,
+        )
+        if source is None:
+            raise ValidationError("関係イベントの出典が指定分岐から到達できません。")
+        if (
+            event.evidence_start is None
+            or event.evidence_end is None
+            or event.evidence_start < 0
+            or event.evidence_end <= event.evidence_start
+            or event.evidence_end > len(source.content)
+        ):
+            raise ValidationError("関係イベントの根拠範囲が不正です。")
+
+    @staticmethod
+    def _profile_scope_is_visible(
+        event: ProfileEvent, requested_character_ids: set[str]
+    ) -> bool:
+        if event.scope is ProfileScope.PROFILE_ONLY:
+            return not requested_character_ids
+        if event.scope is ProfileScope.CONTINUITY:
+            return True
+        return bool(requested_character_ids) and requested_character_ids.issubset(
+            event.known_by_character_ids
+        )
+
+    @staticmethod
+    def _profile_event_state(
+        connection: sqlite3.Connection,
+        event_id: str,
+        initial: ProfileApproval,
+    ) -> tuple[ProfileApproval, ProfileUsageState]:
+        approval = initial
+        usage = ProfileUsageState.ACTIVE
+        rows = connection.execute(
+            "SELECT state FROM profile_decisions WHERE target_event_id = ? ORDER BY sequence",
+            (event_id,),
+        ).fetchall()
+        for row in rows:
+            state = str(row["state"])
+            if state in {"confirmed", "rejected", "undone"}:
+                approval = ProfileApproval(state)
+            elif state == "disabled":
+                usage = ProfileUsageState.DISABLED
+            elif state == "active":
+                usage = ProfileUsageState.ACTIVE
+        return approval, usage
+
+    @staticmethod
+    def _relationship_event_approval(
+        connection: sqlite3.Connection,
+        event_id: str,
+        initial: RelationshipApproval,
+    ) -> RelationshipApproval:
+        row = connection.execute(
+            """
+            SELECT state FROM relationship_decisions
+            WHERE target_event_id = ? ORDER BY sequence DESC LIMIT 1
+            """,
+            (event_id,),
+        ).fetchone()
+        return initial if row is None else RelationshipApproval(str(row["state"]))
+
+    def _profile_event_from_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> ProfileEvent:
+        scope_rows = connection.execute(
+            """
+            SELECT character_id FROM profile_event_scopes
+            WHERE event_id = ? ORDER BY character_id
+            """,
+            (row["id"],),
+        ).fetchall()
+        scopes = tuple(str(item["character_id"]) for item in scope_rows)
+        if len(scopes) != int(row["scope_count"]):
+            raise PersistenceError("Profile共有範囲が壊れています。")
+        return ProfileEvent(
+            id=str(row["id"]),
+            user_profile_id=str(row["user_profile_id"]),
+            item_kind=str(row["item_kind"]),
+            item_name=str(row["item_name"]),
+            value=str(row["value"]),
+            origin=ProfileOrigin(str(row["origin"])),
+            approval=ProfileApproval(str(row["approval"])),
+            scope=ProfileScope(str(row["scope"])),
+            known_by_character_ids=scopes,
+            source_conversation_id=(
+                str(row["source_conversation_id"])
+                if row["source_conversation_id"] is not None
+                else None
+            ),
+            source_branch_id=(
+                str(row["source_branch_id"])
+                if row["source_branch_id"] is not None
+                else None
+            ),
+            source_message_id=(
+                str(row["source_message_id"])
+                if row["source_message_id"] is not None
+                else None
+            ),
+            manual_operation_id=(
+                str(row["manual_operation_id"])
+                if row["manual_operation_id"] is not None
+                else None
+            ),
+            supersedes_event_id=(
+                str(row["supersedes_event_id"])
+                if row["supersedes_event_id"] is not None
+                else None
+            ),
+            effective_at=datetime.fromisoformat(str(row["effective_at"])),
+            recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+        )
+
+    def _relationship_event_from_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> RelationshipEvent:
+        scope_rows = connection.execute(
+            """
+            SELECT character_id FROM relationship_event_knowledge
+            WHERE event_id = ? ORDER BY character_id
+            """,
+            (row["id"],),
+        ).fetchall()
+        knowledge = tuple(str(item["character_id"]) for item in scope_rows)
+        if len(knowledge) != int(row["knowledge_count"]):
+            raise PersistenceError("関係イベントの知識範囲が壊れています。")
+        return RelationshipEvent(
+            id=str(row["id"]),
+            continuity_id=str(row["continuity_id"]),
+            user_profile_id=str(row["user_profile_id"]),
+            character_id=str(row["character_id"]),
+            source_conversation_id=(
+                str(row["source_conversation_id"])
+                if row["source_conversation_id"] is not None
+                else None
+            ),
+            source_branch_id=(
+                str(row["source_branch_id"])
+                if row["source_branch_id"] is not None
+                else None
+            ),
+            source_message_id=(
+                str(row["source_message_id"])
+                if row["source_message_id"] is not None
+                else None
+            ),
+            meaning=RelationshipMeaning(str(row["meaning"])),
+            severity=RelationshipSeverity(str(row["severity"])),
+            evidence_context=EvidenceContext(str(row["evidence_context"])),
+            evidence_start=(
+                int(row["evidence_start"])
+                if row["evidence_start"] is not None
+                else None
+            ),
+            evidence_end=(
+                int(row["evidence_end"]) if row["evidence_end"] is not None else None
+            ),
+            reason=str(row["reason"]),
+            approval=RelationshipApproval(str(row["approval"])),
+            policy_version=str(row["policy_version"]),
+            known_by_character_ids=knowledge,
+            relationship_definition_id=(
+                str(row["relationship_definition_id"])
+                if row["relationship_definition_id"] is not None
+                else None
+            ),
+            assignment_state=(
+                RelationshipAssignmentState(str(row["assignment_state"]))
+                if row["assignment_state"] is not None
+                else None
+            ),
+            role=str(row["role"]) if row["role"] is not None else None,
+            recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+        )
+
+    @classmethod
+    def _relationship_definition_from_row(
+        cls, row: sqlite3.Row
+    ) -> RelationshipDefinition:
+        return RelationshipDefinition(
+            id=str(row["id"]),
+            category=str(row["category"]),
+            group_name=str(row["group_name"]),
+            display_name=str(row["display_name"]),
+            direction=RelationshipDirection(str(row["direction"])),
+            role_a=str(row["role_a"]) if row["role_a"] is not None else None,
+            role_b=str(row["role_b"]) if row["role_b"] is not None else None,
+            caution_tags=cls._string_tuple_from_json(
+                str(row["caution_tags_json"]), "関係定義の注意タグ"
+            ),
+            archived_at=_parse_time(row["archived_at"]),
+        )
+
+    @classmethod
+    def _relationship_interpretation_from_row(
+        cls, row: sqlite3.Row
+    ) -> RelationshipInterpretation:
+        return RelationshipInterpretation(
+            id=str(row["id"]),
+            continuity_id=str(row["continuity_id"]),
+            user_profile_id=str(row["user_profile_id"]),
+            character_id=str(row["character_id"]),
+            character_version_id=str(row["character_version_id"]),
+            relationship_definition_ids=cls._string_tuple_from_json(
+                str(row["relationship_definition_ids_json"]), "関係定義"
+            ),
+            summary=str(row["summary"]),
+            evidence_event_ids=cls._string_tuple_from_json(
+                str(row["evidence_event_ids_json"]), "関係解釈の根拠"
+            ),
+            state=RelationshipInterpretationState(str(row["state"])),
+            generated_at=datetime.fromisoformat(str(row["generated_at"])),
+        )
+
+    @staticmethod
+    def _string_tuple_from_json(value: str, label: str) -> tuple[str, ...]:
+        parsed = json.loads(value)
+        if not isinstance(parsed, list) or not all(
+            isinstance(item, str) for item in parsed
+        ):
+            raise PersistenceError(f"{label}が壊れています。")
+        return tuple(parsed)
+
+    @staticmethod
+    def _continuity_from_row(row: sqlite3.Row) -> Continuity:
+        return Continuity(
+            id=str(row["id"]),
+            display_name=str(row["display_name"]),
+            user_profile_id=str(row["user_profile_id"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            archived_at=_parse_time(row["archived_at"]),
+        )
+
+    @staticmethod
+    def _user_profile_from_row(row: sqlite3.Row) -> UserProfile:
+        return UserProfile(
+            id=str(row["id"]),
+            display_name=str(row["display_name"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _profile_purge_receipt_from_row(row: sqlite3.Row) -> ProfilePurgeReceipt:
+        return ProfilePurgeReceipt(
+            request_id=str(row["request_id"]),
+            user_profile_id=str(row["user_profile_id"]),
+            deleted_event_count=int(row["deleted_event_count"]),
+            deleted_relationship_event_count=int(
+                row["deleted_relationship_event_count"]
+            ),
+            completed_at=datetime.fromisoformat(str(row["completed_at"])),
+        )
+
     @staticmethod
     def _character_from_row(row: sqlite3.Row) -> CharacterVersion:
         return CharacterVersion(
@@ -4345,6 +5848,7 @@ class SQLiteAppRepository:
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             archived_at=_parse_time(row["archived_at"]),
             auto_translate=bool(row["auto_translate"]),
+            continuity_id=str(row["continuity_id"]),
         )
 
     @staticmethod

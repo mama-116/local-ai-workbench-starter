@@ -11,6 +11,7 @@ from local_llm_chat.domain.models import (
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.ports.llm_provider import LLMProvider, LLMProviderRegistry
 from local_llm_chat.domain.ports.repositories import AppRepository
+from local_llm_chat.domain.relationship_profile import Continuity
 
 _DEFAULT_CHAT_PARAMETERS: dict[str, Any] = {
     "num_ctx": 4096,
@@ -35,6 +36,9 @@ class ConversationService:
     async def list_archived_conversations(self) -> list[Conversation]:
         return await self._repository.list_archived_conversations()
 
+    async def list_continuities(self) -> tuple[Continuity, ...]:
+        return await self._repository.list_continuities()
+
     async def create_conversation(
         self,
         title: str,
@@ -42,6 +46,7 @@ class ConversationService:
         provider_name: str,
         model_name: str,
         parameters: dict[str, Any] | None = None,
+        continuity_id: str | None = None,
     ) -> Conversation:
         provider = await self._require_model(provider_name, model_name)
         profile = await self._repository.ensure_model_profile(
@@ -50,7 +55,7 @@ class ConversationService:
             parameters or dict(_DEFAULT_CHAT_PARAMETERS),
         )
         return await self._repository.create_conversation(
-            title, character_version_id, profile.id
+            title, character_version_id, profile.id, continuity_id
         )
 
     async def update_selection(
