@@ -178,6 +178,51 @@ try {
     )
     Set-Content -LiteralPath (Join-Path $stageRoot 'BUILD-INFO.txt') -Value $buildInfo -Encoding utf8
 
+    $portableTestData = Join-Path $physicalBuildRoot 'startup-test-data'
+    $portableReadyDirectory = Join-Path $portableTestData 'restart'
+    $portableReadyFile = Join-Path $portableReadyDirectory 'portable.ready'
+    $portableReadyToken = [guid]::NewGuid().ToString('N')
+    New-Item -ItemType Directory -Force -Path $portableReadyDirectory | Out-Null
+    $previousPythonPath = $env:PYTHONPATH
+    $previousDataDirectory = $env:LOCAL_LLM_CHAT_DATA_DIR
+    $previousRestartToken = $env:LOCAL_LLM_CHAT_RESTART_TOKEN
+    $previousRestartReadyFile = $env:LOCAL_LLM_CHAT_RESTART_READY_FILE
+    $portableTestProcess = $null
+    try {
+        $env:PYTHONPATH = $null
+        $env:LOCAL_LLM_CHAT_DATA_DIR = $portableTestData
+        $env:LOCAL_LLM_CHAT_RESTART_TOKEN = $portableReadyToken
+        $env:LOCAL_LLM_CHAT_RESTART_READY_FILE = $portableReadyFile
+        $portableTestProcess = Start-Process `
+            -FilePath (Join-Path $stageRoot 'LocalLLMChat.exe') `
+            -WorkingDirectory $stageRoot `
+            -WindowStyle Hidden `
+            -PassThru
+        $portableDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (
+            [DateTime]::UtcNow -lt $portableDeadline `
+            -and -not (Test-Path -LiteralPath $portableReadyFile)
+        ) {
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not (Test-Path -LiteralPath $portableReadyFile)) {
+            throw 'Portable app did not finish initialization within 20 seconds.'
+        }
+        $reportedToken = Get-Content -LiteralPath $portableReadyFile -Raw -Encoding utf8
+        if ($reportedToken -ne $portableReadyToken) {
+            throw 'Portable app reported an invalid initialization token.'
+        }
+    } finally {
+        $env:PYTHONPATH = $previousPythonPath
+        $env:LOCAL_LLM_CHAT_DATA_DIR = $previousDataDirectory
+        $env:LOCAL_LLM_CHAT_RESTART_TOKEN = $previousRestartToken
+        $env:LOCAL_LLM_CHAT_RESTART_READY_FILE = $previousRestartReadyFile
+        if ($null -ne $portableTestProcess -and -not $portableTestProcess.HasExited) {
+            Stop-Process -Id $portableTestProcess.Id -Force
+            $portableTestProcess.WaitForExit(5000) | Out-Null
+        }
+    }
+
     $forbiddenFilePatterns = @(
         '*.db', '*.sqlite', '*.sqlite3', '*.sqlite3-shm', '*.sqlite3-wal',
         '*.env', '*.key', '*.pfx', '*.log',
