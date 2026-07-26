@@ -65,3 +65,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows-
 `dist/LocalLLMChat-Windows-x64-0.1.0.zip` とSHA-256ファイルを生成します。ビルド中だけ、承認済みの英数字パス `%USERPROFILE%\LocalLLMChatBuild\b` を使用し、終了時に削除します。配布物は未署名のため、Windowsの発行元確認が表示される場合があります。
 
 配布版ではFletの `FLET_APP_STORAGE_DATA`、開発用の直接起動では `app/.local-data` にSQLiteを保存します。物理削除機能はありません。
+
+## この開発PCでmerge済み最新版を起動
+
+普段の作業ブランチを変更せず、GitHubへmerge済みの `main` だけを取得・ビルドして起動する場合は、リポジトリのルートから初回に次を実行します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\install-latest-launcher.ps1
+```
+
+表示された `.local-runtime\Start-LocalLLMChat-Latest.cmd` を以後の起動入口にします。起動時に `origin/main` を確認し、新しいcommitだけをビルドします。取得またはビルドに失敗した場合は、成功確認済みの直前版を起動します。普段の作業worktreeと未コミット変更には触れません。

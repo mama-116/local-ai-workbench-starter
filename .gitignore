@@ -16,6 +16,7 @@ tmp/
 logs/
 data/
 .local-data/
+.local-runtime/
 
 # Dependencies and caches
 node_modules/
