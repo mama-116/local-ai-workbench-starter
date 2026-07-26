@@ -112,6 +112,8 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
 
+`conversations.title` は会話一覧と中央見出しで共通利用する会話名の正本とする。通常一覧の会話だけを変更でき、入力の前後空白を除いた1〜120文字をApplication層で検査する。Repositoryは `archived_at IS NULL` を更新条件へ含め、メニュー表示後にゴミ箱へ移動された会話や存在しない会話を変更しない。同じ会話名への再送は同じ値を保存する安全な更新として扱う。
+
 `conversations.auto_translate` は会話単位の自動翻訳許可で、既存・新規会話とも既定値を無効とする。`conversations.archived_at` は復元可能なゴミ箱移動を表し、設定しただけでは物理削除しない。恒久削除は、ゴミ箱画面で確認した全会話ID集合を再確認し、Repositoryが全件の `archived_at` と集合一致を同一transactionで検査した場合だけ行う。通常一覧の会話、一部だけ一致する要求、表示後に状態が変わった要求は削除しない。`branches.hidden_at` は分岐を選択肢から隠す表示状態であり、メッセージ、Run、TurnBatch、正史記憶を削除しない。root分岐とactive分岐は非表示にできず、非表示分岐をactiveへ切り替えられない。
 
 ### TurnBatchの初期契約
