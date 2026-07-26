@@ -74,4 +74,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows-
 powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\install-latest-launcher.ps1
 ```
 
-表示された `.local-runtime\Start-LocalLLMChat-Latest.cmd` を以後の起動入口にします。起動時に `origin/main` を確認し、新しいcommitだけをビルドします。取得またはビルドに失敗した場合は、成功確認済みの直前版を起動します。普段の作業worktreeと未コミット変更には触れません。
+表示された `.local-runtime\Start-LocalLLMChat-Latest.cmd` を以後の起動入口にします。起動時に `origin/main` を確認し、新しいcommitだけをビルドします。取得またはビルドに失敗した場合は、成功確認済みの直前版を起動します。この開発PCでは直接起動と同じ `app/.local-data` を使うため、過去の会話・設定・監査データを継続利用できます。普段の作業worktree、未コミット変更、SQLiteファイルには触れません。

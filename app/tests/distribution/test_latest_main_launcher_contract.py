@@ -40,6 +40,19 @@ def test_launcher_builds_each_main_commit_once_and_falls_back_safely() -> None:
     assert "'pull'" not in launcher
 
 
+def test_launcher_reuses_development_data_without_moving_the_database() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "LOCAL_LLM_CHAT_DATA_DIR" in launcher
+    assert r"app\.local-data" in launcher
+    assert "SetEnvironmentVariable" in launcher
+    assert "$previousDataDirectory" in launcher
+    assert "$runtimeRoot.StartsWith(" in launcher
+    assert "最新版用worktreeが元の開発worktreeの外にあります" in launcher
+    assert "Copy-Item" not in launcher
+    assert "Move-Item" not in launcher
+
+
 def test_windows_entry_point_uses_the_checked_in_launcher() -> None:
     entry_point = WINDOWS_ENTRY_POINT.read_text(encoding="utf-8")
 

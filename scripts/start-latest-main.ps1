@@ -14,6 +14,7 @@ $runtimeRoot = [System.IO.Path]::GetFullPath($RepositoryRoot)
 $expectedRemote = 'https://github.com/mama-116/local-ai-workbench-starter.git'
 $buildRoot = Join-Path $runtimeRoot 'dist\latest-main'
 $readyMarkerName = 'BUILD-READY.json'
+$dataEnvironmentVariable = 'LOCAL_LLM_CHAT_DATA_DIR'
 $mutex = [System.Threading.Mutex]::new(
     $false,
     'Local\LocalLLMChatLatestMainLauncher'
@@ -38,6 +39,44 @@ function Invoke-RuntimeGit {
         throw "Gitの実行に失敗しました: git $($GitArguments -join ' ')`n$($result -join [Environment]::NewLine)"
     }
     return @($result | ForEach-Object { $_.ToString() })
+}
+
+function Resolve-DevelopmentDataDirectory {
+    $commonGitDirectory = @(
+        Invoke-RuntimeGit -GitArguments @(
+            'rev-parse', '--path-format=absolute', '--git-common-dir'
+        )
+    )[0].Trim()
+    $resolvedCommonGitDirectory = [System.IO.Path]::GetFullPath(
+        $commonGitDirectory
+    )
+    if ((Split-Path -Leaf $resolvedCommonGitDirectory) -ne '.git') {
+        throw "元の開発worktreeを特定できませんでした: $resolvedCommonGitDirectory"
+    }
+    $developmentRoot = [System.IO.Path]::GetFullPath(
+        (Split-Path -Parent $resolvedCommonGitDirectory)
+    )
+    $developmentRootPrefix = (
+        $developmentRoot.TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar
+        ) + [System.IO.Path]::DirectorySeparatorChar
+    )
+    if (-not $runtimeRoot.StartsWith(
+        $developmentRootPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "最新版用worktreeが元の開発worktreeの外にあります: $runtimeRoot"
+    }
+    $dataDirectory = [System.IO.Path]::GetFullPath(
+        (Join-Path $developmentRoot 'app\.local-data')
+    )
+    if (-not $dataDirectory.StartsWith(
+        $developmentRootPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "会話データの保存先が開発worktreeの外にあります: $dataDirectory"
+    }
+    return $dataDirectory
 }
 
 function Read-ReadyBuild {
@@ -104,6 +143,8 @@ try {
     if (-not $lockAcquired) {
         throw '最新版の確認またはビルドがすでに実行中です。'
     }
+
+    $stableDataDirectory = Resolve-DevelopmentDataDirectory
 
     if (-not $NoLaunch) {
         $runningApp = Get-Process -Name 'LocalLLMChat' -ErrorAction SilentlyContinue
@@ -220,9 +261,27 @@ try {
 
     Write-Output "起動commit: $($selectedBuild.Commit)"
     Write-Output "起動EXE: $($selectedBuild.Executable)"
+    Write-Output "会話データ: $stableDataDirectory"
     if (-not $NoLaunch) {
-        Start-Process -FilePath $selectedBuild.Executable `
-            -WorkingDirectory (Split-Path -Parent $selectedBuild.Executable)
+        $previousDataDirectory = [System.Environment]::GetEnvironmentVariable(
+            $dataEnvironmentVariable,
+            [System.EnvironmentVariableTarget]::Process
+        )
+        try {
+            [System.Environment]::SetEnvironmentVariable(
+                $dataEnvironmentVariable,
+                $stableDataDirectory,
+                [System.EnvironmentVariableTarget]::Process
+            )
+            Start-Process -FilePath $selectedBuild.Executable `
+                -WorkingDirectory (Split-Path -Parent $selectedBuild.Executable)
+        } finally {
+            [System.Environment]::SetEnvironmentVariable(
+                $dataEnvironmentVariable,
+                $previousDataDirectory,
+                [System.EnvironmentVariableTarget]::Process
+            )
+        }
     }
 } finally {
     if ($lockAcquired) {
