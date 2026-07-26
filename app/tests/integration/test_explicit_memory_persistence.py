@@ -21,6 +21,82 @@ from local_llm_chat.infrastructure.persistence.sqlite_repositories import (
 
 
 @pytest.mark.asyncio
+async def test_legacy_explicit_memory_version_17_is_reconciled(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-explicit.sqlite3"
+    migrations = (
+        Path(__file__).parents[2]
+        / "src"
+        / "local_llm_chat"
+        / "infrastructure"
+        / "persistence"
+        / "migrations"
+    )
+    with sqlite3.connect(database_path) as connection:
+        for migration in sorted(migrations.glob("*.sql")):
+            version = int(migration.stem.split("_", maxsplit=1)[0])
+            if version > 16:
+                continue
+            connection.executescript(migration.read_text(encoding="utf-8"))
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                (version, "2026-07-24T00:00:00+00:00"),
+            )
+        connection.executescript(
+            """
+            CREATE TABLE explicit_memory_events (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                branch_id TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                character_id TEXT NOT NULL REFERENCES characters(id),
+                value TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(id, conversation_id),
+                FOREIGN KEY(branch_id, conversation_id)
+                    REFERENCES branches(id, conversation_id),
+                FOREIGN KEY(source_message_id, conversation_id)
+                    REFERENCES messages(id, conversation_id)
+            );
+            CREATE TABLE explicit_memory_decisions (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                target_event_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state = 'undone'),
+                recorded_at TEXT NOT NULL,
+                FOREIGN KEY(target_event_id, conversation_id)
+                    REFERENCES explicit_memory_events(id, conversation_id)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?)",
+            ("2026-07-24T00:00:00+00:00",),
+        )
+
+    repository = SQLiteAppRepository(database_path)
+    await repository.initialize()
+    await repository.initialize()
+
+    with sqlite3.connect(database_path) as check:
+        assert check.execute(
+            "SELECT version FROM schema_migrations WHERE version IN (17, 22, 23) "
+            "ORDER BY version"
+        ).fetchall() == [(17,), (22,), (23,)]
+        guard_columns = {
+            row[1]
+            for row in check.execute(
+                "PRAGMA table_info(conversation_deletion_guards)"
+            ).fetchall()
+        }
+        assert guard_columns == {"conversation_id", "authorized_at"}
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.asyncio
 async def test_explicit_memory_is_character_scoped_and_survives_restart(
     tmp_path: Path,
 ) -> None:
