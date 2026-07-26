@@ -4,6 +4,9 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 
+from local_llm_chat.application.services.relationship_profile_service import (
+    RelationshipProfileService,
+)
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryFact
 from local_llm_chat.domain.errors import ValidationError
 from local_llm_chat.domain.group_turns import (
@@ -37,10 +40,14 @@ class TurnBatchGenerationService:
         generator: TurnBatchGenerator,
         *,
         clock: Callable[[], float] = time.monotonic,
+        relationship_profiles: RelationshipProfileService | None = None,
+        provider_endpoint: Callable[[str], str] | None = None,
     ) -> None:
         self._repository = repository
         self._generator = generator
         self._clock = clock
+        self._relationship_profiles = relationship_profiles
+        self._provider_endpoint = provider_endpoint
 
     async def generate(
         self,
@@ -83,6 +90,20 @@ class TurnBatchGenerationService:
             session.user_message.id,
             tuple(character.character_id for character in characters),
         )
+        relationship_context = ""
+        if (
+            self._relationship_profiles is not None
+            and self._provider_endpoint is not None
+        ):
+            relationship_context = (
+                await self._relationship_profiles.render_generation_context(
+                    conversation_id=conversation.id,
+                    character_ids=tuple(
+                        character.character_id for character in characters
+                    ),
+                    provider_endpoint=self._provider_endpoint(profile.provider),
+                )
+            )
         request = TurnBatchGenerationRequest(
             provider_name=profile.provider,
             model_name=profile.model_name,
@@ -97,6 +118,7 @@ class TurnBatchGenerationService:
             prompt_version=TURN_BATCH_PROMPT_VERSION,
             spotlight_character_id=settings.spotlight_character_id,
             shared_memory_facts=shared_memory,
+            relationship_context=relationship_context,
         )
         validate_turn_batch_generation_request(request)
         response_started = self._clock()

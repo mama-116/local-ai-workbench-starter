@@ -86,7 +86,7 @@
 
 ## 初版後へ送るもの
 
-- [Profile・世界線・関係形成](RELATIONSHIP_PROFILE_DESIGN.md)（ADR-0022とB案UIを選択し、関係性辞書、既存会話を独立世界線へ移す互換境界、Profile権限、好感度・信頼・緊張の追記Reducer、「AIが思う関係」、文脈付きの侮辱・喧嘩・修復分類、完全削除の契約まで設計済み。DB、Application Service、生成Context、画面は未実装）
+- [Profile・世界線・関係形成](RELATIONSHIP_PROFILE_DESIGN.md)（ADR-0022、B案UI、[Profile管理3案比較](PROFILE_MANAGEMENT_UI_OPTIONS.md)に従い、世界線互換移行、Profile追記・確認・Undo・利用停止・完全削除、関係辞書・台帳・Reducer、出典付き関係解釈、単独・グループRelationship Context、常時チップ・右側関係パネル・2ペインProfile管理を実装。受入結果は [Issue #50受入記録](acceptance/relationship-profile-2026-07-26.md) を参照）
 - Phase 7Aの実UI接続、SQLite監査、UI Automation観測、実OS Broker（契約・Fake・B案レビュー部品まで実装済み。隔離環境未選定のため実入力は未実装）
 - Phase 7Bの許可フォルダー内の可逆なファイル整理と登録済みPowerShellレシピ（安全境界のみ決定、未実装。Phase 7A受入後に着手）
 - 意味検索が必要になった場合のローカル埋め込みモデル比較

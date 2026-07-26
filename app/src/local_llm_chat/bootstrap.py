@@ -38,6 +38,9 @@ from local_llm_chat.application.services.conversation_timeline_service import (
 )
 from local_llm_chat.application.services.profile_service import ProfileService
 from local_llm_chat.application.services.rag_service import RagService
+from local_llm_chat.application.services.relationship_profile_service import (
+    RelationshipProfileService,
+)
 from local_llm_chat.application.services.restart_service import RestartService
 from local_llm_chat.application.services.scheduler_service import SchedulerService
 from local_llm_chat.application.services.translation_service import TranslationService
@@ -111,6 +114,7 @@ class AppContainer:
     telemetry: TelemetryService
     memory_capture: QueuedMemoryCaptureScheduler
     memory_review: MemoryReviewService
+    relationship_profiles: RelationshipProfileService
     memory_extractor: OllamaMemoryCandidateExtractor
     chat: ChatCoordinator
     tool_access: ToolAccessService
@@ -177,6 +181,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         repository,
         ComputerUseCoordinator(FakeDesktopActionBroker(repository)),
     )
+    relationship_profiles = RelationshipProfileService(repository)
 
     single_chat = ChatService(
         repository,
@@ -187,6 +192,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         rag,
         tool_coordinator,
         memory_capture_scheduler=memory_capture,
+        relationship_profiles=relationship_profiles,
     )
     return AppContainer(
         paths=paths,
@@ -202,6 +208,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         telemetry=telemetry,
         memory_capture=memory_capture,
         memory_review=MemoryReviewService(repository),
+        relationship_profiles=relationship_profiles,
         memory_extractor=memory_extractor,
         tool_access=tool_access,
         scheduler=scheduler,
@@ -210,7 +217,12 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
             repository,
             single_chat,
             TurnBatchGenerationService(
-                repository, OllamaTurnBatchGenerator(providers)
+                repository,
+                OllamaTurnBatchGenerator(providers),
+                relationship_profiles=relationship_profiles,
+                provider_endpoint=lambda provider_name: providers.get(
+                    provider_name
+                ).metadata.endpoint,
             ),
             TurnBatchService(repository),
             memory_capture_scheduler=memory_capture,

@@ -1,0 +1,60 @@
+# Issue #50 世界線Profile・関係形成 受入記録
+
+実施日: 2026-07-26
+
+対象ブランチ: `agent/design-relationship-profile`
+
+個人会話データ: 使用しない
+
+Profile完全削除: pytestが作成する専用一時SQLiteだけで実施
+
+## 実装範囲
+
+- 既存会話を会話ごとの独立世界線へ決定論的に移行し、新規会話にも世界線を必須化
+- 新規会話で「新しい関係」または既存世界線を選び、同じ世界線のProfile・関係を継承
+- Profileの追記、更新、確認、却下、Undo、利用停止、再開、原子的な完全削除
+- 元会話本文を残しながら、出典単位の再取得抑止を保存
+- 複数・方向付き・履歴付き関係辞書と、世界線×Profile×安定キャラクターIDの追記台帳
+- `relationship-v1` Reducerと、出典付き・版付き「AIが思う関係」
+- 引用、仮定、物語、第三者、ロールプレイ、喧嘩、直接侵害、反復侵害、修復の境界再検査
+- 単独・グループ生成のloopback限定Relationship Context
+- B案の常時好感度チップ、右側関係パネル、履歴入口、2ペインProfile管理
+
+## 自動検査
+
+最終結果をDraft PR作成前に更新する。
+
+| 検査 | 結果 |
+|---|---|
+| 関連unit・integration・startup | 成功 |
+| 全pytest | 440成功、1 skip。skipは既存のWindows symlink権限条件 |
+| distribution pytest | 7成功 |
+| `mypy --strict src tests` | 成功、149 source files |
+| Python compileall | 成功 |
+| Repository秘密情報検査 | 成功 |
+| `git diff --check` | 成功 |
+| 文書リンク検査 | 成功 |
+| migration 新規・既存・二重適用 | 関連統合試験で成功 |
+
+## 画面確認
+
+[Profile管理UI 3案比較](../PROFILE_MANAGEMENT_UI_OPTIONS.md)では同寸法モックを比較し、2ペイン管理型を採用した。
+
+専用一時データディレクトリ `.tmp/relationship-profile-ui-qa` でFlet Desktopを実起動し、次を目視確認した。個人会話・実利用DBは使用していない。
+
+- 単独会話の上部に「アシスタント 50%」チップが常時表示される
+- 右側関係カードに関係名、好感度50%、信頼30、緊張0、AI解釈、直近理由が表示される
+- 「履歴を確認」と「Profile管理」へ1クリックで到達できる
+- Profile管理は左一覧・右詳細の2ペインで、共有範囲、作成者、出典、履歴を確認できる
+- 完全削除までスクロールでき、全Profile項目が対象であることと「元会話本文は残る」が同時に表示される
+- 実データの完全削除操作は行わず、削除の原子性と再取得防止は専用一時SQLiteの統合試験で確認した
+
+## 残る確認
+
+プロジェクトにはruff、blackなどのlint／formatツール設定がないため、採用済み検査としてstrict mypy、全pytest、compileall、`git diff --check`を実施した。未決事項はない。
+
+## high-level-review
+
+初回自己レビューではCritical 1件（既存世界線を選ぶUIがない）、Should 1件（関係候補の宛先が現在キャストかを再検査していない）を検出した。新規会話の世界線選択欄、Conversation Serviceの世界線一覧、現在キャスト照合と壊れる試験を追加し、全検査を再実行した。
+
+最終判定: Ready。Critical 0件、今回の完了条件に関係するShould 0件。

@@ -26,10 +26,19 @@ from local_llm_chat.application.services.memory_decision_service import (
 from local_llm_chat.application.services.memory_review_service import (
     MemoryReviewSnapshot,
 )
+from local_llm_chat.application.services.relationship_profile_service import (
+    CharacterRelationshipSnapshot,
+)
 from local_llm_chat.bootstrap import AppContainer
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryReviewItem
 from local_llm_chat.domain.errors import AppError
 from local_llm_chat.domain.group_turns import ConversationGroupConfiguration
+from local_llm_chat.domain.relationship_profile import (
+    ProfileApproval,
+    ProfileItem,
+    ProfileScope,
+    ProfileUsageState,
+)
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
@@ -102,6 +111,8 @@ class LocalChatApp:
         self.tool_audits: list[ToolCallAudit] = []
         self.computer_use_runs: list[ComputerUseRun] = []
         self.group_configuration: ConversationGroupConfiguration | None = None
+        self.relationship_snapshots: dict[str, CharacterRelationshipSnapshot] = {}
+        self.relationship_selected_character_id: str | None = None
         self.memory_review = MemoryReviewSnapshot((), ())
         self._new_memory_event_ids: list[str] = []
         self._memory_notice_conversation_id: str | None = None
@@ -362,6 +373,71 @@ class LocalChatApp:
             on_click=self.show_group_chat_dialog,
             disabled=True,
         )
+        self.relationship_chip_row = ft.Row(spacing=6, wrap=True)
+        self.relationship_person = ft.Text(
+            "人物を選択してください", size=13, weight=ft.FontWeight.W_600
+        )
+        self.relationship_labels = ft.Text("関係: 未設定", size=10, color=MUTED)
+        self.relationship_affinity = ft.Text("好感度 50%", size=12, color=MINT)
+        self.relationship_trust = ft.Text("信頼 30", size=11, color=TEXT)
+        self.relationship_tension = ft.Text("緊張 0", size=11, color=TEXT)
+        self.relationship_interpretation = ft.Text(
+            "AIが思う関係: 再評価前", size=10, color=MUTED
+        )
+        self.relationship_reason = ft.Text("直近理由: まだありません", size=10, color=MUTED)
+        self.profile_management_button = ft.Button(
+            "Profile管理",
+            icon=ft.Icons.MANAGE_ACCOUNTS_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_profile_management,
+            disabled=True,
+        )
+        self.relationship_history_button = ft.Button(
+            "履歴を確認",
+            icon=ft.Icons.HISTORY_ROUNDED,
+            color=TEXT,
+            bgcolor="#292925",
+            on_click=self.show_relationship_history,
+            disabled=True,
+        )
+        self.relationship_card = ft.Container(
+            bgcolor="#242421",
+            border_radius=14,
+            padding=12,
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.HANDSHAKE_ROUNDED, size=16, color=MINT),
+                            ft.Text("関係", size=11, weight=ft.FontWeight.W_600),
+                        ],
+                        spacing=6,
+                    ),
+                    self.relationship_person,
+                    self.relationship_labels,
+                    ft.Row(
+                        [
+                            self.relationship_affinity,
+                            self.relationship_trust,
+                            self.relationship_tension,
+                        ],
+                        spacing=10,
+                    ),
+                    self.relationship_interpretation,
+                    self.relationship_reason,
+                    ft.Row(
+                        [
+                            self.relationship_history_button,
+                            self.profile_management_button,
+                        ],
+                        spacing=6,
+                        wrap=True,
+                    ),
+                ],
+                spacing=7,
+            ),
+        )
         self.memory_undo_list = ft.Column(spacing=6)
         self.memory_undo_bar = ft.Container(
             visible=False,
@@ -548,7 +624,14 @@ class LocalChatApp:
                         padding=ft.Padding(28, 18, 22, 14),
                         content=ft.Row(
                             [
-                                ft.Column([self.title_text, self.subtitle_text], spacing=1),
+                                ft.Column(
+                                    [
+                                        self.title_text,
+                                        self.subtitle_text,
+                                        self.relationship_chip_row,
+                                    ],
+                                    spacing=5,
+                                ),
                                 ft.Container(expand=True),
                                 self.stop_button,
                             ]
@@ -622,6 +705,7 @@ class LocalChatApp:
                     self._section_label("GROUP CHAT"),
                     self.group_chat_summary,
                     self.group_chat_button,
+                    self.relationship_card,
                     self.memory_card,
                     self._section_label("LOCAL MODEL"),
                     self.model_dropdown,
@@ -879,6 +963,9 @@ class LocalChatApp:
             self.character_dropdown.value = None
             self.character_dropdown.disabled = False
             self.group_configuration = None
+            self.relationship_snapshots = {}
+            self.relationship_selected_character_id = None
+            self._render_relationship()
             self.memory_review = MemoryReviewSnapshot((), ())
             self._new_memory_event_ids.clear()
             self._memory_notice_conversation_id = None
@@ -927,6 +1014,7 @@ class LocalChatApp:
             self.group_configuration.settings.enabled
             or len(self.group_configuration.cast.members) > 1
         )
+        await self._refresh_relationship(conversation.id)
         self.selected_provider_name = selection.model_profile.provider
         self.connection_dropdown.value = selection.model_profile.provider
         allowed_model_names = {model.name for model in self.models}
@@ -964,6 +1052,152 @@ class LocalChatApp:
         )
         self._render_rag_selection()
         self._set_composer_enabled(bool(self.models) and self._generation_task is None)
+
+    async def _refresh_relationship(self, conversation_id: str) -> None:
+        if self.group_configuration is None:
+            self.relationship_snapshots = {}
+            self.relationship_selected_character_id = None
+            self._render_relationship()
+            return
+        snapshots: dict[str, CharacterRelationshipSnapshot] = {}
+        for member in self.group_configuration.cast.members:
+            snapshots[member.character_id] = (
+                await self.container.relationship_profiles.relationship_snapshot(
+                    conversation_id, member.character_id
+                )
+            )
+        self.relationship_snapshots = snapshots
+        if self.relationship_selected_character_id not in snapshots:
+            self.relationship_selected_character_id = next(iter(snapshots), None)
+        self._render_relationship()
+
+    def _render_relationship(self) -> None:
+        names = (
+            {
+                member.character_id: member.display_name
+                for member in self.group_configuration.cast.members
+            }
+            if self.group_configuration is not None
+            else {}
+        )
+        chips: list[ft.Control] = []
+        for character_id, chip_snapshot in self.relationship_snapshots.items():
+            async def select_relationship(target_id: str = character_id) -> None:
+                self.relationship_selected_character_id = target_id
+                self._render_relationship()
+                self.page.update(self.relationship_card, self.relationship_chip_row)
+
+            selected = character_id == self.relationship_selected_character_id
+            chips.append(
+                ft.Button(
+                    f"{names.get(character_id, '人物')}  {chip_snapshot.metrics.affinity}%",
+                    color="#17120D" if selected else TEXT,
+                    bgcolor=MINT if selected else "#292925",
+                    on_click=select_relationship,
+                )
+            )
+        self.relationship_chip_row.controls = chips
+        selected_id = self.relationship_selected_character_id
+        selected_snapshot = (
+            self.relationship_snapshots.get(selected_id)
+            if selected_id is not None
+            else None
+        )
+        self.profile_management_button.disabled = selected_snapshot is None
+        self.relationship_history_button.disabled = selected_snapshot is None
+        if selected_snapshot is None:
+            self.relationship_person.value = "人物を選択してください"
+            self.relationship_labels.value = "関係: 未設定"
+            self.relationship_affinity.value = "好感度 50%"
+            self.relationship_trust.value = "信頼 30"
+            self.relationship_tension.value = "緊張 0"
+            self.relationship_interpretation.value = "AIが思う関係: 再評価前"
+            self.relationship_reason.value = "直近理由: まだありません"
+            return
+        snapshot = selected_snapshot
+        self.relationship_person.value = names.get(snapshot.character_id, "人物")
+        labels = "・".join(
+            definition.display_name for definition in snapshot.active_definitions
+        )
+        self.relationship_labels.value = f"関係: {labels or '未設定'}"
+        self.relationship_affinity.value = f"好感度 {snapshot.metrics.affinity}%"
+        self.relationship_trust.value = f"信頼 {snapshot.metrics.trust}"
+        self.relationship_tension.value = f"緊張 {snapshot.metrics.tension}"
+        self.relationship_interpretation.value = (
+            f"AIが思う関係: {snapshot.interpretation.summary}"
+            if snapshot.interpretation is not None
+            else "AIが思う関係: 再評価前"
+        )
+        self.relationship_reason.value = (
+            f"直近理由: {snapshot.recent_events[0].reason}"
+            if snapshot.recent_events
+            else "直近理由: まだありません"
+        )
+
+    async def show_relationship_history(self) -> None:
+        selected_id = self.relationship_selected_character_id
+        snapshot = (
+            self.relationship_snapshots.get(selected_id)
+            if selected_id is not None
+            else None
+        )
+        if snapshot is None:
+            return
+        names = (
+            {
+                member.character_id: member.display_name
+                for member in self.group_configuration.cast.members
+            }
+            if self.group_configuration is not None
+            else {}
+        )
+        rows: list[ft.Control] = []
+        for event in snapshot.recent_events:
+            rows.append(
+                ft.Container(
+                    bgcolor="#242421",
+                    border_radius=10,
+                    padding=10,
+                    content=ft.Column(
+                        [
+                            ft.Text(event.reason, size=12, color=TEXT),
+                            ft.Text(
+                                (
+                                    f"{event.recorded_at.astimezone().strftime('%Y-%m-%d %H:%M')}"
+                                    f" / {event.meaning.value} / 強さ {event.severity}"
+                                ),
+                                size=10,
+                                color=MUTED,
+                            ),
+                            ft.Text(
+                                f"出典: {event.source_message_id or '利用者の直接操作'}",
+                                size=10,
+                                color=MUTED,
+                            ),
+                        ],
+                        spacing=4,
+                    ),
+                )
+            )
+        if not rows:
+            rows.append(ft.Text("この世界線には、まだ関係履歴がありません。", color=MUTED))
+
+        async def close() -> None:
+            self.page.pop_dialog()
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text(
+                    f"{names.get(snapshot.character_id, '人物')}との関係履歴"
+                ),
+                content=ft.Container(
+                    width=560,
+                    height=420,
+                    content=ft.Column(rows, spacing=8, scroll=ft.ScrollMode.AUTO),
+                ),
+                actions=[ft.TextButton("閉じる", on_click=close)],
+            )
+        )
 
     async def _refresh_memory_review(
         self, conversation_id: str, branch_id: str
@@ -2085,7 +2319,7 @@ class LocalChatApp:
         if event.ctrl and event.shift and event.key.lower() == "r":
             await self.restart_app()
 
-    def show_new_conversation_dialog(self) -> None:
+    async def show_new_conversation_dialog(self) -> None:
         if not self.characters or not self.models or not self._connection_ready():
             self._toast("無料運営の確認後に会話を作成できます。", ERROR)
             return
@@ -2112,6 +2346,26 @@ class LocalChatApp:
             for item in self.models
         ]
         model.value = recommended_name
+        continuities = await self.container.conversations.list_continuities()
+        continuity = self._dropdown("世界線")
+        continuity.options = [
+            ft.DropdownOption("__new__", "新しい関係で始める"),
+            *[
+                ft.DropdownOption(item.id, item.display_name)
+                for item in continuities
+            ],
+        ]
+        continuity.value = "__new__"
+        if self.selected_conversation_id is not None:
+            current = await self.container.relationship_profiles.continuity_for_conversation(
+                self.selected_conversation_id
+            )
+            continuity.value = current.id
+        continuity_help = ft.Text(
+            "同じ世界線を選ぶと、確認済みProfileと関係を引き継ぎます。",
+            size=10,
+            color=MUTED,
+        )
 
         async def change_connection() -> None:
             if not connection.value:
@@ -2151,6 +2405,11 @@ class LocalChatApp:
                     character.value,
                     connection.value,
                     model.value,
+                    continuity_id=(
+                        None
+                        if continuity.value == "__new__"
+                        else continuity.value
+                    ),
                 )
                 self.page.pop_dialog()
                 self.selected_conversation_id = conversation.id
@@ -2163,7 +2422,16 @@ class LocalChatApp:
             title="新しい会話",
             bgcolor="#24231F",
             content=ft.Column(
-                [title, character, connection, model], tight=True, width=420
+                [
+                    title,
+                    continuity,
+                    continuity_help,
+                    character,
+                    connection,
+                    model,
+                ],
+                tight=True,
+                width=420,
             ),
             actions=[
                 ft.Button("キャンセル", on_click=self._close_dialog),
@@ -2450,6 +2718,387 @@ class LocalChatApp:
                 show_close_icon=True,
             )
         )
+
+    async def show_profile_management(self) -> None:
+        conversation = self._selected_conversation()
+        if conversation is None:
+            return
+        continuity = (
+            await self.container.repository.get_continuity_for_conversation(
+                conversation.id
+            )
+        )
+        selected_event_id: str | None = None
+        item_list = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+        detail = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO)
+        dialog = ft.AlertDialog(
+            modal=True,
+            title="Profile管理",
+            bgcolor="#24231F",
+            content=ft.Container(
+                width=1050,
+                height=650,
+                content=ft.Row(
+                    [
+                        ft.Container(
+                            width=360,
+                            padding=12,
+                            bgcolor="#1D1D1B",
+                            border_radius=12,
+                            content=item_list,
+                        ),
+                        ft.VerticalDivider(width=1),
+                        ft.Container(expand=True, padding=12, content=detail),
+                    ],
+                    expand=True,
+                ),
+            ),
+            actions=[ft.Button("関係パネルへ戻る", on_click=self._close_dialog)],
+        )
+
+        async def render_editor(selected: ProfileItem | None) -> None:
+            kind = ft.TextField(
+                label="カテゴリ",
+                value=selected.item_kind if selected is not None else "基本",
+            )
+            name = ft.TextField(
+                label="Profile項目",
+                value=selected.item_name if selected is not None else "",
+            )
+            value = ft.TextField(
+                label="現在値",
+                value=selected.value if selected is not None else "",
+                multiline=True,
+                min_lines=1,
+                max_lines=4,
+            )
+            scope = ft.Dropdown(
+                label="共有範囲",
+                value=(
+                    selected.scope.value
+                    if selected is not None
+                    else ProfileScope.PROFILE_ONLY.value
+                ),
+                options=[
+                    ft.DropdownOption(ProfileScope.PROFILE_ONLY.value, "本人管理だけ"),
+                    ft.DropdownOption(ProfileScope.CONTINUITY.value, "この世界線"),
+                    ft.DropdownOption(
+                        ProfileScope.SELECTED_CHARACTERS.value, "選択中のキャラクター"
+                    ),
+                    ft.DropdownOption(
+                        ProfileScope.CONTINUITY_CAST.value, "現在の正式キャスト"
+                    ),
+                ],
+            )
+            sensitive_confirmation = ft.Checkbox(
+                label="秘密・健康・重大関係の変更内容と共有先を確認しました"
+            )
+            error = ft.Text("", size=10, color=ERROR)
+
+            async def save() -> None:
+                selected_kind = (kind.value or "").strip()
+                selected_name = (name.value or "").strip()
+                selected_value = (value.value or "").strip()
+                sensitive = selected_kind.casefold() in {
+                    "秘密",
+                    "secret",
+                    "健康",
+                    "health",
+                    "安全",
+                    "relationship",
+                }
+                if sensitive and not sensitive_confirmation.value:
+                    error.value = "このカテゴリは変更内容と共有先の明示確認が必要です。"
+                    self.page.update(dialog)
+                    return
+                if not selected_name or not selected_value:
+                    error.value = "項目名と現在値を入力してください。"
+                    self.page.update(dialog)
+                    return
+                chosen_scope = ProfileScope(
+                    scope.value or ProfileScope.PROFILE_ONLY.value
+                )
+                known_by: tuple[str, ...] = ()
+                if chosen_scope is ProfileScope.SELECTED_CHARACTERS:
+                    known_by = (
+                        (self.relationship_selected_character_id,)
+                        if self.relationship_selected_character_id is not None
+                        else ()
+                    )
+                elif (
+                    chosen_scope is ProfileScope.CONTINUITY_CAST
+                    and self.group_configuration is not None
+                ):
+                    known_by = tuple(
+                        member.character_id
+                        for member in self.group_configuration.cast.members
+                    )
+                saved = (
+                    await self.container.relationship_profiles.add_user_profile_item(
+                        conversation_id=conversation.id,
+                        item_kind=selected_kind,
+                        item_name=selected_name,
+                        value=selected_value,
+                        scope=chosen_scope,
+                        known_by_character_ids=known_by,
+                        operation_id=str(uuid4()),
+                        recorded_at=utc_now(),
+                        supersedes_event_id=(
+                            selected.event_id if selected is not None else None
+                        ),
+                    )
+                )
+                await render(saved.id)
+                self.page.update(dialog)
+
+            async def decide(state: str) -> None:
+                if selected is None:
+                    return
+                await self.container.relationship_profiles.decide_profile_item(
+                    user_profile_id=selected.user_profile_id,
+                    event_id=selected.event_id,
+                    state=state,
+                    operation_id=str(uuid4()),
+                    recorded_at=utc_now(),
+                )
+                await render()
+                self.page.update(dialog)
+
+            async def confirm() -> None:
+                await decide("confirmed")
+
+            async def reject() -> None:
+                await decide("rejected")
+
+            async def undo() -> None:
+                await decide("undone")
+
+            async def toggle_usage() -> None:
+                if selected is not None:
+                    await decide(
+                        "active"
+                        if selected.usage is ProfileUsageState.DISABLED
+                        else "disabled"
+                    )
+
+            purge_confirmation = ft.Checkbox(
+                label="この世界線のProfile全項目が削除対象であることを確認しました"
+            )
+
+            async def purge() -> None:
+                if not purge_confirmation.value:
+                    error.value = "完全削除の対象と、元会話が残ることを確認してください。"
+                    self.page.update(dialog)
+                    return
+                await self.container.relationship_profiles.purge_profile(
+                    user_profile_id=continuity.user_profile_id,
+                    request_id=str(uuid4()),
+                )
+                self.page.pop_dialog()
+                await self._refresh_relationship(conversation.id)
+                self.page.update(self.relationship_card, self.relationship_chip_row)
+
+            history_controls: list[ft.Control] = []
+            if selected is not None:
+                history = (
+                    await self.container.relationship_profiles.list_profile_history(
+                        selected.user_profile_id,
+                        selected.item_kind,
+                        selected.item_name,
+                    )
+                )
+                history_controls = [
+                    ft.Text(
+                        (
+                            f"{item.recorded_at.astimezone().strftime('%Y-%m-%d %H:%M')}"
+                            f" · {item.value} · {self._profile_creator_label(item)}"
+                        ),
+                        size=10,
+                        color=MUTED,
+                    )
+                    for item in history
+                ]
+            actions: list[ft.Control] = [
+                ft.Button(
+                    "変更を保存",
+                    icon=ft.Icons.SAVE_ROUNDED,
+                    color="#17120D",
+                    bgcolor=MINT,
+                    on_click=save,
+                )
+            ]
+            if (
+                selected is not None
+                and selected.approval is ProfileApproval.PENDING_CONFIRMATION
+            ):
+                actions.extend(
+                    [
+                        ft.Button("確認して利用", on_click=confirm),
+                        ft.Button("却下", on_click=reject),
+                    ]
+                )
+            elif selected is not None:
+                actions.extend(
+                    [
+                        ft.Button(
+                            (
+                                "利用を再開"
+                                if selected.usage is ProfileUsageState.DISABLED
+                                else "利用を停止"
+                            ),
+                            on_click=toggle_usage,
+                        ),
+                        ft.Button("元に戻す", on_click=undo),
+                    ]
+                )
+            detail.controls = [
+                ft.Text(
+                    "右: 現在値・作成者・出典・履歴・操作",
+                    size=10,
+                    color=MUTED,
+                ),
+                kind,
+                name,
+                value,
+                scope,
+                ft.Text(
+                    (
+                        f"作成者: {self._profile_creator_label(selected)}"
+                        if selected is not None
+                        else "作成者: 利用者"
+                    ),
+                    size=10,
+                    color=MUTED,
+                ),
+                ft.Text(
+                    (
+                        f"出典: {selected.source_message_id or '手動操作'}"
+                        if selected is not None
+                        else "出典: 手動操作"
+                    ),
+                    size=10,
+                    color=MUTED,
+                ),
+                sensitive_confirmation,
+                ft.Row(actions, wrap=True),
+                ft.Divider(),
+                ft.Text("履歴", weight=ft.FontWeight.W_600),
+                *history_controls,
+                ft.Divider(),
+                ft.Text("完全削除", color=ERROR, weight=ft.FontWeight.W_600),
+                ft.Text(
+                    "Profileと派生情報を削除します。元会話本文は残ります。",
+                    color=ERROR,
+                    size=11,
+                ),
+                purge_confirmation,
+                ft.Button(
+                    "完全削除",
+                    icon=ft.Icons.DELETE_FOREVER_ROUNDED,
+                    color=ERROR,
+                    bgcolor="#302522",
+                    on_click=purge,
+                ),
+                error,
+            ]
+
+        async def render(target_event_id: str | None = None) -> None:
+            nonlocal selected_event_id
+            items = await self.container.relationship_profiles.list_profile_items(
+                conversation.id
+            )
+            by_id = {item.event_id: item for item in items}
+            if target_event_id in by_id:
+                selected_event_id = target_event_id
+            elif selected_event_id not in by_id:
+                selected_event_id = next(iter(by_id), None)
+            selected = (
+                by_id.get(selected_event_id)
+                if selected_event_id is not None
+                else None
+            )
+            list_controls: list[ft.Control] = [
+                ft.Text(
+                    "左: 項目・カテゴリ・共有範囲・状態",
+                    size=10,
+                    color=MUTED,
+                )
+            ]
+            for item in items:
+                async def choose(event_id: str = item.event_id) -> None:
+                    await render(event_id)
+                    self.page.update(dialog)
+
+                list_controls.append(
+                    ft.Button(
+                        (
+                            f"{item.item_name} · {self._profile_scope_label(item.scope)}"
+                            f" · {self._profile_state_label(item)}"
+                        ),
+                        icon=(
+                            ft.Icons.CHECK_ROUNDED
+                            if item.event_id == selected_event_id
+                            else ft.Icons.CHEVRON_RIGHT_ROUNDED
+                        ),
+                        color=TEXT,
+                        bgcolor=(
+                            "#24443A"
+                            if item.event_id == selected_event_id
+                            else "#292925"
+                        ),
+                        on_click=choose,
+                    )
+                )
+
+            async def choose_new() -> None:
+                nonlocal selected_event_id
+                selected_event_id = None
+                await render_editor(None)
+                self.page.update(dialog)
+
+            list_controls.append(
+                ft.Button(
+                    "Profileを追加",
+                    icon=ft.Icons.ADD_ROUNDED,
+                    color="#17120D",
+                    bgcolor=MINT,
+                    on_click=choose_new,
+                )
+            )
+            item_list.controls = list_controls
+            await render_editor(selected)
+
+        await render()
+        self.page.show_dialog(dialog)
+
+    @staticmethod
+    def _profile_scope_label(scope: ProfileScope) -> str:
+        return {
+            ProfileScope.PROFILE_ONLY: "本人だけ",
+            ProfileScope.CONTINUITY: "この世界線",
+            ProfileScope.SELECTED_CHARACTERS: "指定人物",
+            ProfileScope.CONTINUITY_CAST: "正式キャスト",
+        }[scope]
+
+    @staticmethod
+    def _profile_state_label(item: ProfileItem) -> str:
+        if item.approval is ProfileApproval.PENDING_CONFIRMATION:
+            return "確認待ち"
+        return (
+            "利用停止"
+            if item.usage is ProfileUsageState.DISABLED
+            else "利用中"
+        )
+
+    @staticmethod
+    def _profile_creator_label(item: ProfileItem | None) -> str:
+        if item is None:
+            return "利用者"
+        return {
+            "user_asserted": "利用者",
+            "ai_auto_saved": "AI（Undo可能）",
+            "ai_proposed": "AI提案",
+        }[item.origin.value]
 
     async def _context_notice(self, message: str, is_warning: bool) -> None:
         self._toast(message, ERROR if is_warning else ACCENT)
