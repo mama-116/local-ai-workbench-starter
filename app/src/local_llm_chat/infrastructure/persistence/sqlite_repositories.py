@@ -1797,6 +1797,260 @@ class SQLiteAppRepository:
 
         await self._write(operation)
 
+    async def delete_archived_conversations(
+        self, conversation_ids: tuple[str, ...]
+    ) -> int:
+        if not conversation_ids:
+            return 0
+        if len(conversation_ids) != len(set(conversation_ids)):
+            raise ValidationError("ゴミ箱の削除対象に重複があります。")
+
+        def operation(connection: sqlite3.Connection) -> int:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, archived_at FROM conversations"
+            ).fetchall()
+            conversations = {str(row["id"]): row["archived_at"] for row in rows}
+            requested = set(conversation_ids)
+            archived = {
+                conversation_id
+                for conversation_id, archived_at in conversations.items()
+                if archived_at is not None
+            }
+            existing_requested = requested.intersection(conversations)
+            if not existing_requested and not archived:
+                return 0
+            if any(
+                conversations.get(conversation_id) is None
+                for conversation_id in existing_requested
+            ):
+                raise ValidationError(
+                    "ゴミ箱にない会話は完全削除できません。"
+                )
+            if requested != archived:
+                raise ValidationError(
+                    "ゴミ箱の内容が変更されました。もう一度確認してください。"
+                )
+
+            authorized_at = _now()
+            connection.executemany(
+                """
+                INSERT INTO conversation_deletion_guards(
+                    conversation_id, authorized_at
+                ) VALUES(?, ?)
+                """,
+                (
+                    (conversation_id, authorized_at)
+                    for conversation_id in conversation_ids
+                ),
+            )
+            statements = (
+                """
+                DELETE FROM computer_actions
+                WHERE run_id IN (
+                    SELECT id FROM computer_use_runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM computer_plan_approvals
+                WHERE run_id IN (
+                    SELECT id FROM computer_use_runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM computer_use_runs
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM agent_steps
+                WHERE run_id IN (
+                    SELECT id FROM agent_runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM agent_runs
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM turn_segments
+                WHERE turn_batch_id IN (
+                    SELECT id FROM turn_batches
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM turn_batches
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM canonical_memory_decisions
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM canonical_memory_event_knowledge
+                WHERE event_id IN (
+                    SELECT id FROM canonical_memory_events
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM canonical_memory_events
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM context_summaries
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM app_events
+                WHERE run_id IN (
+                    SELECT id FROM runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM telemetry_samples
+                WHERE run_id IN (
+                    SELECT id FROM runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM run_citations
+                WHERE run_id IN (
+                    SELECT id FROM runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM run_rag_usage
+                WHERE run_id IN (
+                    SELECT id FROM runs
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                UPDATE message_translations
+                SET reused_from_id = NULL
+                WHERE reused_from_id IN (
+                    SELECT translation.id
+                    FROM message_translations translation
+                    JOIN messages message ON message.id = translation.message_id
+                    WHERE message.conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM message_translations
+                WHERE message_id IN (
+                    SELECT id FROM messages
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM tool_calls
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM conversation_tool_folder_grants
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM conversation_documents
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM conversation_group_settings
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM conversation_cast_members
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM runs
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM branches
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM messages
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+            )
+            for statement in statements:
+                connection.execute(statement)
+            cursor = connection.execute(
+                """
+                DELETE FROM conversations
+                WHERE id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                  AND archived_at IS NOT NULL
+                """
+            )
+            if cursor.rowcount != len(conversation_ids):
+                raise PersistenceError(
+                    "ゴミ箱の会話をすべて削除できませんでした。"
+                )
+            return cursor.rowcount
+
+        return await self._write(operation)
+
     async def set_conversation_auto_translate(
         self, conversation_id: str, enabled: bool
     ) -> None:

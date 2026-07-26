@@ -229,6 +229,10 @@ class AppRepository(Protocol):
 
     async def restore_conversation(self, conversation_id: str) -> None: ...
 
+    async def delete_archived_conversations(
+        self, conversation_ids: tuple[str, ...]
+    ) -> int: ...
+
     async def set_conversation_auto_translate(
         self, conversation_id: str, enabled: bool
     ) -> None: ...

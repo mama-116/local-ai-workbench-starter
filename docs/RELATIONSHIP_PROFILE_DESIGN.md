@@ -2,7 +2,7 @@
 
 更新日: 2026-07-26
 
-意思決定: [ADR-0022](adr/0022-build-continuity-scoped-relationship-profiles.md)
+意思決定: [ADR-0023](adr/0023-build-continuity-scoped-relationship-profiles.md)
 
 関係性候補: [RELATIONSHIP_TAXONOMY.md](RELATIONSHIP_TAXONOMY.md)
 

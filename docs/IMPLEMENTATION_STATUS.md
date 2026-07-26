@@ -9,7 +9,7 @@
 - このPCとプライベートLAN内の複数Ollama接続、逐次応答、停止
 - 会話、キャラクター版、モデル設定、発言、分岐、実行状態の永続化
 - 発言書き直しと回答再生成で元を残す分岐
-- 会話のゴミ箱移動と復元、非active・非root分岐の非表示と復元（物理削除なし）
+- 会話のゴミ箱移動と復元、確認したゴミ箱内全会話の原子的な完全削除、非active・非root分岐の非表示と復元
 - 起動時の中断応答復旧
 - 解除不能な `strict_free` ガード
 - 3カラムのダークUIと独立したメッセージ吹き出し
@@ -60,6 +60,7 @@
 - [S-01〜S-09受入記録](acceptance/S01-S09-2026-07-17.md)（独立展開したPhase 0診断と各基準の試験手順・実績）
 - `pytest`: 457件成功（Windows固有条件により1件skip）
 - `mypy --strict`: 154ファイル、エラー0件
+- ゴミ箱表示時のID集合と実行時の全件一致、通常会話混入、内容変更、二重実行、正史記憶の削除ガード、共有設定・RAG資料・再利用翻訳の保持、途中失敗時の全rollback、UIの二段階確認と失敗表示を自動試験で確認
 - SQLiteへ100往復相当を保存して再初期化し、古い履歴をローカル要約した後も単独チャットの最終生成要求へ正史記憶と現在の利用者メッセージが残ることを自動試験で確認
 - 実Ollama `qwen3.5:9b` でも、100往復相当のSQLite履歴、再初期化、ローカル要約を経た単独チャットが、元発言を直接文脈へ残さず正史記憶 `LONG-MEMORY-REAL-731` を6.3秒で正確に回答することを専用一時DBで確認
 - TurnBatch末尾1か所の再生成操作から専用Application入口へ元AI応答IDとactive branch IDを渡し、成功・競合・二重操作・失敗・キャンセル・会話切替を自動試験で確認。実Ollama `qwen3.5:9b` でも、元TurnBatchを保持した子分岐への再生成とactive branch切替を1回確認
@@ -87,7 +88,7 @@
 
 ## 初版後へ送るもの
 
-- [Profile・世界線・関係形成](RELATIONSHIP_PROFILE_DESIGN.md)（ADR-0022、B案UI、[Profile管理3案比較](PROFILE_MANAGEMENT_UI_OPTIONS.md)に従い、世界線互換移行、Profile追記・確認・Undo・利用停止・完全削除、関係辞書・台帳・Reducer、出典付き関係解釈、単独・グループRelationship Context、常時チップ・右側関係パネル・2ペインProfile管理を実装。受入結果は [Issue #50受入記録](acceptance/relationship-profile-2026-07-26.md) を参照）
+- [Profile・世界線・関係形成](RELATIONSHIP_PROFILE_DESIGN.md)（ADR-0023、B案UI、[Profile管理3案比較](PROFILE_MANAGEMENT_UI_OPTIONS.md)に従い、世界線互換移行、Profile追記・確認・Undo・利用停止・完全削除、関係辞書・台帳・Reducer、出典付き関係解釈、単独・グループRelationship Context、常時チップ・右側関係パネル・2ペインProfile管理を実装。受入結果は [Issue #50受入記録](acceptance/relationship-profile-2026-07-26.md) を参照）
 - Phase 7Aの実UI接続、SQLite監査、UI Automation観測、実OS Broker（契約・Fake・B案レビュー部品まで実装済み。隔離環境未選定のため実入力は未実装）
 - Phase 7Bの許可フォルダー内の可逆なファイル整理と登録済みPowerShellレシピ（安全境界のみ決定、未実装。Phase 7A受入後に着手）
 - 意味検索が必要になった場合のローカル埋め込みモデル比較
