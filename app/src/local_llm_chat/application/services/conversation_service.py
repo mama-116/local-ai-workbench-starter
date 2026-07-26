@@ -77,6 +77,11 @@ class ConversationService:
     async def restore(self, conversation_id: str) -> None:
         await self._repository.restore_conversation(conversation_id)
 
+    async def empty_trash(self, conversation_ids: tuple[str, ...]) -> int:
+        return await self._repository.delete_archived_conversations(
+            conversation_ids
+        )
+
     async def set_auto_translate(self, conversation_id: str, enabled: bool) -> None:
         await self._repository.set_conversation_auto_translate(
             conversation_id, enabled
