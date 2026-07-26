@@ -1844,7 +1844,146 @@ class SQLiteAppRepository:
                     for conversation_id in conversation_ids
                 ),
             )
+            affected_profile_rows = connection.execute(
+                """
+                WITH RECURSIVE affected_profile_events(id, user_profile_id) AS (
+                    SELECT id, user_profile_id
+                    FROM profile_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id
+                        FROM conversation_deletion_guards
+                    )
+                    UNION
+                    SELECT child.id, child.user_profile_id
+                    FROM profile_events child
+                    JOIN affected_profile_events parent
+                      ON child.supersedes_event_id = parent.id
+                )
+                SELECT DISTINCT user_profile_id
+                FROM affected_profile_events
+                UNION
+                SELECT DISTINCT user_profile_id
+                FROM relationship_events
+                WHERE source_conversation_id IN (
+                    SELECT conversation_id
+                    FROM conversation_deletion_guards
+                )
+                """
+            ).fetchall()
+            profile_authorizations = tuple(
+                (str(uuid4()), str(row["user_profile_id"]))
+                for row in affected_profile_rows
+            )
+            connection.executemany(
+                """
+                INSERT INTO profile_purge_authorizations(
+                    request_id, user_profile_id
+                ) VALUES(?, ?)
+                """,
+                profile_authorizations,
+            )
             statements = (
+                """
+                DELETE FROM profile_capture_suppressions
+                WHERE source_message_id IN (
+                    SELECT id FROM messages
+                    WHERE conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_interpretations
+                WHERE user_profile_id IN (
+                    SELECT user_profile_id
+                    FROM profile_purge_authorizations
+                )
+                """,
+                """
+                DELETE FROM profile_derived_data
+                WHERE user_profile_id IN (
+                    SELECT user_profile_id
+                    FROM profile_purge_authorizations
+                )
+                """,
+                """
+                DELETE FROM relationship_decisions
+                WHERE target_event_id IN (
+                    SELECT id FROM relationship_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_event_knowledge
+                WHERE event_id IN (
+                    SELECT id FROM relationship_events
+                    WHERE source_conversation_id IN (
+                        SELECT conversation_id FROM conversation_deletion_guards
+                    )
+                )
+                """,
+                """
+                DELETE FROM relationship_events
+                WHERE source_conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM profile_decisions
+                WHERE target_event_id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
+                """
+                DELETE FROM profile_event_scopes
+                WHERE event_id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
+                """
+                DELETE FROM profile_events
+                WHERE id IN (
+                    WITH RECURSIVE affected_profile_events(id) AS (
+                        SELECT id FROM profile_events
+                        WHERE source_conversation_id IN (
+                            SELECT conversation_id
+                            FROM conversation_deletion_guards
+                        )
+                        UNION
+                        SELECT child.id
+                        FROM profile_events child
+                        JOIN affected_profile_events parent
+                          ON child.supersedes_event_id = parent.id
+                    )
+                    SELECT id FROM affected_profile_events
+                )
+                """,
                 """
                 DELETE FROM computer_actions
                 WHERE run_id IN (
@@ -2034,6 +2173,13 @@ class SQLiteAppRepository:
             )
             for statement in statements:
                 connection.execute(statement)
+            connection.executemany(
+                """
+                DELETE FROM profile_purge_authorizations
+                WHERE request_id = ?
+                """,
+                ((request_id,) for request_id, _ in profile_authorizations),
+            )
             cursor = connection.execute(
                 """
                 DELETE FROM conversations

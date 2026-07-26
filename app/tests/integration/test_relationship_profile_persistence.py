@@ -623,6 +623,66 @@ async def test_relationship_source_rejects_other_worldline_and_other_branch(
 
 
 @pytest.mark.asyncio
+async def test_empty_trash_removes_sourced_profile_and_relationship_data(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "app.sqlite3"
+    repository, service, conversation_id, continuity_id, character_id = (
+        await setup_conversation(database)
+    )
+    conversation = await repository.get_conversation(conversation_id)
+    continuity = await repository.get_continuity_for_conversation(conversation_id)
+    session = await repository.start_send(conversation_id, "紅茶が好きです")
+    await repository.finish_response(session, "覚えておきます", MessageState.COMPLETED)
+    sourced_profile = await service.propose_ai_profile_item(
+        conversation_id=conversation_id,
+        branch_id=conversation.active_branch_id,
+        source_message_id=session.user_message.id,
+        item_kind="preference",
+        item_name="飲み物",
+        value="紅茶",
+        low_risk_explicit=True,
+        recorded_at=NOW,
+    )
+    manual_profile = manual_profile_event(
+        continuity.user_profile_id,
+        "manual-profile",
+        value="ミナ",
+    )
+    await repository.append_profile_event(manual_profile, LedgerActor.USER)
+    sourced_relationship = relationship_event(
+        event_id="sourced-relationship",
+        continuity_id=continuity_id,
+        profile_id=continuity.user_profile_id,
+        character_id=character_id,
+        conversation_id=conversation_id,
+        branch_id=conversation.active_branch_id,
+        message_id=session.user_message.id,
+    )
+    await repository.append_relationship_event(
+        sourced_relationship, LedgerActor.USER
+    )
+
+    await repository.archive_conversation(conversation_id)
+    assert await repository.delete_archived_conversations((conversation_id,)) == 1
+
+    projected = await repository.project_profile(continuity.user_profile_id)
+    assert [item.event_id for item in projected] == [manual_profile.id]
+    assert all(item.event_id != sourced_profile.id for item in projected)
+    assert await repository.list_relationship_events(
+        continuity_id,
+        continuity.user_profile_id,
+        character_id,
+    ) == ()
+    with sqlite3.connect(database) as check:
+        check.execute("PRAGMA foreign_keys = ON")
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert check.execute(
+            "SELECT COUNT(*) FROM profile_purge_authorizations"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 async def test_relationship_candidate_rejects_character_outside_current_cast(
     tmp_path: Path,
 ) -> None:
