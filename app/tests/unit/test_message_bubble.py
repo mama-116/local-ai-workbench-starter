@@ -55,6 +55,35 @@ def _assistant() -> Message:
     )
 
 
+def _user() -> Message:
+    now = utc_now()
+    return Message(
+        id="user-1",
+        conversation_id="conversation-1",
+        parent_message_id=None,
+        source_message_id=None,
+        role=MessageRole.USER,
+        content="猫の名前はミケ",
+        state=MessageState.COMPLETED,
+        created_at=now,
+        completed_at=now,
+    )
+
+
+def test_user_message_can_offer_explicit_character_memory_action() -> None:
+    bubble = MessageBubble(_user(), on_remember=lambda: None)
+
+    actions = [
+        control
+        for control in _controls(bubble)
+        if isinstance(control, ft.IconButton)
+        and control.icon == ft.Icons.BOOKMARK_ADD_OUTLINED
+    ]
+
+    assert len(actions) == 1
+    assert actions[0].tooltip == "このキャラクターに覚えさせる"
+
+
 def test_answer_shows_used_sources_and_expandable_evidence() -> None:
     citation = MessageCitation(
         message_id="assistant-1",

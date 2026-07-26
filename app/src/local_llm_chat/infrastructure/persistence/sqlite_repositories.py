@@ -25,6 +25,14 @@ from local_llm_chat.domain.errors import (
     PersistenceError,
     ValidationError,
 )
+from local_llm_chat.domain.explicit_memory import (
+    MAX_EXPLICIT_MEMORY_VALUE_CHARACTERS,
+    ExplicitMemoryDecision,
+    ExplicitMemoryEvent,
+    ExplicitMemoryLedger,
+    ExplicitMemoryProjectionQuery,
+    ExplicitMemoryReviewItem,
+)
 from local_llm_chat.domain.group_turns import (
     MAX_FORMAL_CHARACTERS,
     ConversationCast,
@@ -1985,6 +1993,18 @@ class SQLiteAppRepository:
                 )
                 """,
                 """
+                DELETE FROM explicit_memory_decisions
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
+                DELETE FROM explicit_memory_events
+                WHERE conversation_id IN (
+                    SELECT conversation_id FROM conversation_deletion_guards
+                )
+                """,
+                """
                 DELETE FROM computer_actions
                 WHERE run_id IN (
                     SELECT id FROM computer_use_runs
@@ -3792,6 +3812,230 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def remember_explicit_memory(
+        self,
+        request_id: str,
+        conversation_id: str,
+        branch_id: str,
+        source_message_id: str,
+        expected_character_id: str,
+        value: str,
+        recorded_at: datetime,
+    ) -> ExplicitMemoryEvent:
+        normalized = value.strip()
+        if not request_id.strip() or not expected_character_id.strip():
+            raise ValidationError("明示記憶の操作情報が不足しています。")
+        if not normalized or len(normalized) > MAX_EXPLICIT_MEMORY_VALUE_CHARACTERS:
+            raise ValidationError("明示記憶は1文字以上200文字以内で入力してください。")
+
+        def operation(connection: sqlite3.Connection) -> ExplicitMemoryEvent:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_row = connection.execute(
+                "SELECT * FROM explicit_memory_events WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._explicit_memory_event_from_row(existing_row)
+                expected = (
+                    conversation_id,
+                    branch_id,
+                    source_message_id,
+                    expected_character_id,
+                    normalized,
+                )
+                actual = (
+                    existing.conversation_id,
+                    existing.branch_id,
+                    existing.source_message_id,
+                    existing.character_id,
+                    existing.value,
+                )
+                if actual != expected:
+                    raise ValidationError("同じ明示記憶操作を別の内容へ再利用できません。")
+                return existing
+
+            conversation = self._require_conversation(connection, conversation_id)
+            if conversation.active_branch_id != branch_id:
+                raise ValidationError("表示中の会話分岐が変わりました。")
+            settings = self._load_conversation_group_settings(
+                connection, conversation_id
+            )
+            if settings.enabled:
+                raise ValidationError("グループ会話では明示記憶を保存できません。")
+            character_row = connection.execute(
+                "SELECT character_id FROM character_versions WHERE id = ?",
+                (conversation.character_version_id,),
+            ).fetchone()
+            if (
+                character_row is None
+                or str(character_row["character_id"]) != expected_character_id
+            ):
+                raise ValidationError("選択中のキャラクターが変わりました。")
+            source = self._require_message(connection, source_message_id)
+            if (
+                source.conversation_id != conversation_id
+                or source.role is not MessageRole.USER
+                or source.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError("完了済みの利用者発言だけを記憶できます。")
+            visible_ids = {item.id for item in self._message_path(connection, branch_id)}
+            if source.id not in visible_ids:
+                raise ValidationError("表示中の分岐にない発言は記憶できません。")
+
+            event = ExplicitMemoryEvent(
+                id=str(uuid4()),
+                request_id=request_id,
+                conversation_id=conversation_id,
+                branch_id=branch_id,
+                source_message_id=source_message_id,
+                character_id=expected_character_id,
+                value=normalized,
+                recorded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO explicit_memory_events(
+                    id, request_id, conversation_id, branch_id,
+                    source_message_id, character_id, value, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.request_id,
+                    event.conversation_id,
+                    event.branch_id,
+                    event.source_message_id,
+                    event.character_id,
+                    event.value,
+                    _utc_iso(event.recorded_at),
+                ),
+            )
+            return event
+
+        return await self._write(operation)
+
+    async def undo_explicit_memory(
+        self,
+        decision_id: str,
+        conversation_id: str,
+        branch_id: str,
+        target_event_id: str,
+        expected_character_id: str,
+        recorded_at: datetime,
+    ) -> ExplicitMemoryDecision:
+        if not decision_id.strip() or not target_event_id.strip():
+            raise ValidationError("明示記憶のUndo情報が不足しています。")
+
+        def operation(connection: sqlite3.Connection) -> ExplicitMemoryDecision:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_row = connection.execute(
+                "SELECT * FROM explicit_memory_decisions WHERE id = ?",
+                (decision_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._explicit_memory_decision_from_row(existing_row)
+                if (
+                    existing.conversation_id != conversation_id
+                    or existing.target_event_id != target_event_id
+                ):
+                    raise ValidationError("同じUndo操作を別の記憶へ再利用できません。")
+                return existing
+
+            conversation = self._require_conversation(connection, conversation_id)
+            if conversation.active_branch_id != branch_id:
+                raise ValidationError("表示中の会話分岐が変わりました。")
+            settings = self._load_conversation_group_settings(
+                connection, conversation_id
+            )
+            if settings.enabled:
+                raise ValidationError("グループ会話では明示記憶を変更できません。")
+            character_row = connection.execute(
+                "SELECT character_id FROM character_versions WHERE id = ?",
+                (conversation.character_version_id,),
+            ).fetchone()
+            if (
+                character_row is None
+                or str(character_row["character_id"]) != expected_character_id
+            ):
+                raise ValidationError("選択中のキャラクターが変わりました。")
+            event_row = connection.execute(
+                "SELECT * FROM explicit_memory_events WHERE id = ?",
+                (target_event_id,),
+            ).fetchone()
+            if event_row is None:
+                raise ValidationError("明示記憶が見つかりません。")
+            event = self._explicit_memory_event_from_row(event_row)
+            visible_ids = {item.id for item in self._message_path(connection, branch_id)}
+            if (
+                event.conversation_id != conversation_id
+                or event.character_id != expected_character_id
+                or event.branch_id not in self._branch_lineage(
+                    connection, conversation_id, branch_id
+                )
+                or event.source_message_id not in visible_ids
+            ):
+                raise ValidationError("現在の会話から操作できない明示記憶です。")
+
+            prior = connection.execute(
+                """
+                SELECT * FROM explicit_memory_decisions
+                WHERE target_event_id = ?
+                """,
+                (target_event_id,),
+            ).fetchone()
+            if prior is not None:
+                raise ValidationError("明示記憶はすでに元に戻されています。")
+            decision = ExplicitMemoryDecision(
+                id=decision_id,
+                conversation_id=conversation_id,
+                target_event_id=target_event_id,
+                recorded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO explicit_memory_decisions(
+                    id, conversation_id, target_event_id, state, recorded_at
+                ) VALUES(?, ?, ?, 'undone', ?)
+                """,
+                (
+                    decision.id,
+                    decision.conversation_id,
+                    decision.target_event_id,
+                    _utc_iso(decision.recorded_at),
+                ),
+            )
+            return decision
+
+        return await self._write(operation)
+
+    async def project_explicit_memory(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        character_id: str,
+    ) -> tuple[ExplicitMemoryReviewItem, ...]:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[ExplicitMemoryReviewItem, ...]:
+            self._require_conversation(connection, conversation_id)
+            lineage = self._branch_lineage(connection, conversation_id, branch_id)
+            visible_ids = frozenset(
+                item.id for item in self._message_path(connection, branch_id)
+            )
+            events, decisions = self._load_explicit_memory_stream(
+                connection, conversation_id
+            )
+            return ExplicitMemoryLedger(events, decisions).project(
+                ExplicitMemoryProjectionQuery(
+                    conversation_id,
+                    lineage,
+                    character_id,
+                    visible_ids,
+                )
+            )
+
+        return await self._read(operation)
+
     async def start_send(self, conversation_id: str, content: str) -> RunSession:
         if not content.strip():
             raise ValidationError("メッセージを入力してください。")
@@ -5198,6 +5442,34 @@ class SQLiteAppRepository:
         )
         return events, decisions
 
+    def _load_explicit_memory_stream(
+        self, connection: sqlite3.Connection, conversation_id: str
+    ) -> tuple[
+        tuple[ExplicitMemoryEvent, ...],
+        tuple[ExplicitMemoryDecision, ...],
+    ]:
+        event_rows = connection.execute(
+            """
+            SELECT * FROM explicit_memory_events
+            WHERE conversation_id = ? ORDER BY recorded_at, id
+            """,
+            (conversation_id,),
+        ).fetchall()
+        decision_rows = connection.execute(
+            """
+            SELECT * FROM explicit_memory_decisions
+            WHERE conversation_id = ? ORDER BY sequence
+            """,
+            (conversation_id,),
+        ).fetchall()
+        return (
+            tuple(self._explicit_memory_event_from_row(row) for row in event_rows),
+            tuple(
+                self._explicit_memory_decision_from_row(row)
+                for row in decision_rows
+            ),
+        )
+
     @staticmethod
     def _validate_memory_ledger(
         events: tuple[CanonicalMemoryEvent, ...],
@@ -5905,6 +6177,32 @@ class SQLiteAppRepository:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             completed_at=_parse_time(row["completed_at"]),
             error_code=str(row["error_code"]) if row["error_code"] else None,
+        )
+
+    @staticmethod
+    def _explicit_memory_event_from_row(row: sqlite3.Row) -> ExplicitMemoryEvent:
+        return ExplicitMemoryEvent(
+            id=str(row["id"]),
+            request_id=str(row["request_id"]),
+            conversation_id=str(row["conversation_id"]),
+            branch_id=str(row["branch_id"]),
+            source_message_id=str(row["source_message_id"]),
+            character_id=str(row["character_id"]),
+            value=str(row["value"]),
+            recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+        )
+
+    @staticmethod
+    def _explicit_memory_decision_from_row(
+        row: sqlite3.Row,
+    ) -> ExplicitMemoryDecision:
+        if str(row["state"]) != "undone":
+            raise PersistenceError("明示記憶の判断状態が壊れています。")
+        return ExplicitMemoryDecision(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            target_event_id=str(row["target_event_id"]),
+            recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
         )
 
     @staticmethod

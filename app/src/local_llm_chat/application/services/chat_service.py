@@ -158,7 +158,14 @@ class ChatService:
                 session.branch_id,
                 character.character_id,
             )
-            memory_context = render_single_chat_memory_context(memory_facts)
+            explicit_memories = await self._repository.project_explicit_memory(
+                conversation.id,
+                session.branch_id,
+                character.character_id,
+            )
+            memory_context = render_single_chat_memory_context(
+                memory_facts, explicit_memories
+            )
         except asyncio.CancelledError:
             await self._repository.finish_response(
                 session,

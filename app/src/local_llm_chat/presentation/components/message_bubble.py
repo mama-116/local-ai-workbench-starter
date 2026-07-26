@@ -18,6 +18,7 @@ class MessageBubble(ft.Container):
         self,
         message: Message,
         on_rewrite: Callable[[], Any] | None = None,
+        on_remember: Callable[[], Any] | None = None,
         on_regenerate: Callable[[], Any] | None = None,
         translation: Translation | None = None,
         on_translate: Callable[[], Any] | None = None,
@@ -40,6 +41,16 @@ class MessageBubble(ft.Container):
                     icon_color="#AAA69D",
                     tooltip="この発言から書き直す",
                     on_click=on_rewrite,
+                )
+            )
+        if on_remember is not None:
+            actions.append(
+                ft.IconButton(
+                    icon=ft.Icons.BOOKMARK_ADD_OUTLINED,
+                    icon_size=16,
+                    icon_color="#AAA69D",
+                    tooltip="このキャラクターに覚えさせる",
+                    on_click=on_remember,
                 )
             )
         if on_regenerate is not None:
