@@ -197,6 +197,22 @@ async def test_new_and_existing_databases_migrate_once_with_independent_continui
                 "UPDATE conversations SET active_branch_id = ? WHERE id = ?",
                 (f"branch-{index}", f"conversation-{index}"),
             )
+        connection.executescript(
+            """
+            CREATE TABLE conversation_deletion_guards (
+                conversation_id TEXT PRIMARY KEY
+            );
+            CREATE TRIGGER trg_conversation_deletion_guard_archived_only
+            BEFORE INSERT ON conversation_deletion_guards
+            WHEN NOT EXISTS (
+                SELECT 1 FROM conversations
+                WHERE id = NEW.conversation_id AND archived_at IS NOT NULL
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'only archived conversations can be deleted');
+            END;
+            """
+        )
         connection.commit()
     finally:
         connection.close()
@@ -212,9 +228,21 @@ async def test_new_and_existing_databases_migrate_once_with_independent_continui
     assert first.continuity_id != second.continuity_id
     with sqlite3.connect(database) as check:
         assert check.execute(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version = 17"
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 22"
         ).fetchone() == (1,)
         assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert check.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name = 'trg_conversation_deletion_guard_archived_only'
+            """
+        ).fetchone() == (1,)
+        with pytest.raises(sqlite3.IntegrityError):
+            check.execute(
+                "INSERT INTO conversation_deletion_guards(conversation_id) "
+                "VALUES('missing')"
+            )
 
 
 @pytest.mark.asyncio

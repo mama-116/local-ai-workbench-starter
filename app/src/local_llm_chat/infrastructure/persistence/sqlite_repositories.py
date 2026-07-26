@@ -199,11 +199,32 @@ class SQLiteAppRepository:
                     continue
                 applied_at = _now().replace("'", "''")
                 migration_sql = migration_path.read_text(encoding="utf-8")
+                dependent_trigger_rows: list[sqlite3.Row] = []
+                if version == 22:
+                    dependent_trigger_rows = connection.execute(
+                        """
+                        SELECT name, sql
+                        FROM sqlite_master
+                        WHERE type = 'trigger'
+                          AND sql IS NOT NULL
+                          AND lower(sql) LIKE '%conversations%'
+                        ORDER BY name
+                        """
+                    ).fetchall()
+                drop_dependent_triggers = "\n".join(
+                    f'DROP TRIGGER "{str(row["name"]).replace('"', '""')}";'
+                    for row in dependent_trigger_rows
+                )
+                restore_dependent_triggers = "\n".join(
+                    str(row["sql"]) + ";" for row in dependent_trigger_rows
+                )
                 connection.commit()
                 connection.execute("PRAGMA foreign_keys = OFF")
                 connection.executescript(
                     "BEGIN IMMEDIATE;\n"
+                    f"{drop_dependent_triggers}\n"
                     f"{migration_sql}\n"
+                    f"{restore_dependent_triggers}\n"
                     "INSERT INTO schema_migrations(version, applied_at) "
                     f"VALUES({version}, '{applied_at}');\n"
                     "COMMIT;"
