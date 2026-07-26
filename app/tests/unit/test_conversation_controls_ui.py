@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, cast
 
 import flet as ft
 import pytest
 
+from local_llm_chat.domain.errors import PersistenceError
 from local_llm_chat.domain.models import BranchInfo, Conversation, utc_now
 from local_llm_chat.presentation.flet_app import LocalChatApp
 
@@ -23,9 +25,16 @@ def _conversation() -> Conversation:
 
 
 class _ConversationControls:
-    def __init__(self, branches: list[BranchInfo] | None = None) -> None:
+    def __init__(
+        self,
+        branches: list[BranchInfo] | None = None,
+        archived: list[Conversation] | None = None,
+    ) -> None:
         self.branches = branches or []
+        self.archived = archived or []
         self.translation_updates: list[tuple[str, bool]] = []
+        self.empty_trash_requests: list[tuple[str, ...]] = []
+        self.empty_trash_error: PersistenceError | None = None
 
     async def set_auto_translate(self, conversation_id: str, enabled: bool) -> None:
         self.translation_updates.append((conversation_id, enabled))
@@ -34,13 +43,26 @@ class _ConversationControls:
         assert conversation_id == "conversation-1"
         return self.branches
 
+    async def list_archived_conversations(self) -> list[Conversation]:
+        return self.archived
+
+    async def empty_trash(self, conversation_ids: tuple[str, ...]) -> int:
+        self.empty_trash_requests.append(conversation_ids)
+        if self.empty_trash_error is not None:
+            raise self.empty_trash_error
+        return len(conversation_ids)
+
 
 class _PageRecorder:
     def __init__(self) -> None:
         self.dialogs: list[ft.AlertDialog] = []
+        self.pop_count = 0
 
     def show_dialog(self, dialog: ft.AlertDialog) -> None:
         self.dialogs.append(dialog)
+
+    def pop_dialog(self) -> None:
+        self.pop_count += 1
 
 
 @pytest.mark.asyncio
@@ -115,4 +137,93 @@ async def test_branch_management_disables_root_and_active_but_allows_other_branc
         "非表示にする",
         "非表示にする",
         "非表示にする",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trash_separates_restore_from_confirmed_bulk_permanent_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _conversation()
+    second = replace(
+        first,
+        id="conversation-2",
+        title="Second",
+        active_branch_id="branch-2",
+    )
+    service = _ConversationControls(archived=[first, second])
+    page = _PageRecorder()
+    app = LocalChatApp.__new__(LocalChatApp)
+    app.container = cast(Any, type("Container", (), {"conversations": service})())
+    app.page = cast(Any, page)
+    app.selected_conversation_id = None
+    toasts: list[tuple[str, str]] = []
+
+    async def refresh_all(_: LocalChatApp) -> None:
+        return None
+
+    monkeypatch.setattr(LocalChatApp, "refresh_all", refresh_all)
+    monkeypatch.setattr(
+        LocalChatApp, "_toast", lambda _self, message, color: toasts.append((message, color))
+    )
+
+    await app.show_archive_dialog()
+
+    trash_dialog = page.dialogs[-1]
+    assert trash_dialog.title == "ゴミ箱"
+    assert isinstance(trash_dialog.content, ft.Column)
+    danger = cast(ft.Container, trash_dialog.content.controls[-1])
+    danger_column = cast(ft.Column, danger.content)
+    delete_button = cast(ft.Button, danger_column.controls[-1])
+    assert delete_button.content == "2件を完全に削除"
+
+    await cast(Any, delete_button.on_click)()
+
+    assert service.empty_trash_requests == []
+    confirmation = page.dialogs[-1]
+    assert confirmation.title == "2件の会話を完全に削除しますか？"
+    confirm_button = cast(ft.Button, confirmation.actions[-1])
+    assert confirm_button.content == "2件を完全に削除"
+
+    await cast(Any, confirm_button.on_click)()
+
+    assert service.empty_trash_requests == [
+        ("conversation-1", "conversation-2")
+    ]
+    assert page.pop_count == 2
+    assert toasts[-1][0] == "2件の会話を完全に削除しました。"
+
+
+@pytest.mark.asyncio
+async def test_trash_reports_database_failure_without_claiming_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _ConversationControls(archived=[_conversation()])
+    service.empty_trash_error = PersistenceError("injected failure")
+    page = _PageRecorder()
+    app = LocalChatApp.__new__(LocalChatApp)
+    app.container = cast(Any, type("Container", (), {"conversations": service})())
+    app.page = cast(Any, page)
+    app.selected_conversation_id = None
+    toasts: list[str] = []
+    monkeypatch.setattr(LocalChatApp, "refresh_all", lambda *_: None)
+    monkeypatch.setattr(
+        LocalChatApp, "_toast", lambda _self, message, _color: toasts.append(message)
+    )
+
+    await app.show_archive_dialog()
+    trash_dialog = page.dialogs[-1]
+    assert isinstance(trash_dialog.content, ft.Column)
+    danger = cast(ft.Container, trash_dialog.content.controls[-1])
+    danger_column = cast(ft.Column, danger.content)
+    delete_button = cast(ft.Button, danger_column.controls[-1])
+    await cast(Any, delete_button.on_click)()
+    confirmation = page.dialogs[-1]
+    confirm_button = cast(ft.Button, confirmation.actions[-1])
+
+    await cast(Any, confirm_button.on_click)()
+
+    assert page.pop_count == 1
+    assert toasts == [
+        "完全削除できませんでした。データは保持されています。 injected failure"
     ]

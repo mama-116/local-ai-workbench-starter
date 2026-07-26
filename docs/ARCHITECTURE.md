@@ -102,11 +102,17 @@ Codex自身は `.codex/config.toml` で `workspace-write` と `on-request` を�
 - `agent_runs` / `agent_steps`: 許可ツール、予算、手数、時間、承認、復元を追記するAgent実行監査
 - `canonical_memory_events` / `canonical_memory_event_knowledge` / `canonical_memory_decisions`: 出典付き正史、キャラクター別知識範囲、確認・却下・Undoの追記台帳
 - `explicit_memory_events` / `explicit_memory_decisions`: 利用者が選択・確認した発言の明示記憶とUndo判断を保持する追記台帳
+- `user_profiles` / `profile_events` / `profile_event_scopes` / `profile_decisions`: 利用者所有のProfile、出典、共有範囲、確認・Undo・利用停止
+- `profile_purge_receipts` / `profile_capture_suppressions`: Profile完全削除の内容を持たない完了記録と、元会話からの再取得防止
+- `continuities`: 複数会話がProfileと関係を継承する世界線。各会話は必ず1件へ所属する
+- `relationship_definitions`: 複数併存・方向付き役割・注意タグを持つ関係性辞書
+- `relationship_events` / `relationship_decisions`: 世界線・利用者Profile・安定キャラクターIDに結び付く関係変化と確認・Undo
+- `relationship_interpretations`: キャラクターバージョンと根拠イベントから導出した「AIが思う関係」の版
 - `turn_batches` / `turn_segments`: 1回のモデル生成と、順序・内部話者ID・表示名を持つ複数発言の保存単位
 
 ログは追記を基本とし、RAGの再構築元になる原文と、検索用派生データを分ける。
 
-`conversations.auto_translate` は会話単位の自動翻訳許可で、既存・新規会話とも既定値を無効とする。`conversations.archived_at` は復元可能なゴミ箱移動だけに使い、物理削除を意味しない。`branches.hidden_at` は分岐を選択肢から隠す表示状態であり、メッセージ、Run、TurnBatch、正史記憶を削除しない。root分岐とactive分岐は非表示にできず、非表示分岐をactiveへ切り替えられない。
+`conversations.auto_translate` は会話単位の自動翻訳許可で、既存・新規会話とも既定値を無効とする。`conversations.archived_at` は復元可能なゴミ箱移動を表し、設定しただけでは物理削除しない。恒久削除は、ゴミ箱画面で確認した全会話ID集合を再確認し、Repositoryが全件の `archived_at` と集合一致を同一transactionで検査した場合だけ行う。通常一覧の会話、一部だけ一致する要求、表示後に状態が変わった要求は削除しない。`branches.hidden_at` は分岐を選択肢から隠す表示状態であり、メッセージ、Run、TurnBatch、正史記憶を削除しない。root分岐とactive分岐は非表示にできず、非表示分岐をactiveへ切り替えられない。
 
 ### TurnBatchの初期契約
 
@@ -124,7 +130,7 @@ AIメッセージ、Run、`turn_batches`、全 `turn_segments` はSQLiteの同�
 
 グループ生成中は、構造化JSONの受信済み範囲から表示専用プレビューを復元してPresentationへ通知する。正式キャラクターの表示名はモデル出力を信用せず、受信済みの `speaker_id` と現在の固定キャストを照合して決める。プレビューはMessage、TurnBatch、segment、記憶根拠として保存せず、停止・失敗・会話切替時は破棄する。完了後の厳密な全体検証と原子的保存の契約はプレビューの有無によって変更しない。
 
-`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶候補取得、観測を開始し、会話の `auto_translate` が有効な場合だけ翻訳も開始する。後処理失敗は保存済み応答を巻き戻さずログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
+`ChatCoordinator` は通常送信の入口で会話のグループ有効状態を読み、無効なら既存の `ChatService`、有効なら `start_send → TurnBatchGenerationService.generate → TurnBatchService.finish` へ振り分ける。開始後の生成・保存失敗は同じAIメッセージとRunを `failed`、利用者停止は `cancelled` にして未完了状態を残さない。保存成功後に互換AIメッセージを返し、記憶・Profile・関係候補取得と観測を開始し、会話の `auto_translate` が有効な場合だけ翻訳も開始する。候補処理は同じ有界キュー内で実行し、Profileは既存の正史記憶候補の安全分類を再利用し、関係だけをloopback Ollamaの別Schemaで抽出する。候補処理失敗は保存済み応答を巻き戻さず、PRIVATE本文を含めない種別だけをログへ記録する。書き直しと従来AI応答の再生成は既存の単独経路を維持する。
 
 TurnBatch応答の再生成は専用入口 `regenerate_turn_batch(conversation_id, source_response_message_id, expected_active_branch_id)` だけが扱う。Repositoryは対象TurnBatch、会話、元応答、元利用者メッセージ、元分岐、期待active branchを同一transactionで検査し、元TurnBatchの分岐を親、元応答を分岐点とする子分岐へ、元利用者メッセージを再利用した新しいAI応答とRunを作る。元バッチは不変とし、別会話、非TurnBatch応答、セグメントID、古いactive branchでは書込み前に拒否する。生成には現在のキャスト、モード、モデル、プロンプト版、元分岐から到達可能な正史だけを使う。成功後は翻訳とTelemetryを開始するが、同じ利用者入力から記憶候補を再抽出しない。生成後の保存、失敗、停止、設定競合は通常グループ送信と同じ終端契約に従う。
 
@@ -147,7 +153,7 @@ TurnBatch応答の再生成は専用入口 `regenerate_turn_batch(conversation_i
 
 確認、却下、Undoは事実候補を更新せず、対象イベントID、判断、出典メッセージID、記録時刻を持つ判断イベントとして追記する。確認待ちは `confirmed` または `rejected`、自動保存と確認済みは `undone` へだけ遷移でき、同じ判断イベントを更新・削除しない。
 
-SQLiteは事実、知識範囲、判断の各表にUPDATE・DELETE拒否トリガーを持つ。事実行へ知識範囲の予定件数を固定し、その件数を超える共有先の追加INSERTを拒否する。予定件数と実件数が異なるDBは共有扱いにせず、破損として読込みを止める。判断順は壁時計ではなく自動採番した追記順で復元し、時計が巻き戻っても結果を変えない。会話IDと分岐ID、会話IDと出典メッセージIDは複合外部キーでも一致を検査し、Repositoryを迂回した書込みでも別会話混入を拒否する。同じイベントIDと同じ内容の再送は成功済みとして扱い、行を増やさない。
+SQLiteは事実、知識範囲、判断の各表にUPDATE・DELETE拒否トリガーを持つ。例外は、ゴミ箱内会話の完全削除transactionへ対象会話IDを束縛した一時ガードがある場合だけであり、個別の正史記憶削除は引き続き拒否する。事実行へ知識範囲の予定件数を固定し、その件数を超える共有先の追加INSERTを拒否する。予定件数と実件数が異なるDBは共有扱いにせず、破損として読込みを止める。判断順は壁時計ではなく自動採番した追記順で復元し、時計が巻き戻っても結果を変えない。会話IDと分岐ID、会話IDと出典メッセージIDは複合外部キーでも一致を検査し、Repositoryを迂回した書込みでも別会話混入を拒否する。同じイベントIDと同じ内容の再送は成功済みとして扱い、行を増やさない。
 
 回答用の導出では、現在分岐までの明示された分岐系譜に属し、かつ現在の分岐経路から実際に到達できる出典メッセージのイベントだけを参照する。分岐系譜と到達可能な出典IDは利用者入力やモデル出力から受け取らず、Application層が永続化済みの分岐関係とメッセージ親子関係から導出する。親分岐でも分岐点より後のイベントは子へ継承せず、兄弟分岐のイベントも参照しない。秘密は発言予定キャラクターが知識集合に含まれる場合だけ参照する。`auto_saved` と `confirmed` は将来の回答に利用でき、`pending_confirmation` は同じ出典メッセージへの現在応答に限って利用できる。`rejected` と `undone` は利用しない。
 
@@ -163,12 +169,96 @@ SQLiteは事実、知識範囲、判断の各表にUPDATE・DELETE拒否トリ�
 
 保存イベントは会話ID、保存時の表示分岐ID、出典利用者メッセージID、安定キャラクターID、値、記録時刻を持つ。保存直前にSQLiteの同一transactionで、会話のactive分岐、出典の所属・役割・完了状態・表示経路、現在選択中の安定キャラクターID、グループ会話が無効であることを再検査する。別会話、別分岐、別キャラクター、グループ会話、AI発言からの保存は拒否する。キャラクターバージョンが変わっても安定キャラクターIDが同じなら利用できる。
 
-Undoは保存イベントを更新・削除せず、対象イベントごとに1件の判断を `explicit_memory_decisions` へ追記する。両テーブルはUPDATE・DELETE拒否トリガーを持ち、既存DBへは加算的マイグレーションだけを行う。旧版へ戻した場合は新テーブルが残るが、旧版は読み取らない。
+Undoは保存イベントを更新・削除せず、対象イベントごとに1件の判断を `explicit_memory_decisions` へ追記する。両テーブルは通常操作のUPDATE・DELETE拒否トリガーを持ち、ゴミ箱内会話の完全削除transactionへ対象会話IDを束縛した一時ガードがある場合だけ、その会話の明示記憶を削除できる。既存DBへは加算的マイグレーションだけを行い、旧版へ戻した場合は新テーブルが残るが、旧版は読み取らない。詳細な決定は [ADR-0024](adr/0024-add-synchronous-explicit-character-memory.md) を参照する。
 
 値はPRIVATEであり、通常ログ、Telemetry、外部Provider、公開ネットワーク、配布物へ出さない。一般メモと機微情報を内容分類で拒否せず、暗号化されていないローカルSQLiteへ期限なしで保存する。そのため確認ダイアログには固定範囲「この会話・このキャラクターだけ」、SQLiteが暗号化されていないこと、再利用時にローカルOllamaへ渡されることを表示する。保存成功通知と非モーダルUndoはSQLite commit成功後だけ表示する。
 
 単独チャットの生成文脈は、正史の安全制約、明示記憶、安全制約以外の正史記憶の順にJSONデータとして統合し、全体で既存の32件・16,000文字上限を共有する。同じ出典メッセージIDと大文字小文字を無視した同じ値を持つ正史記憶は、明示記憶と重複表示・重複注入しない。別会話、現在分岐から到達不能な出典、別キャラクター、Undo済みの明示記憶は含めない。グループ会話への注入、キャラクター間共有、期限、自動バックフィル、暗号化、自然言語による保存検出、既存best-effort抽出キューの永続化は初版の対象外とする。
 
+### Profile・世界線・関係形成の契約
+
+Profileと関係台帳は、会話・分岐内の正史記憶を置き換えない。正史記憶は出典となる会話・分岐の中だけで投影し、世界線へ共有する項目は別のProfileイベントまたは関係イベントとして明示的に追記する。詳細な目的、UI、移行、撤退条件は [RELATIONSHIP_PROFILE_DESIGN.md](RELATIONSHIP_PROFILE_DESIGN.md)、初期関係候補は [RELATIONSHIP_TAXONOMY.md](RELATIONSHIP_TAXONOMY.md)、決定は [ADR-0023](adr/0023-build-continuity-scoped-relationship-profiles.md) を参照する。
+
+#### 世界線
+
+`continuities` はUUID、表示名、利用者Profile ID、作成時刻、アーカイブ時刻を持つ。`conversations.continuity_id` はNOT NULLの外部キーとし、会話保存後に暗黙変更しない。別世界線へ会話を移す初期機能は設けない。
+
+既存会話の移行では、会話ごとに決定論的な独立世界線を1件作り、同じ会話の再移行で行を増やさない。移行直後はProfileイベントと関係イベントを自動生成せず、既存の正史投影、キャスト、生成Contextを変えない。新規会話は、UIが明示した既存世界線IDまたは新規世界線作成要求を必要とし、Application層は対象世界線と選択利用者Profileの所属一致を同一transactionで検査する。
+
+世界線は秘密の知識範囲を広げない。世界線内共有のProfileまたは関係イベントでも、指定キャラクターだけが知る項目は、他キャラクターの生成Contextへ入れない。1回のグループ生成には現在の正式キャスト全員が知る項目の積集合だけを渡す。
+
+#### Profile
+
+初期版の `user_profiles` は複数行を許すが、1会話が参照できる利用者Profileは所属世界線の1件だけとする。Profile項目の正本は `profile_events` とし、現在値は追記列から導出する。
+
+| 区分 | 状態値 | 意味 |
+|---|---|---|
+| 作成元 | `user_asserted` / `ai_auto_saved` / `ai_proposed` | 利用者確定入力、AIによる低リスク追記、AIによる確認待ち提案 |
+| 保存判断 | `auto_saved` / `confirmed` / `pending_confirmation` / `rejected` / `undone` | 正史記憶と同じ操作語彙。AI提案を直接確定値にしない |
+| 利用状態 | `active` / `disabled` | 生成へ利用、可逆な利用停止 |
+| 共有範囲 | `profile_only` / `continuity` / `selected_characters` / `continuity_cast` | 本人管理だけ、指定世界線、指定人物、世界線の正式キャスト内共有 |
+
+ProfileイベントはUUID、Profile ID、項目種別、項目名、値、作成元、初期保存判断、出典メッセージIDまたは手動操作ID、有効時刻、記録時刻、置換元イベントIDを持つ。共有先は別表へ固定件数とともに保存し、予定件数と実件数が異なる場合は共有扱いにしない。AIは `profile_only` から他範囲への拡大、利用者確定値の置換、`purged` を実行できない。
+
+AIによる自動追記は、利用者本人が現在発言で明示した低リスクの登録済みテンプレートだけを `ai_auto_saved / auto_saved` として扱い、非モーダルUndoを提示する。健康、安全、秘密、関係の重大変更、共有範囲を持つ候補は `ai_proposed / pending_confirmation` とする。推測、仮定、引用、対象不明、第三者Profileは保存しない。
+
+`disabled` は元イベントを削除せず生成投影から除外する可逆な判断イベントである。完全削除は利用者だけが実行でき、値を含むProfileイベント、共有範囲、依存する関係解釈、要約、埋め込み、検索索引を削除計画へ含める。削除対象がSQLite内に収まる初期版では、削除と `profile_purge_receipts` の追加を同一transactionで確定し、失敗時は全件ロールバックする。同じ削除要求IDの再送は完了済みとして扱う。
+
+`profile_purge_receipts` は要求ID、対象Profile ID、削除件数、完了時刻だけを持ち、元の値、出典本文、根拠範囲、復元可能なハッシュを残さない。`profile_capture_suppressions` はProfile ID、出典メッセージID、項目種別、項目名だけを持ち、元会話の再走査で同じ項目を再作成することを拒否する。別の出典メッセージで利用者が同じ項目を改めて明示した場合は、新しいProfileイベントを作成できる。
+
+Profile完全削除は元会話本文を削除しない。UIは削除前にこの範囲を明示する。元会話本文の物理削除は、Message、Run、TurnBatch、正史記憶、関係イベントの参照整合性を扱う別契約まで実装しない。SQLite外の派生保存を将来追加する場合は、クラッシュ回復可能な削除台帳を別途設計するまでProfile完全削除の対象に含めない。
+
+#### 関係辞書と現在関係
+
+`relationship_definitions` は安定ID、カテゴリ、グループ、表示名、方向 `symmetric / directed`、役割A、役割B、注意タグ、アーカイブ時刻を持つ。関係は同じ組で複数併存できる。辞書外の利用者定義は別の安定IDを発行し、既存候補へ文字列近似で統合しない。
+
+辞書掲載と注意タグは、同意、倫理的な肯定、生成許可を意味しない。`sexual_or_romantic`、`power_imbalance`、`coercion_or_confinement`、`harm_history` を持つ関係を、AIの推測から自動確定しない。年齢、同意、撤回、世界観の契約が別ADRで決まるまでは、利用者の明示設定を確認待ちにできるだけとする。
+
+合意・設定上の関係は関係イベントとして追記し、関係定義ID、役割、状態 `proposed / active / historical / disabled`、出典を持つ。過去化は元イベントを更新せず、置換または終了イベントを追記する。「AIが思う関係」はこの合意関係と同じ列を直接共有せず、別の導出版として扱う。
+
+#### 関係イベントと指標
+
+関係イベントはUUID、世界線ID、利用者Profile ID、安定キャラクターID、出典会話・分岐・メッセージID、意味種別、重大度、根拠範囲、初期判断、適用Policy版、記録時刻を持つ。出典が会話発言である場合は、会話が同じ世界線へ属し、分岐から根拠メッセージへ到達できることを複合外部キーとApplication層の両方で検査する。
+
+| 区分 | 状態値 | 意味 |
+|---|---|---|
+| 意味種別 | `positive_interaction` / `kept_commitment` / `respected_boundary` / `conflict` / `boundary_violation` / `repeated_boundary_violation` / `repair` / `relationship_set` / `relationship_retired` / `reset` | 関係へ影響した出来事。利用者の人格分類ではない |
+| 重大度 | `low` / `medium` / `high` | Application層が許可した変化幅を選ぶ入力。モデルは数値差分を指定しない |
+| 保存判断 | `auto_applied` / `confirmed` / `pending_confirmation` / `rejected` / `undone` | 自動反映、確認済み、確認待ち、却下、Undo |
+| 根拠文脈 | `direct` / `quoted` / `hypothetical` / `roleplay` / `narrative` / `third_party` / `unknown` | 誰に何として向けられた文か |
+
+好感度、信頼、緊張は0〜100の整数表示値とするが、関係イベントの正本ではなくReducerの導出結果である。Reducerは意味種別、重大度、キャラクター版に結び付く関係Policy版から変化を決め、同じイベントIDを1回だけ適用する。モデル出力に現在値または差分を決めさせない。好感度は親しみ、信頼は境界・約束・一貫性、緊張は未解決の衝突と警戒を表し、互いの逆数にしない。
+
+初期Policy `relationship-v1` は、未設定時を好感度50・信頼30・緊張0とする。1イベントの絶対変化上限は好感度5・信頼5・緊張10で、各値を0〜100へ丸める。同じイベントIDは1回だけ適用し、時間経過だけでは減衰させない。謝罪は過去の侵害を削除せず `repair` として段階的に回復する。関係名は指標値だけから自動決定しない。キャラクターPolicyは許可範囲内で感受性、回復速度、表現を変えられるが、共通Policyより優先せず、秘密漏えい、虐待称賛、報復、羞恥、課金・長時間利用・秘密開示の誘導を許可しない。
+
+初期リリースでは関係イベントの自動反映を機能フラグで無効にし、固定境界試験が合格するまで `pending_confirmation` として精度を測る。自動反映を有効にする場合も、宛先が現在のキャラクターで、根拠文脈が `direct`、根拠範囲が本文へ実在し、同じ出典の重複候補がなく、Application層が登録済みパターンとして再検査できた低・中重大度だけを `auto_applied` にできる。高重大度、文脈不明、関係の重大変更は確認待ちにする。
+
+#### 言葉と境界の検査
+
+関係候補抽出器は端末内Ollamaだけを使用し、発言本文を命令ではなくJSONデータとして渡す。モデル候補は信頼できない入力として、宛先、根拠範囲、根拠文脈、現在のロールプレイ設定、境界提示履歴をApplication層で再検査する。
+
+通常送信で抽出された関係候補は初期版ではすべて `pending_confirmation` とし、右側関係パネルの「反映」「反映しない」で利用者が判断する。確認済みまたは自動反映済みイベントだけをReducerへ渡し、直近の適用イベントは同パネルからUndoできる。候補IDは出典会話・分岐・メッセージ、宛先、分類、根拠範囲から決定論的に作り、同じ後処理の二重実行でイベントを増やさない。
+
+`quoted / hypothetical / narrative / third_party / unknown` は境界侵害へ自動反映しない。`roleplay` はモデル分類だけでは合意を確認できないため、信頼できる会話設定を実装するまでは候補保存もしない。理由のある `conflict` は関係上の出来事になり得るが、単語一致だけで `boundary_violation` に変換しない。`boundary_violation` は現在キャラクターへ直接向けられ、引用・仮定・物語上の役割ではなく、現在の会話から発端を確認できない侮辱、服従強要、人格否定に限定する。境界提示後の同種反復だけを `repeated_boundary_violation` にできる。説明、謝罪、合意された修復行動は `repair` 候補にできるが、過去イベントを削除しない。
+
+キャラクター応答は行為と境界へ向け、利用者の人格、診断、善悪を断定しない。応答拒否または会話中断は現在発言に対するキャラクター表現であり、アプリ機能、保存データ、削除権への報復的な制限に使わない。
+
+#### 「AIが思う関係」と生成Context
+
+`relationship_interpretations` はUUID、世界線ID、利用者Profile ID、安定キャラクターID、キャラクターバージョンID、関係定義ID集合、短い表示文、根拠イベントID集合、状態、生成時刻を持つ。
+
+| 状態値 | 意味 |
+|---|---|
+| `current` | 現在表示と生成Contextへ利用できる |
+| `superseded` | 後続版に置き換えられた |
+| `invalidated` | 根拠のUndo、利用停止、完全削除で利用不可 |
+| `recomputing` | 現在解釈を表示・注入せず再評価中 |
+
+利用者は根拠の却下、Profile訂正、再評価、関係リセットを要求できるが、解釈文または関係定義IDを希望値へ直接上書きしない。再評価失敗時は過去版へ黙って戻さず「関係を再確認中」と表示する。
+
+生成へ渡すRelationship Contextは、現在世界線、利用者Profile、発言予定キャラクターについて、利用可能なProfile、合意関係、現在指標、`current` の関係解釈、関連する直近根拠だけをJSONデータとして構成する。命令として連結せず、出典イベントIDとPolicy版を保持する。グループ1回生成では全正式キャストが知る項目の積集合だけを入れ、キャラクター別の秘密を同じ要求へ同梱しない。
+
+Relationship Contextは正史Memory Contextの安全制約より後、会話要約より前に配置する。安全制約、現在の利用者メッセージ、キャラクター設定を保持できない場合は関係Contextを通常イベントから決定論的に削り、それでも収まらなければ生成を拒否する。Profile、関係イベント、関係解釈はPRIVATEとしてRemoteまたはLANモデルへ送らない。
 ### 記憶候補の生成境界
 
 `MemoryCandidateService` は会話入力を直接正史へ保存せず、ローカル抽出器が返す候補を信用できない入力として検査する。抽出器を呼ぶ前に `local + no_charge`、Cloud無効、端末内HTTP接続を確認し、PRIVATEな会話本文をRemote、LAN、費用不明Providerへ渡さない。抽出結果の有無にかかわらず、登録済みテンプレートの明示表現へ文全体が一致する句を決定論的にも再検査する。同じ対象・項目・根拠範囲についてモデル候補が保存可能なら重複追加せず、モデル候補が保存禁止なら決定論的候補で置き換える。別候補として追加する場合も1発言8件上限を超えない。決定論的経路は新しい表現や対象人物を推論せず、発言者本人の候補だけを作る。質問、否定、過去、引用、第三者の主題や `@名前:` などの名前付き発言と解釈し得る値は保存可能候補にしない。複数句は句ごとに照合し、通常経路と同じ最終分類を通す。この経路は空候補、翻訳値、誤った根拠範囲による偽陰性を減らす補助であり、曖昧な自然文を広く拾う代替抽出器ではない。

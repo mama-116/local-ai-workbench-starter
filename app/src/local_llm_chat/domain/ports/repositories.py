@@ -39,6 +39,18 @@ from local_llm_chat.domain.models import (
     ToolCallRequest,
     ToolFolderGrant,
 )
+from local_llm_chat.domain.relationship_profile import (
+    Continuity,
+    LedgerActor,
+    ProfileEvent,
+    ProfileItem,
+    ProfilePurgeReceipt,
+    RelationshipDefinition,
+    RelationshipEvent,
+    RelationshipInterpretation,
+    RelationshipMetrics,
+    UserProfile,
+)
 from local_llm_chat.domain.states import (
     ContextSummaryState,
     MemoryApprovalState,
@@ -114,6 +126,7 @@ class AppRepository(Protocol):
         title: str,
         character_version_id: str,
         model_profile_id: str,
+        continuity_id: str | None = None,
     ) -> Conversation: ...
 
     async def list_conversations(self) -> list[Conversation]: ...
@@ -121,6 +134,94 @@ class AppRepository(Protocol):
     async def list_archived_conversations(self) -> list[Conversation]: ...
 
     async def get_conversation(self, conversation_id: str) -> Conversation: ...
+
+    async def get_continuity_for_conversation(
+        self, conversation_id: str
+    ) -> Continuity: ...
+
+    async def list_continuities(self) -> tuple[Continuity, ...]: ...
+
+    async def get_user_profile(self, user_profile_id: str) -> UserProfile: ...
+
+    async def append_profile_event(
+        self, event: ProfileEvent, actor: LedgerActor
+    ) -> None: ...
+
+    async def decide_profile_event(
+        self,
+        *,
+        decision_id: str,
+        user_profile_id: str,
+        target_event_id: str,
+        state: str,
+        actor: LedgerActor,
+        recorded_at: datetime,
+    ) -> None: ...
+
+    async def project_profile(
+        self,
+        user_profile_id: str,
+        *,
+        character_ids: tuple[str, ...] = (),
+        include_disabled: bool = False,
+    ) -> tuple[ProfileItem, ...]: ...
+
+    async def list_profile_history(
+        self, user_profile_id: str, item_kind: str, item_name: str
+    ) -> tuple[ProfileItem, ...]: ...
+
+    async def list_profile_items_for_management(
+        self, user_profile_id: str
+    ) -> tuple[ProfileItem, ...]: ...
+
+    async def purge_profile(
+        self,
+        *,
+        request_id: str,
+        user_profile_id: str,
+        actor: LedgerActor,
+    ) -> ProfilePurgeReceipt: ...
+
+    async def list_relationship_definitions(
+        self,
+    ) -> tuple[RelationshipDefinition, ...]: ...
+
+    async def append_relationship_event(
+        self, event: RelationshipEvent, actor: LedgerActor
+    ) -> None: ...
+
+    async def decide_relationship_event(
+        self,
+        *,
+        decision_id: str,
+        user_profile_id: str,
+        target_event_id: str,
+        state: str,
+        actor: LedgerActor,
+        recorded_at: datetime,
+    ) -> None: ...
+
+    async def list_relationship_events(
+        self,
+        continuity_id: str,
+        user_profile_id: str,
+        character_id: str,
+        *,
+        visible_to_character_ids: tuple[str, ...] = (),
+        include_unapplied: bool = False,
+    ) -> tuple[RelationshipEvent, ...]: ...
+
+    async def project_relationship_metrics(
+        self, continuity_id: str, user_profile_id: str, character_id: str
+    ) -> RelationshipMetrics: ...
+
+    async def save_relationship_interpretation(
+        self, interpretation: RelationshipInterpretation, actor: LedgerActor
+    ) -> None: ...
+
+    async def get_current_relationship_interpretation(
+        self, continuity_id: str, user_profile_id: str, character_id: str
+    ) -> RelationshipInterpretation | None: ...
 
     async def update_conversation_selection(
         self,
@@ -132,6 +233,10 @@ class AppRepository(Protocol):
     async def archive_conversation(self, conversation_id: str) -> None: ...
 
     async def restore_conversation(self, conversation_id: str) -> None: ...
+
+    async def delete_archived_conversations(
+        self, conversation_ids: tuple[str, ...]
+    ) -> int: ...
 
     async def set_conversation_auto_translate(
         self, conversation_id: str, enabled: bool

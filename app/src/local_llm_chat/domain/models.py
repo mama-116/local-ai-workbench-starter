@@ -91,6 +91,7 @@ class Conversation:
     updated_at: datetime
     archived_at: datetime | None = None
     auto_translate: bool = False
+    continuity_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

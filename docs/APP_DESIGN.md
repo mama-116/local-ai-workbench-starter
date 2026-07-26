@@ -40,7 +40,7 @@ Windows PC上で外部ブラウザを起動せず、Ollamaのローカルモデ�
 - クラウド同期、アカウント、複数PC同期
 - Ollama Cloud、Ollama Web Search、クラウドモデル、有料・無料枠付きAPI
 - APIキー、クレジットカード、請求先を登録する画面
-- 会話の恒久削除。初版はアーカイブと復元だけを提供する
+- 通常一覧からの会話の恒久削除、自動削除、選択式削除。初回リリース後の追加機能として、ゴミ箱内全件の確認付き一括削除だけを [TRASH_DELETION_DESIGN.md](TRASH_DELETION_DESIGN.md) に従って提供する
 - Ollama以外の実動Provider。交換用の契約とテスト用Fakeだけを用意する
 
 ### 恒久的に避ける
@@ -262,7 +262,7 @@ Serviceで防ぐ規則:
 - active branchのheadがそのbranchから到達可能であること
 - 終端状態のmessage本文とrun設定を更新しないこと
 
-SQLiteは `foreign_keys=ON`、WAL、`busy_timeout` を有効にする。`active_branch_id` はcommit時に必須とし、`head_message_id` はまだ発言がない空のbranchだけNULLを許す。スキーマ更新前にはDBを閉じてバックアップを作り、更新失敗時は元ファイルへ戻す。初版では物理削除を行わず、会話とプロフィールは `archived_at` で非表示にする。
+SQLiteは `foreign_keys=ON`、WAL、`busy_timeout` を有効にする。`active_branch_id` はcommit時に必須とし、`head_message_id` はまだ発言がない空のbranchだけNULLを許す。スキーマ更新前にはDBを閉じてバックアップを作り、更新失敗時は元ファイルへ戻す。会話とプロフィールは `archived_at` で非表示にする。会話の物理削除は、ゴミ箱で表示・再確認した全件のID集合に限り、[TRASH_DELETION_DESIGN.md](TRASH_DELETION_DESIGN.md) の原子的削除契約に従う。
 
 このリポジトリでのDBとバックアップは、起動方法に依存しない `app/.local-data` へ置き、Git対象外にする。`LOCAL_LLM_CHAT_DATA_DIR` が明示された場合だけその許可済み保存先を優先する。Fletの開発起動ごとに変わり得る `FLET_APP_STORAGE_DATA` は、リポジトリ外へインストールした配布版のフォールバックに限定する。持ち運び版が必要になった場合は、データ移行方法を決めてから保存場所を変更する。
 

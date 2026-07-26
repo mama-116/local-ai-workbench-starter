@@ -38,6 +38,11 @@ END;
 
 CREATE TRIGGER trg_explicit_memory_events_no_delete
 BEFORE DELETE ON explicit_memory_events
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM conversation_deletion_guards
+    WHERE conversation_id = OLD.conversation_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'explicit memory is append-only');
 END;
@@ -50,6 +55,11 @@ END;
 
 CREATE TRIGGER trg_explicit_memory_decisions_no_delete
 BEFORE DELETE ON explicit_memory_decisions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM conversation_deletion_guards
+    WHERE conversation_id = OLD.conversation_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'explicit memory is append-only');
 END;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,52 @@ async def test_explicit_memory_follows_character_identity_and_undo_is_append_onl
         )
     )
     assert restored.id != saved.id
+
+
+@pytest.mark.asyncio
+async def test_empty_trash_deletes_explicit_memory_with_its_conversation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = SQLiteAppRepository(database_path)
+    await repository.initialize()
+    character = await repository.create_character_version("アリス", "初版")
+    profile = await repository.ensure_model_profile("ollama-local", "model", {})
+    conversation = await repository.create_conversation(
+        "削除する会話", character.id, profile.id
+    )
+    session = await repository.start_send(conversation.id, "猫の名前はミケ")
+    service = ExplicitMemoryService(repository)
+    saved = await service.remember(
+        RememberExplicitMemoryRequest(
+            "dialog-delete",
+            conversation.id,
+            session.branch_id,
+            session.user_message.id,
+            character.character_id,
+            "猫の名前はミケ",
+        )
+    )
+    await service.undo(
+        UndoExplicitMemoryRequest(
+            conversation.id,
+            session.branch_id,
+            saved.id,
+            character.character_id,
+        )
+    )
+
+    await repository.archive_conversation(conversation.id)
+    assert await repository.delete_archived_conversations((conversation.id,)) == 1
+
+    with sqlite3.connect(database_path) as check:
+        assert check.execute(
+            "SELECT COUNT(*) FROM explicit_memory_events"
+        ).fetchone() == (0,)
+        assert check.execute(
+            "SELECT COUNT(*) FROM explicit_memory_decisions"
+        ).fetchone() == (0,)
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 @pytest.mark.asyncio
