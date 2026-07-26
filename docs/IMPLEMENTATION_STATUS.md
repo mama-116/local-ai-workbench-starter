@@ -58,8 +58,8 @@
 ## 検証済み
 
 - [S-01〜S-09受入記録](acceptance/S01-S09-2026-07-17.md)（独立展開したPhase 0診断と各基準の試験手順・実績）
-- `pytest`: 453件成功（Windows固有条件により1件skip）
-- `mypy --strict`: 153ファイル、エラー0件
+- `pytest`: 457件成功（Windows固有条件により1件skip）
+- `mypy --strict`: 154ファイル、エラー0件
 - SQLiteへ100往復相当を保存して再初期化し、古い履歴をローカル要約した後も単独チャットの最終生成要求へ正史記憶と現在の利用者メッセージが残ることを自動試験で確認
 - 実Ollama `qwen3.5:9b` でも、100往復相当のSQLite履歴、再初期化、ローカル要約を経た単独チャットが、元発言を直接文脈へ残さず正史記憶 `LONG-MEMORY-REAL-731` を6.3秒で正確に回答することを専用一時DBで確認
 - TurnBatch末尾1か所の再生成操作から専用Application入口へ元AI応答IDとactive branch IDを渡し、成功・競合・二重操作・失敗・キャンセル・会話切替を自動試験で確認。実Ollama `qwen3.5:9b` でも、元TurnBatchを保持した子分岐への再生成とactive branch切替を1回確認

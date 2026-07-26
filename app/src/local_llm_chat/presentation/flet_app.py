@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
@@ -83,6 +84,38 @@ PANEL_ALT = "#1D1D1B"
 TEXT = "#E8E4DC"
 MUTED = "#969188"
 ERROR = "#D87866"
+RELATIONSHIP_EFFECT_SECONDS = 0.9
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipAffinityEffect:
+    conversation_id: str
+    character_id: str
+    previous_affinity: int
+    current_affinity: int
+    delta: int
+    badge_label: str
+    color: str
+
+
+def _relationship_affinity_effect(
+    conversation_id: str,
+    character_id: str,
+    previous_affinity: int,
+    current_affinity: int,
+) -> RelationshipAffinityEffect | None:
+    delta = current_affinity - previous_affinity
+    if delta == 0:
+        return None
+    return RelationshipAffinityEffect(
+        conversation_id=conversation_id,
+        character_id=character_id,
+        previous_affinity=previous_affinity,
+        current_affinity=current_affinity,
+        delta=delta,
+        badge_label=f"{delta:+d}",
+        color=MINT if delta > 0 else ACCENT,
+    )
 
 
 def _latest_tool_audit(audits: list[ToolCallAudit]) -> ToolCallAudit | None:
@@ -113,6 +146,8 @@ class LocalChatApp:
         self.group_configuration: ConversationGroupConfiguration | None = None
         self.relationship_snapshots: dict[str, CharacterRelationshipSnapshot] = {}
         self.relationship_selected_character_id: str | None = None
+        self._relationship_effect: RelationshipAffinityEffect | None = None
+        self._relationship_effect_task: asyncio.Task[None] | None = None
         self.memory_review = MemoryReviewSnapshot((), ())
         self._new_memory_event_ids: list[str] = []
         self._memory_notice_conversation_id: str | None = None
@@ -1083,21 +1118,55 @@ class LocalChatApp:
             else {}
         )
         chips: list[ft.Control] = []
+        conversation = self._selected_conversation()
         for character_id, chip_snapshot in self.relationship_snapshots.items():
-            async def select_relationship(target_id: str = character_id) -> None:
+            async def select_relationship(
+                _: Any, target_id: str = character_id
+            ) -> None:
                 self.relationship_selected_character_id = target_id
                 self._render_relationship()
                 self.page.update(self.relationship_card, self.relationship_chip_row)
 
             selected = character_id == self.relationship_selected_character_id
-            chips.append(
-                ft.Button(
+            button = ft.Button(
                     f"{names.get(character_id, '人物')}  {chip_snapshot.metrics.affinity}%",
                     color="#17120D" if selected else TEXT,
                     bgcolor=MINT if selected else "#292925",
                     on_click=select_relationship,
-                )
             )
+            effect = self._relationship_effect
+            if (
+                effect is not None
+                and conversation is not None
+                and effect.conversation_id == conversation.id
+                and effect.character_id == character_id
+            ):
+                chips.append(
+                    ft.Row(
+                        [
+                            ft.Container(
+                                content=button,
+                                border=ft.Border.all(2, effect.color),
+                                border_radius=24,
+                                padding=1,
+                            ),
+                            ft.Container(
+                                content=ft.Text(
+                                    effect.badge_label,
+                                    size=11,
+                                    weight=ft.FontWeight.W_700,
+                                    color="#17120D",
+                                ),
+                                bgcolor=effect.color,
+                                border_radius=14,
+                                padding=ft.Padding(8, 4, 8, 4),
+                            ),
+                        ],
+                        spacing=4,
+                    )
+                )
+            else:
+                chips.append(button)
         self.relationship_chip_row.controls = chips
         selected_id = self.relationship_selected_character_id
         selected_snapshot = (
@@ -1136,14 +1205,21 @@ class LocalChatApp:
             if snapshot.recent_events
             else "直近理由: まだありません"
         )
+        effect = self._relationship_effect
+        conversation = self._selected_conversation()
+        if (
+            effect is not None
+            and conversation is not None
+            and effect.conversation_id == conversation.id
+            and effect.character_id == snapshot.character_id
+        ):
+            self.relationship_reason.value = (
+                f"好感度 {effect.previous_affinity} → {effect.current_affinity}"
+                f"（{effect.badge_label}）・"
+                f"{snapshot.recent_events[0].reason if snapshot.recent_events else '関係イベント'}"
+            )
         review_controls: list[ft.Control] = []
         for event in snapshot.pending_events:
-            async def confirm_candidate(target_id: str = event.id) -> None:
-                await self._decide_relationship_candidate(target_id, "confirmed")
-
-            async def reject_candidate(target_id: str = event.id) -> None:
-                await self._decide_relationship_candidate(target_id, "rejected")
-
             review_controls.append(
                 ft.Container(
                     bgcolor="#302D27",
@@ -1169,14 +1245,18 @@ class LocalChatApp:
                                         icon=ft.Icons.CHECK_ROUNDED,
                                         bgcolor=MINT,
                                         color="#17120D",
-                                        on_click=confirm_candidate,
+                                        on_click=self._relationship_decision_handler(
+                                            event.id, "confirmed"
+                                        ),
                                     ),
                                     ft.Button(
                                         "反映しない",
                                         icon=ft.Icons.CLOSE_ROUNDED,
                                         bgcolor="#292925",
                                         color=TEXT,
-                                        on_click=reject_candidate,
+                                        on_click=self._relationship_decision_handler(
+                                            event.id, "rejected"
+                                        ),
                                     ),
                                 ],
                                 spacing=6,
@@ -1188,18 +1268,24 @@ class LocalChatApp:
             )
         if snapshot.undoable_events:
             last_event = snapshot.undoable_events[0]
-
-            async def undo_candidate(target_id: str = last_event.id) -> None:
-                await self._decide_relationship_candidate(target_id, "undone")
-
             review_controls.append(
                 ft.TextButton(
                     "直前の関係変化をUndo",
                     icon=ft.Icons.UNDO_ROUNDED,
-                    on_click=undo_candidate,
+                    on_click=self._relationship_decision_handler(
+                        last_event.id, "undone"
+                    ),
                 )
             )
         self.relationship_review.controls = review_controls
+
+    def _relationship_decision_handler(
+        self, event_id: str, state: str
+    ) -> Callable[[Any], Awaitable[None]]:
+        async def handle(_: Any) -> None:
+            await self._decide_relationship_candidate(event_id, state)
+
+        return handle
 
     async def _decide_relationship_candidate(
         self, event_id: str, state: str
@@ -1208,6 +1294,9 @@ class LocalChatApp:
         if conversation is None:
             return
         try:
+            before = self.relationship_snapshots.get(
+                self.relationship_selected_character_id or ""
+            )
             await self.container.relationship_profiles.decide_relationship_candidate(
                 conversation_id=conversation.id,
                 event_id=event_id,
@@ -1216,9 +1305,50 @@ class LocalChatApp:
                 recorded_at=utc_now(),
             )
             await self._refresh_relationship(conversation.id)
+            after = self.relationship_snapshots.get(
+                self.relationship_selected_character_id or ""
+            )
+            if before is not None and after is not None:
+                effect = _relationship_affinity_effect(
+                    conversation.id,
+                    after.character_id,
+                    before.metrics.affinity,
+                    after.metrics.affinity,
+                )
+                if effect is not None:
+                    self._start_relationship_effect(effect)
+                    self._render_relationship()
             self.page.update(self.relationship_card, self.relationship_chip_row)
         except AppError as error:
             self._toast(str(error), ERROR)
+
+    def _start_relationship_effect(
+        self, effect: RelationshipAffinityEffect
+    ) -> None:
+        previous_task = self._relationship_effect_task
+        if previous_task is not None and not previous_task.done():
+            previous_task.cancel()
+        self._relationship_effect = effect
+        self._relationship_effect_task = asyncio.create_task(
+            self._clear_relationship_effect(effect),
+            name="relationship-affinity-effect",
+        )
+
+    async def _clear_relationship_effect(
+        self, effect: RelationshipAffinityEffect
+    ) -> None:
+        try:
+            await asyncio.sleep(RELATIONSHIP_EFFECT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self._relationship_effect != effect:
+            return
+        self._relationship_effect = None
+        self._render_relationship()
+        try:
+            self.page.update(self.relationship_card, self.relationship_chip_row)
+        except RuntimeError:
+            return
 
     async def show_relationship_history(self) -> None:
         selected_id = self.relationship_selected_character_id
