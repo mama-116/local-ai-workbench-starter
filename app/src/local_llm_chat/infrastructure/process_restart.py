@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from local_llm_chat.application.services.restart_service import RestartProcess
 
@@ -23,7 +23,7 @@ def _default_restart_arguments(
     original_arguments: tuple[str, ...],
 ) -> tuple[str, ...]:
     # Flet treats any packaged argv entry as a developer-mode connection URL.
-    if Path(executable).name.casefold() == _PACKAGED_EXECUTABLE_NAME:
+    if PureWindowsPath(executable).name.casefold() == _PACKAGED_EXECUTABLE_NAME:
         return ()
     return original_arguments
 
