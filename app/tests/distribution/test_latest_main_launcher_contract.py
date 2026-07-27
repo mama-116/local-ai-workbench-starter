@@ -47,6 +47,11 @@ def test_launcher_reuses_development_data_without_moving_the_database() -> None:
     assert r"app\.local-data" in launcher
     assert "SetEnvironmentVariable" in launcher
     assert "$previousDataDirectory" in launcher
+    assert "AltDirectorySeparatorChar" in launcher
+    assert "DirectorySeparatorChar" in launcher
+    assert "[Console]::OutputEncoding" in launcher
+    assert "[System.Text.UTF8Encoding]::new($false)" in launcher
+    assert "$previousConsoleOutputEncoding" in launcher
     assert "$runtimeRoot.StartsWith(" in launcher
     assert "最新版用worktreeが元の開発worktreeの外にあります" in launcher
     assert "Copy-Item" not in launcher

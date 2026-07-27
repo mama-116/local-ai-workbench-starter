@@ -6,11 +6,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$previousConsoleOutputEncoding = [Console]::OutputEncoding
+$previousOutputEncoding = $OutputEncoding
+$utf8OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8OutputEncoding
+$OutputEncoding = $utf8OutputEncoding
+
+function ConvertTo-NormalizedPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    return [System.IO.Path]::GetFullPath($Path).Replace(
+        [System.IO.Path]::AltDirectorySeparatorChar,
+        [System.IO.Path]::DirectorySeparatorChar
+    )
+}
 
 if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 }
-$runtimeRoot = [System.IO.Path]::GetFullPath($RepositoryRoot)
+$runtimeRoot = ConvertTo-NormalizedPath -Path $RepositoryRoot
 $expectedRemote = 'https://github.com/mama-116/local-ai-workbench-starter.git'
 $buildRoot = Join-Path $runtimeRoot 'dist\latest-main'
 $readyMarkerName = 'BUILD-READY.json'
@@ -47,15 +64,13 @@ function Resolve-DevelopmentDataDirectory {
             'rev-parse', '--path-format=absolute', '--git-common-dir'
         )
     )[0].Trim()
-    $resolvedCommonGitDirectory = [System.IO.Path]::GetFullPath(
-        $commonGitDirectory
-    )
+    $resolvedCommonGitDirectory = ConvertTo-NormalizedPath `
+        -Path $commonGitDirectory
     if ((Split-Path -Leaf $resolvedCommonGitDirectory) -ne '.git') {
         throw "元の開発worktreeを特定できませんでした: $resolvedCommonGitDirectory"
     }
-    $developmentRoot = [System.IO.Path]::GetFullPath(
-        (Split-Path -Parent $resolvedCommonGitDirectory)
-    )
+    $developmentRoot = ConvertTo-NormalizedPath `
+        -Path (Split-Path -Parent $resolvedCommonGitDirectory)
     $developmentRootPrefix = (
         $developmentRoot.TrimEnd(
             [System.IO.Path]::DirectorySeparatorChar
@@ -65,11 +80,13 @@ function Resolve-DevelopmentDataDirectory {
         $developmentRootPrefix,
         [System.StringComparison]::OrdinalIgnoreCase
     )) {
-        throw "最新版用worktreeが元の開発worktreeの外にあります: $runtimeRoot"
+        throw (
+            "最新版用worktreeが元の開発worktreeの外にあります: " +
+            "$runtimeRoot (開発worktree: $developmentRootPrefix)"
+        )
     }
-    $dataDirectory = [System.IO.Path]::GetFullPath(
-        (Join-Path $developmentRoot 'app\.local-data')
-    )
+    $dataDirectory = ConvertTo-NormalizedPath `
+        -Path (Join-Path $developmentRoot 'app\.local-data')
     if (-not $dataDirectory.StartsWith(
         $developmentRootPrefix,
         [System.StringComparison]::OrdinalIgnoreCase
@@ -91,15 +108,13 @@ function Read-ReadyBuild {
         if ($marker.commit -notmatch '^[0-9a-f]{40}$') {
             return $null
         }
-        $commitDirectory = [System.IO.Path]::GetFullPath(
-            (Split-Path -Parent $MarkerPath)
-        )
+        $commitDirectory = ConvertTo-NormalizedPath `
+            -Path (Split-Path -Parent $MarkerPath)
         if ((Split-Path -Leaf $commitDirectory) -ne $marker.commit) {
             return $null
         }
-        $executable = [System.IO.Path]::GetFullPath(
-            (Join-Path $commitDirectory ([string]$marker.executable))
-        )
+        $executable = ConvertTo-NormalizedPath `
+            -Path (Join-Path $commitDirectory ([string]$marker.executable))
         if (-not $executable.StartsWith(
             $commitDirectory + [System.IO.Path]::DirectorySeparatorChar,
             [System.StringComparison]::OrdinalIgnoreCase
@@ -220,13 +235,12 @@ try {
                 throw "起動対象のEXEを1件に特定できませんでした: $commitBuildRoot"
             }
             $commitBuildPrefix = (
-                [System.IO.Path]::GetFullPath($commitBuildRoot).TrimEnd(
+                (ConvertTo-NormalizedPath -Path $commitBuildRoot).TrimEnd(
                     [System.IO.Path]::DirectorySeparatorChar
                 ) + [System.IO.Path]::DirectorySeparatorChar
             )
-            $executablePath = [System.IO.Path]::GetFullPath(
-                $executables[0].FullName
-            )
+            $executablePath = ConvertTo-NormalizedPath `
+                -Path $executables[0].FullName
             if (-not $executablePath.StartsWith(
                 $commitBuildPrefix,
                 [System.StringComparison]::OrdinalIgnoreCase
@@ -288,4 +302,6 @@ try {
         $mutex.ReleaseMutex()
     }
     $mutex.Dispose()
+    [Console]::OutputEncoding = $previousConsoleOutputEncoding
+    $OutputEncoding = $previousOutputEncoding
 }
