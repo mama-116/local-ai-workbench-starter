@@ -7,6 +7,11 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+class ProviderKind(StrEnum):
+    OLLAMA = "ollama"
+    VLLM = "vllm"
+
+
 class MessageState(StrEnum):
     PENDING = "pending"
     STREAMING = "streaming"

@@ -12,7 +12,11 @@ class FreeOperationBlocked(AppError):
         self.code = code
 
 
-class OllamaUnavailable(AppError):
+class ProviderUnavailable(AppError):
+    pass
+
+
+class OllamaUnavailable(ProviderUnavailable):
     pass
 
 

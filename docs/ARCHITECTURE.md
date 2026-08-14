@@ -11,7 +11,7 @@ flowchart LR
     O --> F{無料運営ガード}
     F --> P[推論Provider]
     P --> OL[Ollama]
-    P -. Phase 7 .-> VL[vLLM on WSL2]
+    P -. Phase 8 .-> VL[vLLM on LAN]
     O --> DB[(SQLiteログ)]
     O --> M[観測Service]
     M --> COL[交換可能な取得部品]
@@ -65,7 +65,7 @@ DuckDuckGoを使う場合、検索語は家庭内LANの外へ出る。「完全�
 
 すべてのProvider、RAG、Tool呼出しは無料運営ガードを通る。各実装は `locality` と `cost_class` を宣言し、初版は `locality=local` かつ `cost_class=no_charge` だけを許可する。値がない、不明、無料枠、試用期間、従量課金、アカウント必須のいずれかであれば拒否する。UIを隠すだけではなく、Application ServiceとProvider境界の両方で検査する。
 
-Ollamaは端末内・LAN内経由でもクラウドモデルを実行できるため、各Ollamaのクラウド無効化確認と、アプリ側のローカルモデル実体確認を併用する。接続先はループバックまたはプライベートIPのHTTPだけを許可し、APIキーとAuthorizationヘッダーを設定・処理・ログへ持ち込まない。
+Ollamaは端末内・LAN内経由でもクラウドモデルを実行できるため、各Ollamaのクラウド無効化確認と、アプリ側のローカルモデル実体確認を併用する。vLLMはOpenAI互換の `/v1` 経路を使うLAN内Providerとして扱い、接続先はループバックまたはプライベートIPのHTTPだけを許可する。vLLMのBearer APIキーは `LOCAL_LLM_CHAT_VLLM_API_KEY` のプロセス環境変数からのみ読み、設定ファイル、SQLite、画面、監査ログへ保存しない。会話・RAG資料・プロンプトは引き続きLAN内の推論先以外へ送信しない。
 
 無料運営ガードを通っても、外部検索や外部投稿は別のデータ・承認境界を通る。無料であることは外部送信の許可を意味しない。
 

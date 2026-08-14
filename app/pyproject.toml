@@ -1,7 +1,7 @@
 [project]
 name = "local-llm-chat"
 version = "0.1.0"
-description = "Strictly local, no-charge desktop chat for Ollama"
+description = "Strictly local, no-charge desktop chat for Ollama and LAN vLLM"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "flet>=0.28,<1",
@@ -19,7 +19,7 @@ dev = [
 
 [tool.flet]
 product = "Local LLM Chat"
-description = "Strictly local, no-charge desktop chat for Ollama"
+description = "Strictly local, no-charge desktop chat for Ollama and LAN vLLM"
 build_number = 1
 
 [tool.flet.app]

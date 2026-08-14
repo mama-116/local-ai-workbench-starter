@@ -555,7 +555,7 @@ class LocalChatApp:
                 spacing=8,
             ),
         )
-        self.connection_dropdown = self._dropdown("Ollama接続先")
+        self.connection_dropdown = self._dropdown("推論接続先")
         self.connection_dropdown.on_select = self.switch_connection
         self.model_dropdown = self._dropdown("モデル")
         self.model_dropdown.on_select = self.update_selection
@@ -1022,7 +1022,7 @@ class LocalChatApp:
             self.branch_dropdown.options = []
             self.branch_dropdown.value = None
             self._show_empty_state(
-                "Ollama Cloudを無効にし、ローカルモデルを確認すると会話を作成できます。"
+                "無料運営の条件を確認し、ローカルモデルを読み込むと会話を作成できます。"
                 if not self.models
                 else "左上の「新しい会話」から始められます。"
             )
@@ -1957,7 +1957,10 @@ class LocalChatApp:
                     "確認済みにしてください。"
                 )
             elif cloud_disabled:
-                detail = "利用条件を確認できるローカルモデルがありません。Ollamaへモデルを追加してください。"
+                detail = (
+                    "利用条件を確認できるローカルモデルがありません。"
+                    "接続先のモデル一覧を確認してください。"
+                )
             else:
                 detail = (
                     f"{config_path} に disable_ollama_cloud: true を設定し、"
@@ -2714,7 +2717,7 @@ class LocalChatApp:
             ft.DropdownOption(item.id, item.display_name) for item in self.characters
         ]
         character.value = self.characters[0].id
-        connection = self._dropdown("Ollama接続先")
+        connection = self._dropdown("推論接続先")
         connection.options = [
             ft.DropdownOption(item.provider_name, item.display_name)
             for item in self.connections
@@ -2872,8 +2875,8 @@ class LocalChatApp:
             autofocus=True,
         )
         endpoint = ft.TextField(
-            label="Ollamaのアドレス",
-            value=editable.endpoint if editable else "http://192.168.1.:11434",
+            label="推論接続先のアドレス",
+            value=editable.endpoint if editable else "http://192.168.1.17:11434",
         )
         cloud_confirmed = ft.Checkbox(
             label="相手端末でOllama Cloudを無効化済み",
@@ -2891,14 +2894,14 @@ class LocalChatApp:
                 self.page.pop_dialog()
                 self.selected_provider_name = saved.provider_name
                 await self.refresh_all()
-                self._toast("Ollama接続先を保存しました。", MINT)
+                self._toast("推論接続先を保存しました。", MINT)
             except AppError as error:
                 self._toast(str(error), ERROR)
 
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title="Ollama接続先を編集" if editable else "Ollama接続先を追加",
+                title="推論接続先を編集" if editable else "推論接続先を追加",
                 bgcolor="#24231F",
                 content=ft.Column(
                     [
