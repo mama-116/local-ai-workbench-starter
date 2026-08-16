@@ -1297,7 +1297,7 @@ class SQLiteAppRepository:
                        result_sha256, failure_reason, created_at, started_at,
                        completed_at
                 FROM tool_calls WHERE conversation_id = ?
-                ORDER BY created_at DESC, id DESC LIMIT ?
+                ORDER BY created_at DESC, rowid DESC LIMIT ?
                 """,
                 (conversation_id, max(1, min(limit, 100))),
             ).fetchall()
