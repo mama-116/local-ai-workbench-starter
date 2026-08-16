@@ -237,6 +237,12 @@ Profile完全削除は元会話本文を削除しない。UIは削除前にこ�
 
 初期Policy `relationship-v1` は、未設定時を好感度50・信頼30・緊張0とする。1イベントの絶対変化上限は好感度5・信頼5・緊張10で、各値を0〜100へ丸める。同じイベントIDは1回だけ適用し、時間経過だけでは減衰させない。謝罪は過去の侵害を削除せず `repair` として段階的に回復する。関係名は指標値だけから自動決定しない。キャラクターPolicyは許可範囲内で感受性、回復速度、表現を変えられるが、共通Policyより優先せず、秘密漏えい、虐待称賛、報復、羞恥、課金・長時間利用・秘密開示の誘導を許可しない。
 
+`relationship-v2` は `relationship-v1` の初期値、値域、意味別基礎差分、1イベント上限を維持し、キャラクター版のRelationship StyleからApplication層が許可範囲内の差分を解決する。Relationship Styleの正本値は、親しくなる速さ `slow / standard / quick`、感情表現 `reserved / balanced / expressive`、重視対象 `words / commitments / boundaries / shared_experience`、衝突時反応 `withdraw / direct / repair_seeking`、回復速度 `slow / standard / quick` とする。既存キャラクター版は `standard / balanced / shared_experience / direct / standard` へ移行する。新規イベントは解決済みの好感度・信頼・緊張差分を保持し、Reducerは共通上限を再検査して適用する。既存イベントは `relationship-v1` の意味別表で互換計算する。モデル出力から現在値または差分を採用しない。
+
+低重大度、根拠文脈 `direct`、Application再検査済みの `positive_interaction / kept_commitment / respected_boundary / repair` は `auto_applied` にできる。同じ出典、同じ決定論的イベントID、直前と同じ意味かつ同じ正規化根拠は二重反映しない。好感度80以上の低重大度 `positive_interaction` は2件に1件だけ自動増加し、90以上では確認待ちにする。`conflict / boundary_violation / repeated_boundary_violation`、高重大度、関係名変更は確認待ちを維持する。
+
+関係候補抽出モデルは会話モデルから分離し、loopback Ollamaの `/api/tags` で実在確認した専用モデルだけを使う。初期既定は `qwen3.5:9b` とし、未導入時は関係抽出だけを停止して会話応答を継続する。保存済み利用者発言を返答前に抽出・再検査できた場合、同じ出典のイベントを生成Contextへ含める。応答後の再試行は同じ決定論的イベントIDを使い、二重処理しない。
+
 初期リリースでは関係イベントの自動反映を機能フラグで無効にし、固定境界試験が合格するまで `pending_confirmation` として精度を測る。自動反映を有効にする場合も、宛先が現在のキャラクターで、根拠文脈が `direct`、根拠範囲が本文へ実在し、同じ出典の重複候補がなく、Application層が登録済みパターンとして再検査できた低・中重大度だけを `auto_applied` にできる。高重大度、文脈不明、関係の重大変更は確認待ちにする。
 
 #### 言葉と境界の検査
@@ -265,6 +271,8 @@ Profile完全削除は元会話本文を削除しない。UIは削除前にこ�
 生成へ渡すRelationship Contextは、現在世界線、利用者Profile、発言予定キャラクターについて、利用可能なProfile、合意関係、現在指標、`current` の関係解釈、関連する直近根拠だけをJSONデータとして構成する。命令として連結せず、出典イベントIDとPolicy版を保持する。グループ1回生成では全正式キャストが知る項目の積集合だけを入れ、キャラクター別の秘密を同じ要求へ同梱しない。
 
 Relationship Contextは正史Memory Contextの安全制約より後、会話要約より前に配置する。安全制約、現在の利用者メッセージ、キャラクター設定を保持できない場合は関係Contextを通常イベントから決定論的に削り、それでも収まらなければ生成を拒否する。Profile、関係イベント、関係解釈はPRIVATEとしてRemoteまたはLANモデルへ送らない。
+
+信頼済みLAN接続で利用者が接続単位の `relationship_behavior_allowed` を明示的に有効化した場合だけ、PRIVATEなRelationship Contextの代わりに `relationship-behavior-v1` の匿名最小Envelopeを送れる。許可フィールドは `version / affinity_band / trust_band / tension_band / turn_reception / expressiveness / conflict_response` と、グループ生成時の正式キャスト順番号だけである。人物名、人物ID、世界線ID、Profile ID・値、本文、理由、根拠範囲、イベントID、履歴を含む要求は送信前に拒否する。許可は既定OFFで、接続先変更時にOFFへ戻し、別接続へ継承しない。Remoteまたは公開ネットワーク接続には許可できない。
 ### 記憶候補の生成境界
 
 `MemoryCandidateService` は会話入力を直接正史へ保存せず、ローカル抽出器が返す候補を信用できない入力として検査する。抽出器を呼ぶ前に `local + no_charge`、Cloud無効、端末内HTTP接続を確認し、PRIVATEな会話本文をRemote、LAN、費用不明Providerへ渡さない。抽出結果の有無にかかわらず、登録済みテンプレートの明示表現へ文全体が一致する句を決定論的にも再検査する。同じ対象・項目・根拠範囲についてモデル候補が保存可能なら重複追加せず、モデル候補が保存禁止なら決定論的候補で置き換える。別候補として追加する場合も1発言8件上限を超えない。決定論的経路は新しい表現や対象人物を推論せず、発言者本人の候補だけを作る。質問、否定、過去、引用、第三者の主題や `@名前:` などの名前付き発言と解釈し得る値は保存可能候補にしない。複数句は句ごとに照合し、通常経路と同じ最終分類を通す。この経路は空候補、翻訳値、誤った根拠範囲による偽陰性を減らす補助であり、曖昧な自然文を広く拾う代替抽出器ではない。

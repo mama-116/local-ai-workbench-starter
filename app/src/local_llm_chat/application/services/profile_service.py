@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from local_llm_chat.domain.errors import FreeOperationBlocked
 from local_llm_chat.domain.models import CharacterVersion, ModelInfo, ProviderConnection
+from local_llm_chat.domain.relationship_behavior import RelationshipStyle
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.ports.llm_provider import LLMProviderRegistry
 from local_llm_chat.domain.ports.repositories import AppRepository
@@ -26,9 +29,10 @@ class ProfileService:
         display_name: str,
         system_prompt: str,
         character_id: str | None = None,
+        relationship_style: RelationshipStyle | None = None,
     ) -> CharacterVersion:
         return await self._repository.create_character_version(
-            display_name, system_prompt, character_id
+            display_name, system_prompt, character_id, relationship_style
         )
 
     def list_connections(self) -> list[ProviderConnection]:
@@ -69,10 +73,16 @@ class ProfileService:
         display_name: str,
         endpoint: str,
         cloud_disabled_confirmed: bool,
+        relationship_behavior_allowed: bool = False,
     ) -> ProviderConnection:
-        return await self._providers.save_connection(
-            connection_id,
-            display_name,
-            endpoint,
-            cloud_disabled_confirmed,
+        registry = cast(Any, self._providers)
+        return cast(
+            ProviderConnection,
+            await registry.save_connection(
+                connection_id,
+                display_name,
+                endpoint,
+                cloud_disabled_confirmed,
+                relationship_behavior_allowed,
+            ),
         )

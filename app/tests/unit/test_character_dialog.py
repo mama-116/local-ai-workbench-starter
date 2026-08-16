@@ -7,6 +7,7 @@ import flet as ft
 import pytest
 
 from local_llm_chat.domain.models import CharacterVersion, utc_now
+from local_llm_chat.domain.relationship_behavior import RelationshipStyle
 from local_llm_chat.presentation.flet_app import LocalChatApp
 
 
@@ -27,15 +28,18 @@ class _PageRecorder:
 class _ProfilesRecorder:
     def __init__(self, saved: CharacterVersion) -> None:
         self.saved = saved
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, RelationshipStyle | None]] = []
 
     async def save_character(
         self,
         display_name: str,
         system_prompt: str,
         character_id: str | None = None,
+        relationship_style: RelationshipStyle | None = None,
     ) -> CharacterVersion:
-        self.calls.append((display_name, system_prompt, character_id))
+        self.calls.append(
+            (display_name, system_prompt, character_id, relationship_style)
+        )
         return self.saved
 
 
@@ -113,5 +117,10 @@ async def test_new_character_dialog_is_blank_and_saves_without_existing_id(
 
     await save()
 
-    assert profiles.calls == [(saved.display_name, saved.system_prompt, None)]
+    assert profiles.calls[0][:3] == (
+        saved.display_name,
+        saved.system_prompt,
+        None,
+    )
+    assert profiles.calls[0][3] is not None
     assert app.character_dropdown.value == saved.id

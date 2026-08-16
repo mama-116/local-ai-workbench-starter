@@ -45,6 +45,14 @@ from local_llm_chat.domain.relationship_profile import (
     ProfileScope,
     ProfileUsageState,
 )
+from local_llm_chat.domain.relationship_behavior import (
+    DEFAULT_RELATIONSHIP_STYLE,
+    RelationshipConflictResponse,
+    RelationshipExpressiveness,
+    RelationshipPace,
+    RelationshipPriority,
+    RelationshipStyle,
+)
 from local_llm_chat.domain.models import (
     BranchInfo,
     CharacterVersion,
@@ -90,6 +98,7 @@ TEXT = "#E8E4DC"
 MUTED = "#969188"
 ERROR = "#D87866"
 RELATIONSHIP_EFFECT_SECONDS = 0.9
+RELATIONSHIP_RECEPTION_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +424,13 @@ class LocalChatApp:
             disabled=True,
         )
         self.relationship_chip_row = ft.Row(spacing=6, wrap=True)
+        self.relationship_reception = ft.Text(
+            "",
+            size=10,
+            color=MINT,
+            visible=False,
+        )
+        self._relationship_reception_task: asyncio.Task[None] | None = None
         self.relationship_person = ft.Text(
             "人物を選択してください", size=13, weight=ft.FontWeight.W_600
         )
@@ -672,6 +688,7 @@ class LocalChatApp:
                                         self.title_text,
                                         self.subtitle_text,
                                         self.relationship_chip_row,
+                                        self.relationship_reception,
                                     ],
                                     spacing=5,
                                 ),
@@ -1358,6 +1375,31 @@ class LocalChatApp:
         except RuntimeError:
             return
 
+    def _start_relationship_reception(self, reason: str) -> None:
+        previous_task = self._relationship_reception_task
+        if previous_task is not None and not previous_task.done():
+            previous_task.cancel()
+        self.relationship_reception.value = f"今回の受け止め: {reason}"
+        self.relationship_reception.visible = True
+        self._relationship_reception_task = asyncio.create_task(
+            self._clear_relationship_reception(reason),
+            name="relationship-turn-reception",
+        )
+
+    async def _clear_relationship_reception(self, reason: str) -> None:
+        try:
+            await asyncio.sleep(RELATIONSHIP_RECEPTION_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if self.relationship_reception.value != f"今回の受け止め: {reason}":
+            return
+        self.relationship_reception.value = ""
+        self.relationship_reception.visible = False
+        try:
+            self.page.update(self.relationship_reception)
+        except RuntimeError:
+            return
+
     async def show_relationship_history(self) -> None:
         selected_id = self.relationship_selected_character_id
         snapshot = (
@@ -1496,11 +1538,19 @@ class LocalChatApp:
         self._render_memory_review()
         if update.relationship_event_ids:
             await self._refresh_relationship(conversation.id)
+            selected = self.relationship_snapshots.get(
+                self.relationship_selected_character_id or ""
+            )
+            if selected is not None and selected.recent_events:
+                self._start_relationship_reception(
+                    selected.recent_events[0].reason
+                )
         self.page.update(
             self.memory_card,
             self.memory_undo_bar,
             self.relationship_card,
             self.relationship_chip_row,
+            self.relationship_reception,
         )
 
     @staticmethod
@@ -2879,6 +2929,12 @@ class LocalChatApp:
             label="相手端末でOllama Cloudを無効化済み",
             value=editable.cloud_disabled_confirmed if editable else False,
         )
+        relationship_behavior_allowed = ft.Checkbox(
+            label="匿名の最小関係表現をこのLAN接続へ送る",
+            value=(
+                editable.relationship_behavior_allowed if editable else False
+            ),
+        )
 
         async def save() -> None:
             try:
@@ -2887,6 +2943,7 @@ class LocalChatApp:
                     name.value or "",
                     endpoint.value or "",
                     bool(cloud_confirmed.value),
+                    bool(relationship_behavior_allowed.value),
                 )
                 self.page.pop_dialog()
                 self.selected_provider_name = saved.provider_name
@@ -2910,6 +2967,13 @@ class LocalChatApp:
                             color=MUTED,
                         ),
                         cloud_confirmed,
+                        relationship_behavior_allowed,
+                        ft.Text(
+                            "人物名、Profile、本文、理由、履歴は送りません。"
+                            " 接続先を変更すると自動でOFFへ戻ります。",
+                            size=10,
+                            color=MUTED,
+                        ),
                     ],
                     tight=True,
                     width=460,
@@ -2942,6 +3006,53 @@ class LocalChatApp:
             min_lines=5,
             max_lines=10,
         )
+        style = current.relationship_style if current else DEFAULT_RELATIONSHIP_STYLE
+        attachment_pace = ft.Dropdown(
+            label="親しくなる速さ",
+            value=style.attachment_pace.value,
+            options=[
+                ft.DropdownOption("slow", "ゆっくり"),
+                ft.DropdownOption("standard", "標準"),
+                ft.DropdownOption("quick", "早い"),
+            ],
+        )
+        expressiveness = ft.Dropdown(
+            label="感情表現",
+            value=style.expressiveness.value,
+            options=[
+                ft.DropdownOption("reserved", "控えめ"),
+                ft.DropdownOption("balanced", "標準"),
+                ft.DropdownOption("expressive", "豊か"),
+            ],
+        )
+        priority = ft.Dropdown(
+            label="関係で重視するもの",
+            value=style.priority.value,
+            options=[
+                ft.DropdownOption("words", "言葉"),
+                ft.DropdownOption("commitments", "約束"),
+                ft.DropdownOption("boundaries", "境界の尊重"),
+                ft.DropdownOption("shared_experience", "一緒にした経験"),
+            ],
+        )
+        conflict_response = ft.Dropdown(
+            label="衝突時の反応",
+            value=style.conflict_response.value,
+            options=[
+                ft.DropdownOption("withdraw", "距離を取る"),
+                ft.DropdownOption("direct", "率直に伝える"),
+                ft.DropdownOption("repair_seeking", "修復を求める"),
+            ],
+        )
+        recovery_pace = ft.Dropdown(
+            label="関係の回復速度",
+            value=style.recovery_pace.value,
+            options=[
+                ft.DropdownOption("slow", "ゆっくり"),
+                ft.DropdownOption("standard", "標準"),
+                ft.DropdownOption("quick", "早い"),
+            ],
+        )
 
         async def save() -> None:
             try:
@@ -2949,6 +3060,23 @@ class LocalChatApp:
                     name.value or "",
                     prompt.value or "",
                     current.character_id if current else None,
+                    RelationshipStyle(
+                        attachment_pace=RelationshipPace(
+                            attachment_pace.value or "standard"
+                        ),
+                        expressiveness=RelationshipExpressiveness(
+                            expressiveness.value or "balanced"
+                        ),
+                        priority=RelationshipPriority(
+                            priority.value or "shared_experience"
+                        ),
+                        conflict_response=RelationshipConflictResponse(
+                            conflict_response.value or "direct"
+                        ),
+                        recovery_pace=RelationshipPace(
+                            recovery_pace.value or "standard"
+                        ),
+                    ),
                 )
                 self.page.pop_dialog()
                 await self.refresh_all()
@@ -2962,7 +3090,22 @@ class LocalChatApp:
             modal=True,
             title="新しいキャラクター" if create_new else "キャラクター設定",
             bgcolor="#24231F",
-            content=ft.Column([name, prompt], tight=True, width=460),
+            content=ft.Column(
+                [
+                    name,
+                    prompt,
+                    ft.Text("関係への反応", size=12, weight=ft.FontWeight.W_600),
+                    attachment_pace,
+                    expressiveness,
+                    priority,
+                    conflict_response,
+                    recovery_pace,
+                ],
+                tight=True,
+                width=460,
+                height=610,
+                scroll=ft.ScrollMode.AUTO,
+            ),
             actions=[
                 ft.Button("キャンセル", on_click=self._close_dialog),
                 ft.Button(

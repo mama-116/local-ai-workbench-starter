@@ -3,7 +3,11 @@ import json
 import httpx
 import pytest
 
-from local_llm_chat.domain.errors import FreeOperationBlocked, ValidationError
+from local_llm_chat.domain.errors import (
+    FreeOperationBlocked,
+    OllamaUnavailable,
+    ValidationError,
+)
 from local_llm_chat.domain.relationship_profile import (
     EvidenceContext,
     RelationshipCandidateRequest,
@@ -31,6 +35,10 @@ async def test_relationship_extractor_is_local_strict_and_deterministic() -> Non
     content = "ありがとう"
 
     async def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/api/tags":
+            return httpx.Response(
+                200, json={"models": [{"name": "qwen3.5:9b"}]}
+            )
         captured.update(json.loads(http_request.content))
         return httpx.Response(
             200,
@@ -70,6 +78,7 @@ async def test_relationship_extractor_is_local_strict_and_deterministic() -> Non
     assert captured["think"] is False
     assert captured["options"] == {"temperature": 0}
     assert isinstance(captured["format"], dict)
+    assert captured["model"] == "qwen3.5:9b"
     await client.aclose()
 
 
@@ -135,6 +144,10 @@ async def test_relationship_extractor_rejects_nonconforming_output(
     output: str,
 ) -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
+        if _.url.path == "/api/tags":
+            return httpx.Response(
+                200, json={"models": [{"name": "qwen3.5:9b"}]}
+            )
         return httpx.Response(200, json={"message": {"content": output}})
 
     client = httpx.AsyncClient(
@@ -146,4 +159,29 @@ async def test_relationship_extractor_rejects_nonconforming_output(
     )
     with pytest.raises(ValidationError):
         await extractor.extract(request())
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_relationship_extractor_fails_closed_when_dedicated_model_is_missing() -> None:
+    calls: list[str] = []
+
+    async def handler(http_request: httpx.Request) -> httpx.Response:
+        calls.append(http_request.url.path)
+        return httpx.Response(200, json={"models": [{"name": "other:latest"}]})
+
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:11434",
+        transport=httpx.MockTransport(handler),
+    )
+    extractor = OllamaRelationshipCandidateExtractor(
+        client=client,
+        cloud_is_disabled=True,
+        model_name="qwen3.5:9b",
+    )
+
+    with pytest.raises(OllamaUnavailable, match="qwen3.5:9b"):
+        await extractor.extract(request())
+
+    assert calls == ["/api/tags"]
     await client.aclose()

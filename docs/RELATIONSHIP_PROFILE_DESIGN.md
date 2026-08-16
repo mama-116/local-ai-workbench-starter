@@ -4,6 +4,8 @@
 
 意思決定: [ADR-0023](adr/0023-build-continuity-scoped-relationship-profiles.md)
 
+言動同期の拡張: [RELATIONSHIP_BEHAVIOR_SYNC_DESIGN.md](RELATIONSHIP_BEHAVIOR_SYNC_DESIGN.md) / [ADR-0027](adr/0027-sync-character-behavior-with-relationship-events.md)
+
 関係性候補: [RELATIONSHIP_TAXONOMY.md](RELATIONSHIP_TAXONOMY.md)
 
 状態値、権限、データ境界の正本: [ARCHITECTURE.md](ARCHITECTURE.md)

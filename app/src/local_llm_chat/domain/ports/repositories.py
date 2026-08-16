@@ -51,6 +51,7 @@ from local_llm_chat.domain.relationship_profile import (
     RelationshipMetrics,
     UserProfile,
 )
+from local_llm_chat.domain.relationship_behavior import RelationshipStyle
 from local_llm_chat.domain.states import (
     ContextSummaryState,
     MemoryApprovalState,
@@ -108,6 +109,7 @@ class AppRepository(Protocol):
         display_name: str,
         system_prompt: str,
         character_id: str | None = None,
+        relationship_style: RelationshipStyle | None = None,
     ) -> CharacterVersion: ...
 
     async def get_character_version(self, version_id: str) -> CharacterVersion: ...

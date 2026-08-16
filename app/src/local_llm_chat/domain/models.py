@@ -6,6 +6,10 @@ import math
 from pathlib import Path
 from typing import Any
 
+from local_llm_chat.domain.relationship_behavior import (
+    DEFAULT_RELATIONSHIP_STYLE,
+    RelationshipStyle,
+)
 from local_llm_chat.domain.states import (
     AgentPolicyDecision,
     AgentRunState,
@@ -49,6 +53,7 @@ class ProviderConnection:
     endpoint: str
     cloud_disabled_confirmed: bool
     is_builtin: bool = False
+    relationship_behavior_allowed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +75,7 @@ class CharacterVersion:
     version: int
     system_prompt: str
     created_at: datetime
+    relationship_style: RelationshipStyle = DEFAULT_RELATIONSHIP_STYLE
 
 
 @dataclass(frozen=True, slots=True)

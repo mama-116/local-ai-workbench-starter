@@ -44,6 +44,9 @@ from local_llm_chat.application.services.rag_service import RagService
 from local_llm_chat.application.services.relationship_profile_service import (
     RelationshipProfileService,
 )
+from local_llm_chat.application.services.relationship_turn_reception_service import (
+    RelationshipTurnReceptionService,
+)
 from local_llm_chat.application.services.restart_service import RestartService
 from local_llm_chat.application.services.scheduler_service import SchedulerService
 from local_llm_chat.application.services.translation_service import TranslationService
@@ -173,6 +176,9 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         endpoint=LOCAL_ENDPOINT,
         cloud_is_disabled=lambda: providers.cloud_is_disabled(LOCAL_PROVIDER_NAME),
     )
+    relationship_turn_reception = RelationshipTurnReceptionService(
+        repository, relationship_profiles, relationship_extractor
+    )
     memory_capture = QueuedMemoryCaptureScheduler(
         MemoryCaptureService(
             repository,
@@ -210,7 +216,8 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         rag,
         tool_coordinator,
         memory_capture_scheduler=memory_capture,
-        relationship_profiles=relationship_profiles,
+            relationship_profiles=relationship_profiles,
+            relationship_turn_reception=relationship_turn_reception,
     )
     return AppContainer(
         paths=paths,
@@ -243,6 +250,15 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
                 provider_endpoint=lambda provider_name: providers.get(
                     provider_name
                 ).metadata.endpoint,
+                provider_behavior_allowed=lambda provider_name: next(
+                    (
+                        item.relationship_behavior_allowed
+                        for item in providers.list_connections()
+                        if item.provider_name == provider_name
+                    ),
+                    False,
+                ),
+                relationship_turn_reception=relationship_turn_reception,
             ),
             TurnBatchService(repository),
             memory_capture_scheduler=memory_capture,
