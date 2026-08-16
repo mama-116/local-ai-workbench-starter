@@ -68,6 +68,14 @@ from local_llm_chat.domain.relationship_profile import (
     UserProfile,
     reduce_relationship_events,
 )
+from local_llm_chat.domain.relationship_behavior import (
+    DEFAULT_RELATIONSHIP_STYLE,
+    RelationshipConflictResponse,
+    RelationshipExpressiveness,
+    RelationshipPace,
+    RelationshipPriority,
+    RelationshipStyle,
+)
 from local_llm_chat.domain.models import (
     AgentExecutionLimits,
     AgentRun,
@@ -1394,6 +1402,7 @@ class SQLiteAppRepository:
         display_name: str,
         system_prompt: str,
         character_id: str | None = None,
+        relationship_style: RelationshipStyle | None = None,
     ) -> CharacterVersion:
         if not display_name.strip() or not system_prompt.strip():
             raise ValidationError("キャラクター名と指示文は必須です。")
@@ -1407,6 +1416,7 @@ class SQLiteAppRepository:
                     (target_id, display_name.strip(), now),
                 )
                 version = 1
+                selected_style = relationship_style or DEFAULT_RELATIONSHIP_STYLE
             else:
                 found = connection.execute(
                     "SELECT id FROM characters WHERE id = ? AND archived_at IS NULL",
@@ -1418,18 +1428,49 @@ class SQLiteAppRepository:
                     "UPDATE characters SET display_name = ? WHERE id = ?",
                     (display_name.strip(), target_id),
                 )
-                row = connection.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM character_versions WHERE character_id = ?",
+                version_row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                    FROM character_versions WHERE character_id = ?
+                    """,
                     (target_id,),
                 ).fetchone()
-                version = int(row["version"])
+                style_row = connection.execute(
+                    """
+                    SELECT * FROM character_versions
+                    WHERE character_id = ? ORDER BY version DESC LIMIT 1
+                    """,
+                    (target_id,),
+                ).fetchone()
+                if version_row is None or style_row is None:  # pragma: no cover
+                    raise PersistenceError("キャラクター版を更新できませんでした。")
+                version = int(version_row["next_version"])
+                selected_style = relationship_style or self._relationship_style_from_row(
+                    style_row
+                )
             version_id = str(uuid4())
             connection.execute(
                 """
-                INSERT INTO character_versions(id, character_id, version, system_prompt, created_at)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO character_versions(
+                    id, character_id, version, system_prompt, created_at,
+                    relationship_attachment_pace, relationship_expressiveness,
+                    relationship_priority, relationship_conflict_response,
+                    relationship_recovery_pace
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (version_id, target_id, version, system_prompt.strip(), now),
+                (
+                    version_id,
+                    target_id,
+                    version,
+                    system_prompt.strip(),
+                    now,
+                    selected_style.attachment_pace.value,
+                    selected_style.expressiveness.value,
+                    selected_style.priority.value,
+                    selected_style.conflict_response.value,
+                    selected_style.recovery_pace.value,
+                ),
             )
             return CharacterVersion(
                 id=version_id,
@@ -1438,6 +1479,7 @@ class SQLiteAppRepository:
                 version=version,
                 system_prompt=system_prompt.strip(),
                 created_at=datetime.fromisoformat(now),
+                relationship_style=selected_style,
             )
 
         return await self._write(operation)
@@ -3204,12 +3246,31 @@ class SQLiteAppRepository:
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
             connection.execute("BEGIN IMMEDIATE")
-            if actor is LedgerActor.AI and event.approval is not (
-                RelationshipApproval.PENDING_CONFIRMATION
+            if actor is LedgerActor.AI and event.approval not in {
+                RelationshipApproval.PENDING_CONFIRMATION,
+                RelationshipApproval.AUTO_APPLIED,
+            }:
+                raise ValidationError("AIの関係イベント状態が不正です。")
+            if actor is LedgerActor.AI and event.approval is (
+                RelationshipApproval.AUTO_APPLIED
             ):
-                raise ValidationError(
-                    "初期版ではAIの関係イベントを自動反映できません。"
-                )
+                if (
+                    event.meaning
+                    not in {
+                        RelationshipMeaning.POSITIVE_INTERACTION,
+                        RelationshipMeaning.KEPT_COMMITMENT,
+                        RelationshipMeaning.RESPECTED_BOUNDARY,
+                        RelationshipMeaning.REPAIR,
+                    }
+                    or event.severity is not RelationshipSeverity.LOW
+                    or event.evidence_context is not EvidenceContext.DIRECT
+                    or event.affinity_delta is None
+                    or event.trust_delta is None
+                    or event.tension_delta is None
+                ):
+                    raise ValidationError(
+                        "この関係イベントは自動反映できません。"
+                    )
             existing = connection.execute(
                 "SELECT * FROM relationship_events WHERE id = ?", (event.id,)
             ).fetchone()
@@ -3255,9 +3316,10 @@ class SQLiteAppRepository:
                     evidence_start, evidence_end, reason, approval,
                     policy_version, knowledge_count,
                     relationship_definition_id, assignment_state, role,
-                    recorded_at
+                    recorded_at, affinity_delta, trust_delta, tension_delta
                 ) VALUES(
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
                 )
                 """,
                 (
@@ -3285,6 +3347,9 @@ class SQLiteAppRepository:
                     ),
                     event.role,
                     _utc_iso(event.recorded_at),
+                    event.affinity_delta,
+                    event.trust_delta,
+                    event.tension_delta,
                 ),
             )
             for character_id in event.known_by_character_ids:
@@ -6018,6 +6083,24 @@ class SQLiteAppRepository:
             ),
             role=str(row["role"]) if row["role"] is not None else None,
             recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+            affinity_delta=(
+                int(row["affinity_delta"])
+                if "affinity_delta" in row.keys()
+                and row["affinity_delta"] is not None
+                else None
+            ),
+            trust_delta=(
+                int(row["trust_delta"])
+                if "trust_delta" in row.keys()
+                and row["trust_delta"] is not None
+                else None
+            ),
+            tension_delta=(
+                int(row["tension_delta"])
+                if "tension_delta" in row.keys()
+                and row["tension_delta"] is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -6107,6 +6190,26 @@ class SQLiteAppRepository:
             version=int(row["version"]),
             system_prompt=str(row["system_prompt"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            relationship_style=SQLiteAppRepository._relationship_style_from_row(row),
+        )
+
+    @staticmethod
+    def _relationship_style_from_row(row: sqlite3.Row) -> RelationshipStyle:
+        keys = set(row.keys())
+        if "relationship_attachment_pace" not in keys:
+            return DEFAULT_RELATIONSHIP_STYLE
+        return RelationshipStyle(
+            attachment_pace=RelationshipPace(
+                str(row["relationship_attachment_pace"])
+            ),
+            expressiveness=RelationshipExpressiveness(
+                str(row["relationship_expressiveness"])
+            ),
+            priority=RelationshipPriority(str(row["relationship_priority"])),
+            conflict_response=RelationshipConflictResponse(
+                str(row["relationship_conflict_response"])
+            ),
+            recovery_pace=RelationshipPace(str(row["relationship_recovery_pace"])),
         )
 
     @staticmethod

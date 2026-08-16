@@ -88,7 +88,7 @@ class RelationshipExtractor:
 
 
 @pytest.mark.asyncio
-async def test_chat_capture_creates_profile_and_confirmable_relationship(
+async def test_chat_capture_creates_profile_and_auto_applies_safe_relationship(
     tmp_path: Path,
 ) -> None:
     repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
@@ -155,9 +155,10 @@ async def test_chat_capture_creates_profile_and_confirmable_relationship(
     snapshot = await relationship_profiles.relationship_snapshot(
         conversation.id, character.character_id
     )
-    assert snapshot.metrics.affinity == 50
-    assert [event.approval for event in snapshot.pending_events] == [
-        RelationshipApproval.PENDING_CONFIRMATION
+    assert snapshot.metrics.affinity == 51
+    assert snapshot.pending_events == ()
+    assert [event.approval for event in snapshot.undoable_events] == [
+        RelationshipApproval.AUTO_APPLIED
     ]
     retry = await capture.capture(
         MemoryCaptureRequest(
@@ -174,27 +175,13 @@ async def test_chat_capture_creates_profile_and_confirmable_relationship(
     assert len(
         await relationship_profiles.list_profile_items(conversation.id)
     ) == 1
-    assert len(
-        (
-            await relationship_profiles.relationship_snapshot(
-                conversation.id, character.character_id
-            )
-        ).pending_events
-    ) == 1
-
-    event_id = result.relationship_event_ids[0]
-    await relationship_profiles.decide_relationship_candidate(
-        conversation_id=conversation.id,
-        event_id=event_id,
-        state="confirmed",
-        operation_id="confirm",
-        recorded_at=NOW,
-    )
-    confirmed = await relationship_profiles.relationship_snapshot(
+    retry_snapshot = await relationship_profiles.relationship_snapshot(
         conversation.id, character.character_id
     )
-    assert confirmed.metrics.affinity == 51
+    assert retry_snapshot.metrics.affinity == 51
+    assert len(retry_snapshot.undoable_events) == 1
 
+    event_id = result.relationship_event_ids[0]
     await relationship_profiles.decide_relationship_candidate(
         conversation_id=conversation.id,
         event_id=event_id,

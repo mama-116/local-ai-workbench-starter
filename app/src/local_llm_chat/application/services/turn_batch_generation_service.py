@@ -7,8 +7,11 @@ from dataclasses import replace
 from local_llm_chat.application.services.relationship_profile_service import (
     RelationshipProfileService,
 )
+from local_llm_chat.application.services.relationship_turn_reception_service import (
+    RelationshipTurnReceptionService,
+)
 from local_llm_chat.domain.canonical_memory import CanonicalMemoryFact
-from local_llm_chat.domain.errors import ValidationError
+from local_llm_chat.domain.errors import AppError, ValidationError
 from local_llm_chat.domain.group_turns import (
     MAX_SHARED_MEMORY_CONTEXT_CHARACTERS,
     MAX_SHARED_MEMORY_FACTS,
@@ -42,12 +45,16 @@ class TurnBatchGenerationService:
         clock: Callable[[], float] = time.monotonic,
         relationship_profiles: RelationshipProfileService | None = None,
         provider_endpoint: Callable[[str], str] | None = None,
+        provider_behavior_allowed: Callable[[str], bool] | None = None,
+        relationship_turn_reception: RelationshipTurnReceptionService | None = None,
     ) -> None:
         self._repository = repository
         self._generator = generator
         self._clock = clock
         self._relationship_profiles = relationship_profiles
         self._provider_endpoint = provider_endpoint
+        self._provider_behavior_allowed = provider_behavior_allowed
+        self._relationship_turn_reception = relationship_turn_reception
 
     async def generate(
         self,
@@ -90,6 +97,23 @@ class TurnBatchGenerationService:
             session.user_message.id,
             tuple(character.character_id for character in characters),
         )
+        if self._relationship_turn_reception is not None:
+            try:
+                await self._relationship_turn_reception.capture(
+                    conversation_id=conversation.id,
+                    branch_id=session.branch_id,
+                    source_message_id=session.user_message.id,
+                    character_ids=tuple(
+                        character.character_id for character in characters
+                    ),
+                )
+            except AppError as error:
+                await self._repository.log_event(
+                    "warning",
+                    "relationship_turn_reception_failed",
+                    {"error_type": type(error).__name__},
+                    session.run.id,
+                )
         relationship_context = ""
         if (
             self._relationship_profiles is not None
@@ -102,6 +126,12 @@ class TurnBatchGenerationService:
                         character.character_id for character in characters
                     ),
                     provider_endpoint=self._provider_endpoint(profile.provider),
+                    allow_private_lan_behavior=(
+                        self._provider_behavior_allowed(profile.provider)
+                        if self._provider_behavior_allowed is not None
+                        else False
+                    ),
+                    current_source_message_id=session.user_message.id,
                 )
             )
         request = TurnBatchGenerationRequest(

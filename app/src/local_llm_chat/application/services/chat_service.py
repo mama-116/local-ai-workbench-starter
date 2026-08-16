@@ -15,6 +15,9 @@ from local_llm_chat.application.services.canonical_memory_context import (
 from local_llm_chat.application.services.relationship_profile_service import (
     RelationshipProfileService,
 )
+from local_llm_chat.application.services.relationship_turn_reception_service import (
+    RelationshipTurnReceptionService,
+)
 from local_llm_chat.application.services.translation_service import (
     TranslationScheduler,
 )
@@ -45,6 +48,20 @@ from local_llm_chat.domain.states import MessageRole, MessageState
 StreamCallback = Callable[[str], Awaitable[None]]
 NoticeCallback = Callable[[str, bool], Awaitable[None]]
 _READ_TOOL_NAME = "read_allowed_text"
+RELATIONSHIP_RECEPTION_TIMEOUT_SECONDS = 2.0
+_RELATIONSHIP_MEANING_LABELS = {
+    "positive_interaction": "肯定的なやり取り",
+    "kept_commitment": "約束が守られた",
+    "respected_boundary": "境界が尊重された",
+    "conflict": "理由のある衝突",
+    "boundary_violation": "境界侵害の可能性",
+    "repeated_boundary_violation": "境界侵害の反復の可能性",
+    "repair": "謝罪・修復",
+}
+
+
+def _relationship_meaning_label(meaning: str) -> str:
+    return _RELATIONSHIP_MEANING_LABELS.get(meaning, meaning)
 
 
 async def _no_update(_: str) -> None:
@@ -68,6 +85,7 @@ class ChatService:
         context_window: ContextWindowManager | None = None,
         memory_capture_scheduler: MemoryCaptureScheduler | None = None,
         relationship_profiles: RelationshipProfileService | None = None,
+        relationship_turn_reception: RelationshipTurnReceptionService | None = None,
     ) -> None:
         self._repository = repository
         self._providers = providers
@@ -79,6 +97,7 @@ class ChatService:
         self._context_window = context_window or ContextWindowManager(repository)
         self._memory_capture_scheduler = memory_capture_scheduler
         self._relationship_profiles = relationship_profiles
+        self._relationship_turn_reception = relationship_turn_reception
 
     async def send_message(
         self,
@@ -183,6 +202,30 @@ class ChatService:
             )
             raise
         system_prompt = character.system_prompt
+        if self._relationship_turn_reception is not None:
+            try:
+                async with asyncio.timeout(RELATIONSHIP_RECEPTION_TIMEOUT_SECONDS):
+                    reception = await self._relationship_turn_reception.capture(
+                        conversation_id=conversation.id,
+                        branch_id=session.branch_id,
+                        source_message_id=session.user_message.id,
+                        character_ids=(character.character_id,),
+                        character_names={
+                            character.character_id: character.display_name
+                        },
+                    )
+                if reception.meanings:
+                    await on_notice(
+                        f"今回の受け止め: {_relationship_meaning_label(reception.meanings[-1].value)}",
+                        False,
+                    )
+            except (AppError, TimeoutError) as error:
+                await self._repository.log_event(
+                    "warning",
+                    "relationship_turn_reception_failed",
+                    {"error_type": type(error).__name__},
+                    session.run.id,
+                )
         if memory_context:
             system_prompt = f"{system_prompt}\n\n{memory_context}"
         if self._relationship_profiles is not None:
@@ -191,6 +234,15 @@ class ChatService:
                     conversation_id=conversation.id,
                     character_ids=(character.character_id,),
                     provider_endpoint=provider.metadata.endpoint,
+                    allow_private_lan_behavior=next(
+                        (
+                            connection.relationship_behavior_allowed
+                            for connection in self._providers.list_connections()
+                            if connection.provider_name == profile.provider
+                        ),
+                        False,
+                    ),
+                    current_source_message_id=session.user_message.id,
                 )
             )
             if relationship_context:

@@ -37,6 +37,7 @@ async def test_saves_lan_confirmation_and_reloads_it(tmp_path: Path) -> None:
             "推論PC",
             "http://192.168.1.17:11434",
             True,
+            True,
         )
         assert registry.cloud_is_disabled(saved.provider_name) is True
     finally:
@@ -55,8 +56,31 @@ async def test_saves_lan_confirmation_and_reloads_it(tmp_path: Path) -> None:
         )
         assert restored.display_name == "推論PC"
         assert restored.cloud_disabled_confirmed is True
+        assert restored.relationship_behavior_allowed is True
     finally:
         await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_changing_lan_endpoint_resets_relationship_behavior_permission(
+    tmp_path: Path,
+) -> None:
+    registry = OllamaProviderRegistry(
+        tmp_path / "connections.json",
+        tmp_path / "server.json",
+        FreeOperationPolicy(),
+    )
+    try:
+        changed = await registry.save_connection(
+            "lan-192-168-1-17",
+            "別の推論PC",
+            "http://192.168.1.18:11434",
+            True,
+            True,
+        )
+        assert changed.relationship_behavior_allowed is False
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio

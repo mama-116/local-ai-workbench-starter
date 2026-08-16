@@ -7,7 +7,8 @@ from enum import StrEnum
 from local_llm_chat.domain.errors import ValidationError
 
 
-RELATIONSHIP_POLICY_VERSION = "relationship-v1"
+RELATIONSHIP_POLICY_VERSION = "relationship-v2"
+LEGACY_RELATIONSHIP_POLICY_VERSION = "relationship-v1"
 MAX_RELATIONSHIP_CANDIDATES_PER_MESSAGE = 8
 INITIAL_AFFINITY = 50
 INITIAL_TRUST = 30
@@ -201,6 +202,9 @@ class RelationshipEvent:
     assignment_state: RelationshipAssignmentState | None
     role: str | None
     recorded_at: datetime
+    affinity_delta: int | None = None
+    trust_delta: int | None = None
+    tension_delta: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +255,7 @@ class RelationshipCandidateRequest:
     model_name: str
     content: str
     allowed_character_ids: frozenset[str]
+    allowed_characters: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,35 +279,6 @@ class RelationshipContext:
     recent_events: tuple[RelationshipEvent, ...]
 
 
-_SEVERITY_INDEX = {
-    RelationshipSeverity.LOW: 0,
-    RelationshipSeverity.MEDIUM: 1,
-    RelationshipSeverity.HIGH: 2,
-}
-
-_DELTA_TABLE: dict[
-    RelationshipMeaning, tuple[tuple[int, int, int], ...]
-] = {
-    RelationshipMeaning.POSITIVE_INTERACTION: ((1, 1, -1), (2, 2, -2), (5, 4, -4)),
-    RelationshipMeaning.KEPT_COMMITMENT: ((1, 2, -1), (3, 4, -2), (5, 5, -4)),
-    RelationshipMeaning.RESPECTED_BOUNDARY: ((1, 2, -2), (3, 4, -4), (5, 5, -6)),
-    RelationshipMeaning.CONFLICT: ((-1, -1, 3), (-3, -2, 6), (-5, -5, 10)),
-    RelationshipMeaning.BOUNDARY_VIOLATION: (
-        (-2, -3, 4),
-        (-4, -5, 7),
-        (-5, -5, 10),
-    ),
-    RelationshipMeaning.REPEATED_BOUNDARY_VIOLATION: (
-        (-3, -4, 6),
-        (-5, -5, 9),
-        (-5, -5, 10),
-    ),
-    RelationshipMeaning.REPAIR: ((1, 1, -2), (2, 2, -4), (3, 3, -6)),
-    RelationshipMeaning.RELATIONSHIP_SET: ((0, 0, 0),) * 3,
-    RelationshipMeaning.RELATIONSHIP_RETIRED: ((0, 0, 0),) * 3,
-}
-
-
 def reduce_relationship_events(
     events: tuple[RelationshipEvent, ...],
 ) -> RelationshipMetrics:
@@ -315,7 +291,10 @@ def reduce_relationship_events(
         if event.id in seen:
             continue
         seen.add(event.id)
-        if event.policy_version != RELATIONSHIP_POLICY_VERSION:
+        if event.policy_version not in {
+            LEGACY_RELATIONSHIP_POLICY_VERSION,
+            RELATIONSHIP_POLICY_VERSION,
+        }:
             raise ValidationError("unknown relationship reducer policy version")
         if event.approval not in {
             RelationshipApproval.AUTO_APPLIED,
@@ -328,7 +307,22 @@ def reduce_relationship_events(
             tension = INITIAL_TENSION
             applied.append(event.id)
             continue
-        delta = _DELTA_TABLE[event.meaning][_SEVERITY_INDEX[event.severity]]
+        from local_llm_chat.domain.relationship_behavior import (
+            base_relationship_delta,
+        )
+
+        base_delta = base_relationship_delta(event.meaning, event.severity)
+        delta = (
+            (
+                event.affinity_delta,
+                event.trust_delta,
+                event.tension_delta,
+            )
+            if event.affinity_delta is not None
+            and event.trust_delta is not None
+            and event.tension_delta is not None
+            else (base_delta.affinity, base_delta.trust, base_delta.tension)
+        )
         affinity_delta = _bounded(
             delta[0], -MAX_AFFINITY_OR_TRUST_DELTA, MAX_AFFINITY_OR_TRUST_DELTA
         )

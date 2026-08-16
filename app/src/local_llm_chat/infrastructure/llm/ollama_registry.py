@@ -78,6 +78,7 @@ class OllamaProviderRegistry:
         display_name: str,
         endpoint: str,
         cloud_disabled_confirmed: bool,
+        relationship_behavior_allowed: bool = False,
     ) -> ProviderConnection:
         name = display_name.strip()
         normalized_endpoint = endpoint.strip().rstrip("/")
@@ -104,6 +105,11 @@ class OllamaProviderRegistry:
             display_name=name,
             endpoint=normalized_endpoint,
             cloud_disabled_confirmed=cloud_disabled_confirmed,
+            relationship_behavior_allowed=(
+                relationship_behavior_allowed
+                if existing is None or existing.endpoint == normalized_endpoint
+                else False
+            ),
         )
         self._connections = [
             saved if item.id == target_id else item for item in self._connections
@@ -163,6 +169,9 @@ class OllamaProviderRegistry:
                 endpoint=str(raw["endpoint"]).rstrip("/"),
                 cloud_disabled_confirmed=bool(raw["cloud_disabled_confirmed"]),
                 is_builtin=bool(raw.get("is_builtin", False)),
+                relationship_behavior_allowed=bool(
+                    raw.get("relationship_behavior_allowed", False)
+                ),
             )
             self._free_policy.require_endpoint(connection.endpoint)
         except (KeyError, TypeError, ValidationError):
@@ -183,6 +192,9 @@ class OllamaProviderRegistry:
                 "endpoint": item.endpoint,
                 "cloud_disabled_confirmed": item.cloud_disabled_confirmed,
                 "is_builtin": item.is_builtin,
+                "relationship_behavior_allowed": (
+                    item.relationship_behavior_allowed
+                ),
             }
             for item in self._connections
         ]

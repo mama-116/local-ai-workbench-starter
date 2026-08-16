@@ -810,6 +810,12 @@ async def test_relationship_context_is_loopback_only_and_uses_group_intersection
         character_ids=(first_character_id,),
         provider_endpoint="http://192.168.1.20:11434",
     )
+    permitted_lan = await service.render_generation_context(
+        conversation_id=conversation_id,
+        character_ids=(first_character_id,),
+        provider_endpoint="http://192.168.1.20:11434",
+        allow_private_lan_behavior=True,
+    )
 
     assert "秘密の呼ばれ方" in single
     assert "private-event" in single
@@ -817,3 +823,9 @@ async def test_relationship_context_is_loopback_only_and_uses_group_intersection
     assert "秘密の呼ばれ方" not in group
     assert "private-event" not in group
     assert lan == ""
+    assert '"version":"relationship-behavior-v1"' in permitted_lan
+    assert '"affinity_band"' in permitted_lan
+    assert first_character_id not in permitted_lan
+    assert continuity_id not in permitted_lan
+    assert "秘密の呼ばれ方" not in permitted_lan
+    assert "private-event" not in permitted_lan
