@@ -15,6 +15,9 @@ from local_llm_chat.application.model_selection import (
 from local_llm_chat.application.services.conversation_timeline_service import (
     ConversationTimelineItem,
 )
+from local_llm_chat.application.services.explicit_memory_service import (
+    ExplicitMemorySaveRequest,
+)
 from local_llm_chat.application.services.memory_capture_service import (
     MemoryCaptureState,
     MemoryCaptureUpdate,
@@ -54,6 +57,7 @@ from local_llm_chat.domain.states import (
     EmbeddingIndexState,
     MessageRole,
     MessageState,
+    MemoryKind,
 )
 from local_llm_chat.presentation.components.computer_use_review import (
     ComputerUseReviewDialog,
@@ -1288,6 +1292,10 @@ class LocalChatApp:
             "food_allergy": "食物アレルギー",
             "personal_goal": "目標",
             "club_membership_intent": "所属の意向",
+            "explicit_note": "明示保存した内容",
+            "explicit_goal": "明示保存した目標",
+            "explicit_safety": "明示保存した健康・安全情報",
+            "liked_food_condition": "好きな食べ物の条件",
         }.get(item.slot, item.slot)
         scope = (
             "会話内で共有"
@@ -1346,6 +1354,15 @@ class LocalChatApp:
             return MessageBubble(
                 message,
                 on_rewrite=lambda: self.show_rewrite_dialog(message),
+                on_remember=(
+                    (
+                        lambda: self.page.run_task(
+                            self.show_explicit_memory_dialog, message
+                        )
+                    )
+                    if message.state is MessageState.COMPLETED
+                    else None
+                ),
             )
         return MessageBubble(
             message,
@@ -1369,6 +1386,354 @@ class LocalChatApp:
             self._toast(str(error), ERROR)
         except Exception:
             self._toast("日本語訳を開始できませんでした。原文は保持されています。", ERROR)
+
+    async def show_explicit_memory_dialog(self, source: Message) -> None:
+        conversation = self._selected_conversation()
+        if (
+            conversation is None
+            or conversation.id != source.conversation_id
+            or source.state is not MessageState.COMPLETED
+        ):
+            self._toast("現在の会話にある完了済み発言を選んでください。", ERROR)
+            return
+        try:
+            draft = await self.container.explicit_memory.prepare(
+                conversation.id,
+                conversation.active_branch_id,
+                source.id,
+            )
+            selection = await self.container.conversations.selection(conversation.id)
+            initial_suggestion = await self.container.explicit_memory.suggest(
+                conversation.id,
+                conversation.active_branch_id,
+                draft.selected_source_message_ids,
+                MemoryKind.PREFERENCE,
+                selection.character.character_id,
+                use_model=False,
+            )
+        except AppError as error:
+            self._toast(str(error), ERROR)
+            return
+
+        checked: dict[str, ft.Checkbox] = {}
+        knowledge_checked: dict[str, ft.Checkbox] = {}
+        knowledge_controls: list[ft.Control] = []
+        for character in draft.knowledge_character_options:
+            automatically_known = (
+                character.character_id in draft.auto_known_by_character_ids
+            )
+            checkbox = ft.Checkbox(value=automatically_known)
+            knowledge_checked[character.character_id] = checkbox
+            knowledge_controls.append(
+                ft.Row(
+                    [
+                        checkbox,
+                        ft.Text(
+                            character.display_name,
+                            size=13,
+                            color=TEXT,
+                            expand=True,
+                        ),
+                        ft.Container(
+                            content=ft.Text(
+                                (
+                                    "自動：この場にいた"
+                                    if automatically_known
+                                    else "手動で追加"
+                                ),
+                                size=10,
+                                color=MINT if automatically_known else MUTED,
+                            ),
+                            bgcolor=(
+                                "#183B32" if automatically_known else "#302E29"
+                            ),
+                            border_radius=12,
+                            padding=ft.Padding.symmetric(
+                                horizontal=9, vertical=4
+                            ),
+                        ),
+                    ],
+                    spacing=6,
+                )
+            )
+        item = ft.TextField(
+            label="好きなもの",
+            value=initial_suggestion.item,
+            max_length=160,
+        )
+        condition = ft.TextField(
+            label="好みの状態（任意）",
+            value=initial_suggestion.condition or "",
+            max_length=80,
+        )
+        summary = ft.TextField(
+            label="記憶として保存する内容",
+            value=initial_suggestion.summary,
+            read_only=True,
+            multiline=True,
+            min_lines=2,
+            max_lines=3,
+        )
+        suggestion_status = ft.Text(
+            (
+                "抽出モデルを利用できなかったため、安全に確認できた項目だけ表示しています。"
+                if initial_suggestion.extractor_unavailable
+                else "各項目は選択した原文に存在する語句だけで構成されます。"
+            ),
+            size=11,
+            color=MUTED,
+        )
+
+        source_controls: list[ft.Control] = []
+        for message in draft.source_messages:
+            checkbox = ft.Checkbox(
+                value=message.id in draft.selected_source_message_ids,
+            )
+            checked[message.id] = checkbox
+            source_controls.append(
+                ft.Row(
+                    [
+                        checkbox,
+                        ft.Text(
+                            message.content.strip()[:120],
+                            size=12,
+                            color=TEXT,
+                            expand=True,
+                        ),
+                    ],
+                    spacing=6,
+                )
+            )
+
+        kind = ft.Dropdown(
+            label="記憶の種類",
+            value=MemoryKind.PREFERENCE.value,
+            options=[
+                ft.DropdownOption(
+                    key=MemoryKind.PREFERENCE.value,
+                    text="好み・プロフィール",
+                ),
+                ft.DropdownOption(key=MemoryKind.GOAL.value, text="目標"),
+                ft.DropdownOption(
+                    key=MemoryKind.SAFETY_CONSTRAINT.value,
+                    text="健康・安全",
+                ),
+            ],
+        )
+        request_id = str(uuid4())
+        suggestion_generation = 0
+
+        def selected_source_ids() -> tuple[str, ...]:
+            return tuple(
+                message.id
+                for message in draft.source_messages
+                if bool(checked[message.id].value)
+            )
+
+        def selected_knowledge_character_ids() -> frozenset[str]:
+            return frozenset(
+                character_id
+                for character_id, checkbox in knowledge_checked.items()
+                if bool(checkbox.value)
+            )
+
+        def refresh_summary() -> None:
+            nonlocal suggestion_generation
+            suggestion_generation += 1
+            selected_kind = MemoryKind(
+                kind.value or MemoryKind.PREFERENCE.value
+            )
+            condition.visible = selected_kind is MemoryKind.PREFERENCE
+            selected_condition = (
+                condition.value or ""
+                if selected_kind is MemoryKind.PREFERENCE
+                else None
+            )
+            try:
+                summary.value = self.container.explicit_memory.compose_summary(
+                    selected_kind,
+                    item.value or "",
+                    selected_condition,
+                )
+            except AppError:
+                summary.value = ""
+            condition.update()
+            summary.update()
+
+        async def rebuild_suggestion() -> None:
+            nonlocal suggestion_generation
+            selected_ids = selected_source_ids()
+            if not selected_ids:
+                self._toast("根拠にする発言を1件以上選んでください。", ERROR)
+                return
+            suggestion_generation += 1
+            generation = suggestion_generation
+            selected_kind = MemoryKind(
+                kind.value or MemoryKind.PREFERENCE.value
+            )
+            suggestion_status.value = "短い記憶文を作っています…"
+            suggestion_status.update()
+            try:
+                suggestion = await self.container.explicit_memory.suggest(
+                    conversation.id,
+                    conversation.active_branch_id,
+                    selected_ids,
+                    selected_kind,
+                    selection.character.character_id,
+                )
+            except AppError as error:
+                if generation != suggestion_generation:
+                    return
+                suggestion_status.value = str(error)
+                suggestion_status.color = ERROR
+                suggestion_status.update()
+                return
+            if generation != suggestion_generation:
+                return
+            item.value = suggestion.item
+            condition.value = suggestion.condition or ""
+            summary.value = suggestion.summary
+            suggestion_status.value = (
+                "抽出モデルを利用できなかったため、安全に確認できた項目だけ表示しています。"
+                if suggestion.extractor_unavailable
+                else "各項目は選択した原文に存在する語句だけで構成されます。"
+            )
+            suggestion_status.color = MUTED
+            item.update()
+            condition.update()
+            summary.update()
+            suggestion_status.update()
+
+        def mark_sources_changed() -> None:
+            nonlocal suggestion_generation
+            suggestion_generation += 1
+            item.value = ""
+            condition.value = ""
+            summary.value = ""
+            suggestion_status.value = (
+                "根拠を変更しました。「短く整え直す」を押してください。"
+            )
+            item.update()
+            condition.update()
+            summary.update()
+            suggestion_status.update()
+
+        def rebuild_for_kind() -> None:
+            mark_sources_changed()
+            suggestion_status.value = "記憶の種類に合わせて短く整え直しています…"
+            suggestion_status.update()
+            self.page.run_task(rebuild_suggestion)
+
+        for checkbox in checked.values():
+            checkbox.on_change = mark_sources_changed
+        item.on_change = refresh_summary
+        condition.on_change = refresh_summary
+        kind.on_select = rebuild_for_kind
+
+        async def save() -> None:
+            current = self._selected_conversation()
+            selected_ids = selected_source_ids()
+            if current is None or current.id != conversation.id:
+                self._toast("会話が切り替わったため保存を中止しました。", ERROR)
+                return
+            known_by_character_ids = selected_knowledge_character_ids()
+            if not known_by_character_ids:
+                self._toast(
+                    "この情報を知っている人物を1人以上選んでください。",
+                    ERROR,
+                )
+                return
+            try:
+                await self.container.explicit_memory.save(
+                    ExplicitMemorySaveRequest(
+                        request_id=request_id,
+                        conversation_id=current.id,
+                        branch_id=current.active_branch_id,
+                        source_message_ids=selected_ids,
+                        item=item.value or "",
+                        condition=(
+                            condition.value or None
+                            if kind.value == MemoryKind.PREFERENCE.value
+                            else None
+                        ),
+                        kind=MemoryKind(
+                            kind.value or MemoryKind.PREFERENCE.value
+                        ),
+                        known_by_character_ids=known_by_character_ids,
+                    )
+                )
+            except AppError as error:
+                self._toast(str(error), ERROR)
+                return
+            self.page.pop_dialog()
+            await self._refresh_memory_review(
+                current.id, current.active_branch_id
+            )
+            self.page.update()
+            self._toast("選択した発言を記憶へ保存しました。", MINT)
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title="覚えておいて",
+                bgcolor="#24231F",
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "根拠を選び、短く整えた記憶文を確認してください。原文は引用用に保持されます。",
+                            size=12,
+                            color=MUTED,
+                        ),
+                        ft.Column(source_controls, spacing=4, scroll=ft.ScrollMode.AUTO),
+                        ft.Divider(height=12, color="#3A3833"),
+                        ft.Text(
+                            "この情報を知っている人物",
+                            size=13,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT,
+                        ),
+                        ft.Text(
+                            "発言時に会話へ参加していた人物は自動で選ばれます。保存前に変更できます。",
+                            size=11,
+                            color=MUTED,
+                        ),
+                        ft.Column(
+                            knowledge_controls,
+                            spacing=3,
+                            height=min(
+                                180,
+                                max(48, len(knowledge_controls) * 44),
+                            ),
+                            scroll=ft.ScrollMode.AUTO,
+                        ),
+                        kind,
+                        ft.Button(
+                            "選択した発言から短く整え直す",
+                            icon=ft.Icons.AUTO_FIX_HIGH_ROUNDED,
+                            on_click=rebuild_suggestion,
+                        ),
+                        item,
+                        condition,
+                        summary,
+                        suggestion_status,
+                    ],
+                    tight=True,
+                    width=520,
+                    height=680,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                actions=[
+                    ft.Button("キャンセル", on_click=self._close_dialog),
+                    ft.Button(
+                        "記憶へ保存",
+                        bgcolor=ACCENT,
+                        color="#17120D",
+                        on_click=save,
+                    ),
+                ],
+            )
+        )
+        self.page.run_task(rebuild_suggestion)
 
     async def _on_translation_update(self, message_id: str) -> None:
         if self._generation_task is not None:

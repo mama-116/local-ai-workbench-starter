@@ -40,6 +40,13 @@ _FOOD_CONDITION_ONLY_PATTERN = re.compile(
     r")"
     r"(?:状態|もの|方|の)?"
 )
+_THIRD_PARTY_FOOD_PREFERENCE_PATTERN = re.compile(
+    r"(?P<subject>妹|弟|姉|兄|母|父|夫|妻|祖母|祖父|友人|友達)は"
+    r"(?P<value>[^「『\"'、。！？!?\r\n]{1,160})が好き(?:です)?"
+)
+_GROUNDED_THIRD_PARTY_SUBJECTS = frozenset(
+    {"妹", "弟", "姉", "兄", "母", "父", "夫", "妻", "祖母", "祖父", "友人", "友達"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +83,8 @@ DEFAULT_MEMORY_TEMPLATES = (
         MemoryCardinality.MULTIPLE,
         requires_confirmation=True,
         evidence_patterns=(
-            r"{value}\s*アレルギー",
-            r"{value}\s*にアレルギー",
+            r"{value}\s*アレルギー(?:です)?",
+            r"{value}\s*にアレルギー(?:があります|です)?",
         ),
     ),
     MemoryTemplate(
@@ -141,6 +148,8 @@ class MemoryCandidateService:
             )[:MAX_MEMORY_CANDIDATES_PER_MESSAGE]
             if fallback_candidates:
                 return MemoryCandidateGeneration(fallback_candidates, True)
+            if self._is_known_non_memory_statement(request.content):
+                return MemoryCandidateGeneration((), True)
             raise
         if len(drafts) > MAX_MEMORY_CANDIDATES_PER_MESSAGE:
             raise ValidationError("1発言の記憶候補は8件までです。")
@@ -205,6 +214,33 @@ class MemoryCandidateService:
             leading_space = len(raw_clause) - len(raw_clause.lstrip())
             evidence_start = clause_match.start() + leading_space
             evidence_end = evidence_start + len(clause)
+
+            third_party = _THIRD_PARTY_FOOD_PREFERENCE_PATTERN.fullmatch(clause)
+            if third_party is not None:
+                subject = third_party.group("subject").strip()
+                value = third_party.group("value").strip()
+                if self._is_semantically_valid_value(
+                    self._templates[
+                        (MemoryKind.PREFERENCE, "liked_food")
+                    ],
+                    value,
+                ):
+                    drafts.append(
+                        MemoryCandidateDraft(
+                            subject_id=(
+                                request.author_subject_id
+                                if subject in {"私", "自分"}
+                                else subject
+                            ),
+                            kind=MemoryKind.PREFERENCE,
+                            slot="liked_food",
+                            value=value,
+                            evidence_mode=MemoryEvidenceMode.EXPLICIT,
+                            evidence_start=evidence_start,
+                            evidence_end=evidence_end,
+                        )
+                    )
+                    continue
 
             for template in self._templates.values():
                 matched_value = self._fullmatch_template_value(template, clause)
@@ -280,7 +316,12 @@ class MemoryCandidateService:
         template = self._templates.get((draft.kind, draft.slot))
         value = draft.value.strip()
 
-        if draft.subject_id not in request.allowed_subject_ids:
+        if (
+            draft.subject_id not in request.allowed_subject_ids
+            and not self._is_grounded_third_party_subject(
+                draft.subject_id, evidence_text
+            )
+        ):
             return self._blocked(
                 request, draft, value, evidence_text, template, MemoryCandidateReason.SUBJECT_UNKNOWN
             )
@@ -362,17 +403,6 @@ class MemoryCandidateService:
                 MemoryCandidateReason.TEMPLATE_REQUIRES_CONFIRMATION,
                 MemoryApprovalState.PENDING_CONFIRMATION,
             )
-        if request.known_by_character_ids:
-            return self._candidate(
-                request,
-                draft,
-                value,
-                evidence_text,
-                template,
-                MemoryCandidateDisposition.REQUIRE_CONFIRMATION,
-                MemoryCandidateReason.RESTRICTED_KNOWLEDGE_SCOPE,
-                MemoryApprovalState.PENDING_CONFIRMATION,
-            )
         if draft.subject_id != request.author_subject_id:
             return self._candidate(
                 request,
@@ -393,6 +423,38 @@ class MemoryCandidateService:
             MemoryCandidateDisposition.AUTO_SAVE,
             MemoryCandidateReason.EXPLICIT_LOW_RISK,
             MemoryApprovalState.AUTO_SAVED,
+        )
+
+    @staticmethod
+    def _is_grounded_third_party_subject(
+        subject_id: str | None, evidence_text: str
+    ) -> bool:
+        return bool(
+            subject_id
+            and subject_id in _GROUNDED_THIRD_PARTY_SUBJECTS
+            and len(subject_id) <= 40
+            and evidence_text.startswith(f"{subject_id}は")
+        )
+
+    @staticmethod
+    def _is_known_non_memory_statement(content: str) -> bool:
+        unsafe_markers = (
+            "ではなく",
+            "じゃなく",
+            "ではない",
+            "じゃない",
+            "好きではない",
+            "前は",
+            "前まで",
+            "以前は",
+            "昔は",
+            "かつて",
+            "好きだった",
+            "と言っていた",
+            "と言った",
+        )
+        return any(marker in content for marker in unsafe_markers) or any(
+            marker in content for marker in ("「", "」", "『", "』", '"', "'")
         )
 
     @staticmethod

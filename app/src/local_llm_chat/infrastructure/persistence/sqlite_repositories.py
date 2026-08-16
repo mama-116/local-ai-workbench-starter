@@ -14,6 +14,7 @@ from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 from local_llm_chat.domain.canonical_memory import (
+    CanonicalMemoryAttribute,
     CanonicalMemoryEvent,
     CanonicalMemoryFact,
     CanonicalMemoryReviewItem,
@@ -3323,6 +3324,130 @@ class SQLiteAppRepository:
 
         return await self._read(operation)
 
+    async def list_memory_source_messages(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        through_source_message_id: str,
+        limit: int,
+    ) -> tuple[Message, ...]:
+        if limit <= 0:
+            raise ValidationError("記憶の根拠件数は1件以上必要です。")
+
+        def operation(connection: sqlite3.Connection) -> tuple[Message, ...]:
+            self._require_conversation(connection, conversation_id)
+            path = self._message_path(connection, branch_id)
+            through_position = next(
+                (
+                    index
+                    for index, message in enumerate(path)
+                    if message.id == through_source_message_id
+                ),
+                None,
+            )
+            if through_position is None:
+                raise ValidationError("選択した発言は現在の分岐にありません。")
+            source = path[through_position]
+            if (
+                source.role is not MessageRole.USER
+                or source.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError("完了したユーザー発言だけを記憶にできます。")
+            candidates = tuple(
+                message
+                for message in path[: through_position + 1]
+                if message.role is MessageRole.USER
+                and message.state is MessageState.COMPLETED
+            )
+            return candidates[-limit:]
+
+        return await self._read(operation)
+
+    async def get_memory_source_messages(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        source_message_ids: tuple[str, ...],
+    ) -> tuple[Message, ...]:
+        if not source_message_ids or len(source_message_ids) != len(
+            set(source_message_ids)
+        ):
+            raise ValidationError("記憶の根拠発言が空または重複しています。")
+
+        def operation(connection: sqlite3.Connection) -> tuple[Message, ...]:
+            self._require_conversation(connection, conversation_id)
+            path = self._message_path(connection, branch_id)
+            positions = {message.id: index for index, message in enumerate(path)}
+            if any(source_id not in positions for source_id in source_message_ids):
+                raise ValidationError("現在の分岐にない発言は記憶の根拠にできません。")
+            ordered_ids = tuple(
+                sorted(source_message_ids, key=lambda source_id: positions[source_id])
+            )
+            if ordered_ids != source_message_ids:
+                raise ValidationError("記憶の根拠発言は会話順に選択してください。")
+            messages_by_id = {message.id: message for message in path}
+            messages = tuple(messages_by_id[source_id] for source_id in ordered_ids)
+            if any(
+                message.role is not MessageRole.USER
+                or message.state is not MessageState.COMPLETED
+                for message in messages
+            ):
+                raise ValidationError("完了したユーザー発言だけを記憶にできます。")
+            return messages
+
+        return await self._read(operation)
+
+    async def get_memory_source_listener_character_ids(
+        self, conversation_id: str, source_message_id: str
+    ) -> frozenset[str]:
+        def operation(connection: sqlite3.Connection) -> frozenset[str]:
+            source = self._require_message(connection, source_message_id)
+            if source.conversation_id != conversation_id:
+                raise ValidationError(
+                    "memory source belongs to another conversation"
+                )
+            group_row = connection.execute(
+                """
+                SELECT formal_character_ids_json
+                FROM turn_batches
+                WHERE conversation_id = ? AND source_message_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (conversation_id, source_message_id),
+            ).fetchone()
+            if group_row is not None:
+                character_ids = json.loads(
+                    str(group_row["formal_character_ids_json"])
+                )
+                if not isinstance(character_ids, list) or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in character_ids
+                ):
+                    raise PersistenceError(
+                        "turn batch contains an invalid listener snapshot"
+                    )
+                return frozenset(character_ids)
+
+            run_row = connection.execute(
+                """
+                SELECT cv.character_id
+                FROM runs r
+                JOIN character_versions cv ON cv.id = r.character_version_id
+                WHERE r.conversation_id = ? AND r.request_message_id = ?
+                ORDER BY r.rowid DESC
+                LIMIT 1
+                """,
+                (conversation_id, source_message_id),
+            ).fetchone()
+            if run_row is None:
+                raise ValidationError(
+                    "memory source has no listener snapshot"
+                )
+            return frozenset({str(run_row["character_id"])})
+
+        return await self._read(operation)
+
     async def save_model_role_setting(
         self, setting: ModelRoleSetting
     ) -> ModelRoleSetting:
@@ -3949,6 +4074,11 @@ class SQLiteAppRepository:
     def _append_captured_memory_event_in_transaction(
         self, connection: sqlite3.Connection, event: CanonicalMemoryEvent
     ) -> str | None:
+        event = replace(
+            event,
+            source_message_ids=event.source_message_ids
+            or (event.source_message_id,),
+        )
         if event.supersedes_event_id is not None:
             raise ValidationError(
                 "captured memory must not choose its own replacement target"
@@ -4045,6 +4175,17 @@ class SQLiteAppRepository:
                 event,
                 supersedes_event_id=replacement_target.id,
                 recorded_at=max(event.recorded_at, replacement_target.recorded_at),
+                source_message_ids=tuple(
+                    dict.fromkeys(
+                        (
+                            *(
+                                replacement_target.source_message_ids
+                                or (replacement_target.source_message_id,)
+                            ),
+                            *(event.source_message_ids or (event.source_message_id,)),
+                        )
+                    )
+                ),
             )
         self._append_canonical_memory_event_in_transaction(connection, event)
         return event.id
@@ -4052,6 +4193,11 @@ class SQLiteAppRepository:
     def _append_canonical_memory_event_in_transaction(
         self, connection: sqlite3.Connection, event: CanonicalMemoryEvent
     ) -> None:
+        event = replace(
+            event,
+            source_message_ids=event.source_message_ids
+            or (event.source_message_id,),
+        )
         self._require_conversation(connection, event.conversation_id)
         branch_lineage = self._branch_lineage(
             connection, event.conversation_id, event.branch_id
@@ -4062,8 +4208,23 @@ class SQLiteAppRepository:
         branch_message_ids = {
             message.id for message in self._message_path(connection, event.branch_id)
         }
-        if event.source_message_id not in branch_message_ids:
+        source_message_ids = event.source_message_ids or (event.source_message_id,)
+        if (
+            source_message_ids[-1] != event.source_message_id
+            or len(source_message_ids) != len(set(source_message_ids))
+            or any(source_id not in branch_message_ids for source_id in source_message_ids)
+        ):
             raise ValidationError("memory source is not in the selected branch")
+        for source_message_id in source_message_ids:
+            evidence_source = self._require_message(connection, source_message_id)
+            if (
+                evidence_source.conversation_id != event.conversation_id
+                or evidence_source.role is not MessageRole.USER
+                or evidence_source.state is not MessageState.COMPLETED
+            ):
+                raise ValidationError(
+                    "memory evidence must use completed user messages"
+                )
 
         existing_events, decisions = self._load_canonical_memory_stream(
             connection, event.conversation_id
@@ -4132,6 +4293,35 @@ class SQLiteAppRepository:
             tuple(
                 (event.id, character_id)
                 for character_id in sorted(event.known_by_character_ids)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO canonical_memory_event_attributes(
+                event_id, conversation_id, attribute_key,
+                attribute_value, source_message_id
+            ) VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    event.id,
+                    event.conversation_id,
+                    attribute.key,
+                    attribute.value,
+                    attribute.source_message_id,
+                )
+                for attribute in event.attributes
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO canonical_memory_event_sources(
+                event_id, conversation_id, source_message_id, ordinal
+            ) VALUES(?, ?, ?, ?)
+            """,
+            (
+                (event.id, event.conversation_id, source_message_id, ordinal)
+                for ordinal, source_message_id in enumerate(source_message_ids)
             ),
         )
 
@@ -4216,15 +4406,57 @@ class SQLiteAppRepository:
             """,
             (conversation_id,),
         ).fetchall()
+        source_rows = connection.execute(
+            """
+            SELECT source.event_id, source.source_message_id, source.ordinal
+            FROM canonical_memory_event_sources source
+            JOIN canonical_memory_events event ON event.id = source.event_id
+            WHERE event.conversation_id = ?
+            ORDER BY source.event_id, source.ordinal
+            """,
+            (conversation_id,),
+        ).fetchall()
+        attribute_rows = connection.execute(
+            """
+            SELECT attribute.event_id, attribute.attribute_key,
+                   attribute.attribute_value, attribute.source_message_id
+            FROM canonical_memory_event_attributes attribute
+            JOIN canonical_memory_events event ON event.id = attribute.event_id
+            WHERE event.conversation_id = ?
+            ORDER BY attribute.event_id, attribute.attribute_key
+            """,
+            (conversation_id,),
+        ).fetchall()
         knowledge: dict[str, set[str]] = {}
         for row in knowledge_rows:
             knowledge.setdefault(str(row["event_id"]), set()).add(
                 str(row["character_id"])
             )
+        sources: dict[str, list[str]] = {}
+        for row in source_rows:
+            sources.setdefault(str(row["event_id"]), []).append(
+                str(row["source_message_id"])
+            )
+        attributes: dict[str, list[CanonicalMemoryAttribute]] = {}
+        for row in attribute_rows:
+            attributes.setdefault(str(row["event_id"]), []).append(
+                CanonicalMemoryAttribute(
+                    key=str(row["attribute_key"]),
+                    value=str(row["attribute_value"]),
+                    source_message_id=str(row["source_message_id"]),
+                )
+            )
         for row in event_rows:
             event_id = str(row["id"])
             if len(knowledge.get(event_id, set())) != int(row["knowledge_count"]):
                 raise PersistenceError("正史記憶の知識範囲が壊れています。")
+            event_sources = sources.get(event_id, [])
+            if (
+                not event_sources
+                or event_sources[-1] != str(row["source_message_id"])
+                or len(event_sources) != len(set(event_sources))
+            ):
+                raise PersistenceError("正史記憶の出典一覧が壊れています。")
         events = tuple(
             CanonicalMemoryEvent(
                 id=str(row["id"]),
@@ -4245,6 +4477,8 @@ class SQLiteAppRepository:
                 ),
                 effective_at=datetime.fromisoformat(str(row["effective_at"])),
                 recorded_at=datetime.fromisoformat(str(row["recorded_at"])),
+                source_message_ids=tuple(sources[str(row["id"])]),
+                attributes=tuple(attributes.get(str(row["id"]), [])),
             )
             for row in event_rows
         )

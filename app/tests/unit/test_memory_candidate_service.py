@@ -334,9 +334,9 @@ async def test_secret_scope_upgrades_low_risk_candidate_to_confirmation() -> Non
         )
     )[0]
 
-    assert candidate.disposition is MemoryCandidateDisposition.REQUIRE_CONFIRMATION
-    assert candidate.reason is MemoryCandidateReason.RESTRICTED_KNOWLEDGE_SCOPE
-    assert candidate.initial_approval is MemoryApprovalState.PENDING_CONFIRMATION
+    assert candidate.disposition is MemoryCandidateDisposition.AUTO_SAVE
+    assert candidate.reason is MemoryCandidateReason.EXPLICIT_LOW_RISK
+    assert candidate.initial_approval is MemoryApprovalState.AUTO_SAVED
     assert candidate.known_by_character_ids == frozenset({"character-alice"})
 
 
@@ -525,6 +525,54 @@ async def test_third_party_low_risk_fact_requires_confirmation() -> None:
 
     assert candidate.disposition is MemoryCandidateDisposition.REQUIRE_CONFIRMATION
     assert candidate.reason is MemoryCandidateReason.THIRD_PARTY_SUBJECT
+
+
+@pytest.mark.asyncio
+async def test_unregistered_but_source_grounded_third_party_waits_for_confirmation() -> None:
+    extractor = FakeExtractor(())
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    candidate = (await service.generate(request("妹はチョコ味が好き")))[0]
+
+    assert candidate.subject_id == "妹"
+    assert candidate.value == "チョコ味"
+    assert candidate.disposition is MemoryCandidateDisposition.REQUIRE_CONFIRMATION
+    assert candidate.reason is MemoryCandidateReason.THIRD_PARTY_SUBJECT
+
+
+@pytest.mark.asyncio
+async def test_polite_allergy_fallback_requires_confirmation() -> None:
+    extractor = FakeExtractor((), error=OllamaUnavailable("invalid model output"))
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    generation = await service.generate_with_status(request("苺アレルギーです"))
+
+    assert generation.extractor_unavailable
+    assert len(generation.candidates) == 1
+    assert generation.candidates[0].value == "苺"
+    assert (
+        generation.candidates[0].disposition
+        is MemoryCandidateDisposition.REQUIRE_CONFIRMATION
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_extractor_output_on_clear_negation_safely_saves_nothing() -> None:
+    extractor = FakeExtractor((), error=OllamaUnavailable("invalid model output"))
+    service = MemoryCandidateService(
+        extractor, FreeOperationPolicy(), DEFAULT_MEMORY_TEMPLATES
+    )
+
+    generation = await service.generate_with_status(
+        request("バニラ味は好きではない")
+    )
+
+    assert generation.extractor_unavailable
+    assert generation.candidates == ()
 
 
 @pytest.mark.asyncio

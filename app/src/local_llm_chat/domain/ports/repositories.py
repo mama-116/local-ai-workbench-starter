@@ -140,6 +140,25 @@ class AppRepository(Protocol):
         self, conversation_id: str, branch_id: str, source_message_id: str
     ) -> Message: ...
 
+    async def list_memory_source_messages(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        through_source_message_id: str,
+        limit: int,
+    ) -> tuple[Message, ...]: ...
+
+    async def get_memory_source_messages(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        source_message_ids: tuple[str, ...],
+    ) -> tuple[Message, ...]: ...
+
+    async def get_memory_source_listener_character_ids(
+        self, conversation_id: str, source_message_id: str
+    ) -> frozenset[str]: ...
+
     async def get_response_model(self, message_id: str) -> tuple[str, str]: ...
 
     async def prepare_translation(

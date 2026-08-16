@@ -232,6 +232,7 @@ class ChatCoordinator:
                 author_subject_id="user",
                 allowed_subject_ids=frozenset({"user", *formal_character_ids}),
                 allowed_knowledge_character_ids=frozenset(formal_character_ids),
+                known_by_character_ids=frozenset(formal_character_ids),
             )
             try:
                 await self._memory_capture_scheduler.request_capture(request, run_id)

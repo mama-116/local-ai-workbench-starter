@@ -41,6 +41,13 @@ def transitive_superseded_event_ids(
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalMemoryAttribute:
+    key: str
+    value: str
+    source_message_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalMemoryEvent:
     id: str
     conversation_id: str
@@ -56,6 +63,8 @@ class CanonicalMemoryEvent:
     supersedes_event_id: str | None
     effective_at: datetime
     recorded_at: datetime
+    source_message_ids: tuple[str, ...] = ()
+    attributes: tuple[CanonicalMemoryAttribute, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +110,8 @@ class CanonicalMemoryReviewItem:
     known_by_character_ids: frozenset[str]
     effective_at: datetime
     is_active: bool
+    source_message_ids: tuple[str, ...] = ()
+    attributes: tuple[CanonicalMemoryAttribute, ...] = ()
 
 
 class CanonicalMemoryLedger:
@@ -187,6 +198,8 @@ class CanonicalMemoryLedger:
                 known_by_character_ids=item.known_by_character_ids,
                 effective_at=item.effective_at,
                 is_active=item.id not in superseded_ids,
+                source_message_ids=self._event_source_ids(item),
+                attributes=item.attributes,
             )
             for item in visible
         )
@@ -295,6 +308,32 @@ class CanonicalMemoryLedger:
             raise ValueError("canonical memory event timestamps must be timezone-aware")
         if any(not character_id.strip() for character_id in item.known_by_character_ids):
             raise ValueError("knowledge scope character ids cannot be blank")
+        source_ids = CanonicalMemoryLedger._event_source_ids(item)
+        if (
+            source_ids[-1] != item.source_message_id
+            or len(source_ids) != len(set(source_ids))
+            or any(not source_id.strip() for source_id in source_ids)
+        ):
+            raise ValueError(
+                "memory evidence sources must be unique and end at the primary source"
+            )
+        attribute_keys = tuple(attribute.key for attribute in item.attributes)
+        if (
+            len(attribute_keys) != len(set(attribute_keys))
+            or any(
+                not attribute.key.strip()
+                or not attribute.value.strip()
+                or attribute.source_message_id not in source_ids
+                for attribute in item.attributes
+            )
+        ):
+            raise ValueError(
+                "memory attributes must be unique, non-blank, and source-backed"
+            )
+
+    @staticmethod
+    def _event_source_ids(item: CanonicalMemoryEvent) -> tuple[str, ...]:
+        return item.source_message_ids or (item.source_message_id,)
 
     @staticmethod
     def _validate_query(query: MemoryProjectionQuery) -> None:

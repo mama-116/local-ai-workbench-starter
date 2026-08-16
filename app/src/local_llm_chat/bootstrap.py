@@ -10,6 +10,9 @@ from local_llm_chat.application.services.chat_service import ChatService
 from local_llm_chat.application.services.embedding_index_service import (
     EmbeddingIndexService,
 )
+from local_llm_chat.application.services.explicit_memory_service import (
+    ExplicitMemoryService,
+)
 from local_llm_chat.application.services.computer_use_access_service import (
     ComputerUseAccessService,
 )
@@ -118,6 +121,7 @@ class AppContainer:
     memory_capture: QueuedMemoryCaptureScheduler
     memory_review: MemoryReviewService
     memory_settings: MemoryExtractionSettingsService
+    explicit_memory: ExplicitMemoryService
     memory_extractor: ConfiguredMemoryCandidateExtractor
     chat: ChatCoordinator
     tool_access: ToolAccessService
@@ -217,6 +221,7 @@ async def bootstrap(data_dir: Path | None = None) -> AppContainer:
         memory_capture=memory_capture,
         memory_review=MemoryReviewService(repository),
         memory_settings=memory_settings,
+        explicit_memory=ExplicitMemoryService(repository, memory_candidates),
         memory_extractor=memory_extractor,
         tool_access=tool_access,
         scheduler=scheduler,

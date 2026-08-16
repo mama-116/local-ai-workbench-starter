@@ -232,6 +232,12 @@ async def test_enabled_conversation_generates_and_finishes_one_turn_batch(
 ) -> None:
     repository = SQLiteAppRepository(tmp_path / "chat.sqlite3")
     conversation = await make_conversation(repository)
+    other = await repository.create_character_version(
+        "二人目", "二人目として話す。"
+    )
+    await repository.set_conversation_cast(
+        conversation.id, (conversation.character_version_id, other.id)
+    )
     await ConversationGroupSettingsService(repository).configure(
         conversation.id, enabled=True, mode=TurnMode.STORY
     )
@@ -248,12 +254,15 @@ async def test_enabled_conversation_generates_and_finishes_one_turn_batch(
     )
     single = SingleChatStub(placeholder)
     generator = RecordingGenerator()
+    memory = RecordingMemoryScheduler()
     updates: list[str] = []
 
     async def on_update(content: str) -> None:
         updates.append(content)
 
-    response = await coordinator(repository, single, generator).send_message(
+    response = await coordinator(
+        repository, single, generator, memory=memory
+    ).send_message(
         conversation.id, "みんなはどう思う？", on_update
     )
 
@@ -267,6 +276,14 @@ async def test_enabled_conversation_generates_and_finishes_one_turn_batch(
     ]
     batch = await repository.get_turn_batch_for_response(response.id)
     assert len(batch.segments) == 1
+    assert len(memory.requests) == 1
+    capture_request = memory.requests[0][0]
+    assert capture_request.known_by_character_ids == frozenset(
+        batch.formal_character_ids
+    )
+    assert await repository.get_memory_source_listener_character_ids(
+        conversation.id, batch.source_message_id
+    ) == frozenset(batch.formal_character_ids)
     latest = await repository.get_latest_telemetry(conversation.id)
     assert latest is not None
     assert latest.run.prompt_tokens == 80

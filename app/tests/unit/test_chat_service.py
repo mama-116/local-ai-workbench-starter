@@ -363,6 +363,9 @@ async def test_completed_chat_enqueues_memory_without_losing_response(
     assert capture_request.allowed_knowledge_character_ids == (
         capture_request.allowed_subject_ids - {"user"}
     )
+    assert capture_request.known_by_character_ids == (
+        capture_request.allowed_knowledge_character_ids
+    )
     assert run_id
     if scheduler_fails:
         with sqlite3.connect(database_path) as connection:

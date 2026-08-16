@@ -399,6 +399,9 @@ class ChatService:
                     allowed_knowledge_character_ids=frozenset(
                         {character.character_id}
                     ),
+                    known_by_character_ids=frozenset(
+                        {character.character_id}
+                    ),
                 )
                 try:
                     await self._memory_capture_scheduler.request_capture(

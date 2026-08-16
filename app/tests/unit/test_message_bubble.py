@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Any, cast
 
 import flet as ft
 
@@ -49,6 +50,21 @@ def _assistant() -> Message:
         source_message_id=None,
         role=MessageRole.ASSISTANT,
         content="回答",
+        state=MessageState.COMPLETED,
+        created_at=now,
+        completed_at=now,
+    )
+
+
+def _user() -> Message:
+    now = utc_now()
+    return Message(
+        id="user-1",
+        conversation_id="conversation-1",
+        parent_message_id=None,
+        source_message_id=None,
+        role=MessageRole.USER,
+        content="スーパーカップのチョコチップ味が好き",
         state=MessageState.COMPLETED,
         created_at=now,
         completed_at=now,
@@ -112,3 +128,23 @@ def test_answer_without_selected_sources_has_no_rag_status() -> None:
 
     assert "資料使用あり" not in copy
     assert "該当箇所なし" not in copy
+
+
+def test_completed_user_message_can_offer_explicit_memory_action() -> None:
+    called = False
+
+    def remember() -> None:
+        nonlocal called
+        called = True
+
+    bubble = MessageBubble(_user(), on_remember=remember)
+    buttons = [
+        control
+        for control in _controls(bubble)
+        if isinstance(control, ft.IconButton)
+        and control.tooltip == "覚えておいて"
+    ]
+
+    assert len(buttons) == 1
+    cast(Callable[[], Any], buttons[0].on_click)()
+    assert called

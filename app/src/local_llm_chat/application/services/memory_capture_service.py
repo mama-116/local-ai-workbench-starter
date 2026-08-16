@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,10 +21,35 @@ from local_llm_chat.domain.memory_candidates import (
     MemoryCandidateRequest,
 )
 from local_llm_chat.domain.ports.repositories import AppRepository
-from local_llm_chat.domain.states import MemoryCandidateDisposition
+from local_llm_chat.domain.states import (
+    MemoryApprovalState,
+    MemoryCandidateDisposition,
+    MemoryCardinality,
+    MemoryKind,
+)
 
 
 _MEMORY_EVENT_NAMESPACE = UUID("8a37fbc1-ca67-4ecf-a54a-f54cc0f31475")
+_PROGRESSIVE_MEMORY_NAMESPACE = UUID("c19f1db5-dd4e-4324-b61e-1cb928ca61cb")
+_FOOD_DETAIL_PATTERN = re.compile(
+    r"^\s*(?:私は|自分は)\s*(?P<value>[^。！？!?\r\n]{1,180}?(?:アイス|味))"
+    r"\s*[。！？!?]?\s*$"
+)
+_FOOD_LATEST_CORRECTION_PATTERN = re.compile(
+    r"^\s*(?:でも)?\s*今は\s*(?P<value>[^。！？!?\r\n]{1,180}?(?:アイス|味))"
+    r"\s*が一番好き\s*[。！？!?]?\s*$"
+)
+_FOOD_CONDITION_STATEMENT_PATTERN = re.compile(
+    r"^\s*(?P<value>(?:ちょっと|少し|やや|かなり|完全に)?\s*"
+    r"(?:溶け(?:かけ|た|ている)|冷え(?:かけ|た|ている)|温め(?:た|ている)"
+    r"|焼き(?:たて|かけ)|凍(?:った|らせた)|熱々|あつあつ|ひえひえ"
+    r"|冷たい|温かい|ぬるい|常温)(?:状態|もの|方|の)?)"
+    r"\s*が好き\s*[。！？!?]?\s*$"
+)
+_MULTIPLE_FOOD_OPTIONS_PATTERN = re.compile(
+    r"(?P<first>[^。！？!?\r\n、]{1,80}味)\s*と\s*"
+    r"(?P<second>[^。！？!?\r\n、]{1,80}味)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,11 +110,27 @@ class MemoryCaptureService:
         self._candidate_service = candidate_service
 
     async def capture(self, request: MemoryCaptureRequest) -> MemoryCaptureResult:
+        if not request.known_by_character_ids:
+            raise ValidationError(
+                "automatic memory requires at least one listener character"
+            )
+        if not request.known_by_character_ids.issubset(
+            request.allowed_knowledge_character_ids
+        ):
+            raise ValidationError(
+                "automatic memory listener is outside the allowed knowledge scope"
+            )
         source = await self._repository.get_memory_source_message(
             request.conversation_id,
             request.branch_id,
             request.source_message_id,
         )
+        progressive_event = await self._progressive_preference_event(
+            request, source.content, source.created_at
+        )
+        if progressive_event is not None:
+            await self._repository.append_canonical_memory_event(progressive_event)
+            return MemoryCaptureResult((), (progressive_event.id,))
         generation = await self._candidate_service.generate_with_status(
             MemoryCandidateRequest(
                 conversation_id=request.conversation_id,
@@ -116,6 +158,178 @@ class MemoryCaptureService:
         )
         return MemoryCaptureResult(
             candidates, persisted_event_ids, generation.extractor_unavailable
+        )
+
+    async def _progressive_preference_event(
+        self,
+        request: MemoryCaptureRequest,
+        content: str,
+        source_created_at: datetime,
+    ) -> CanonicalMemoryEvent | None:
+        detail_match = _FOOD_DETAIL_PATTERN.fullmatch(content)
+        correction_match = _FOOD_LATEST_CORRECTION_PATTERN.fullmatch(content)
+        condition_match = _FOOD_CONDITION_STATEMENT_PATTERN.fullmatch(content)
+        if (
+            detail_match is None
+            and correction_match is None
+            and condition_match is None
+        ):
+            return None
+
+        review_items = await self._repository.list_canonical_memory_review_items(
+            request.conversation_id, request.branch_id
+        )
+        active_foods = tuple(
+            item
+            for item in review_items
+            if item.is_active
+            and item.subject_id == request.author_subject_id
+            and item.kind is MemoryKind.PREFERENCE
+            and item.slot == "liked_food"
+            and item.approval
+            in {MemoryApprovalState.AUTO_SAVED, MemoryApprovalState.CONFIRMED}
+        )
+        if any(
+            item.known_by_character_ids != request.known_by_character_ids
+            for item in active_foods
+        ):
+            # A replacement is global, while knowledge is per character.
+            # Merging different listener snapshots would leak or hide updates.
+            return None
+        if not active_foods:
+            if condition_match is None:
+                return None
+            recent = await self._repository.list_memory_source_messages(
+                request.conversation_id,
+                request.branch_id,
+                request.source_message_id,
+                8,
+            )
+            ambiguous_sources = tuple(
+                message.id
+                for message in recent[:-1]
+                if _MULTIPLE_FOOD_OPTIONS_PATTERN.search(message.content)
+            )
+            if not ambiguous_sources:
+                return None
+            condition = condition_match.group("value").strip()
+            source_ids = (*ambiguous_sources, request.source_message_id)
+            identity = json.dumps(
+                {
+                    "conversation_id": request.conversation_id,
+                    "branch_id": request.branch_id,
+                    "sources": source_ids,
+                    "subject_id": request.author_subject_id,
+                    "slot": "liked_food_condition",
+                    "value": condition,
+                    "approval": MemoryApprovalState.PENDING_CONFIRMATION.value,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return CanonicalMemoryEvent(
+                id=str(uuid5(_PROGRESSIVE_MEMORY_NAMESPACE, identity)),
+                conversation_id=request.conversation_id,
+                branch_id=request.branch_id,
+                subject_id=request.author_subject_id,
+                kind=MemoryKind.PREFERENCE,
+                slot="liked_food_condition",
+                value=condition,
+                cardinality=MemoryCardinality.MULTIPLE,
+                approval=MemoryApprovalState.PENDING_CONFIRMATION,
+                source_message_id=request.source_message_id,
+                known_by_character_ids=request.known_by_character_ids,
+                supersedes_event_id=None,
+                effective_at=source_created_at,
+                recorded_at=source_created_at,
+                source_message_ids=source_ids,
+            )
+
+        sources: tuple[str, ...]
+        if correction_match is not None:
+            if len(active_foods) != 1:
+                return None
+            target = active_foods[0]
+            value = correction_match.group("value").strip()
+            if value == target.value:
+                return None
+            approval = MemoryApprovalState.AUTO_SAVED
+            slot = target.slot
+            supersedes_event_id = target.event_id
+            # An explicit latest preference is independently grounded in the
+            # correction turn. The superseded event retains its own evidence.
+            sources = (request.source_message_id,)
+            known_by = target.known_by_character_ids
+        elif detail_match is not None:
+            if len(active_foods) != 1:
+                return None
+            target = active_foods[0]
+            value = detail_match.group("value").strip()
+            if value == target.value:
+                return None
+            approval = MemoryApprovalState.AUTO_SAVED
+            slot = target.slot
+            supersedes_event_id = target.event_id
+            sources = (*target.source_message_ids, request.source_message_id)
+            known_by = target.known_by_character_ids
+        else:
+            assert condition_match is not None
+            condition = condition_match.group("value").strip()
+            if len(active_foods) == 1:
+                target = active_foods[0]
+                value = f"{target.value}（{condition}）"
+                approval = MemoryApprovalState.AUTO_SAVED
+                slot = target.slot
+                supersedes_event_id = target.event_id
+                sources = (*target.source_message_ids, request.source_message_id)
+                known_by = target.known_by_character_ids
+            else:
+                value = condition
+                approval = MemoryApprovalState.PENDING_CONFIRMATION
+                slot = "liked_food_condition"
+                supersedes_event_id = None
+                prior_sources = tuple(
+                    source_id
+                    for item in active_foods
+                    for source_id in item.source_message_ids
+                )
+                sources = (*prior_sources[-7:], request.source_message_id)
+                known_by = request.known_by_character_ids
+
+        source_ids = tuple(dict.fromkeys(sources))
+        identity = json.dumps(
+            {
+                "conversation_id": request.conversation_id,
+                "branch_id": request.branch_id,
+                "sources": source_ids,
+                "subject_id": request.author_subject_id,
+                "slot": slot,
+                "value": value,
+                "approval": approval.value,
+                "known_by": sorted(known_by),
+                "supersedes": supersedes_event_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return CanonicalMemoryEvent(
+            id=str(uuid5(_PROGRESSIVE_MEMORY_NAMESPACE, identity)),
+            conversation_id=request.conversation_id,
+            branch_id=request.branch_id,
+            subject_id=request.author_subject_id,
+            kind=MemoryKind.PREFERENCE,
+            slot=slot,
+            value=value,
+            cardinality=MemoryCardinality.MULTIPLE,
+            approval=approval,
+            source_message_id=request.source_message_id,
+            known_by_character_ids=known_by,
+            supersedes_event_id=supersedes_event_id,
+            effective_at=source_created_at,
+            recorded_at=source_created_at,
+            source_message_ids=source_ids,
         )
 
     @staticmethod

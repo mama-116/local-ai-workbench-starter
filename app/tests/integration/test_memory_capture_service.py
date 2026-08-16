@@ -154,6 +154,7 @@ async def test_capture_loads_trusted_message_classifies_and_atomically_persists(
         author_subject_id="user",
         allowed_subject_ids=frozenset({"user", "character-tanaka"}),
         allowed_knowledge_character_ids=frozenset({character.character_id}),
+        known_by_character_ids=frozenset({character.character_id}),
     )
 
     result = await capture.capture(request)
@@ -244,6 +245,7 @@ async def test_capture_rejects_untrusted_source_before_extraction(tmp_path: Path
                 author_subject_id="user",
                 allowed_subject_ids=frozenset({"user"}),
                 allowed_knowledge_character_ids=frozenset({character.character_id}),
+                known_by_character_ids=frozenset({character.character_id}),
             )
         )
 
@@ -296,6 +298,7 @@ async def test_capture_single_value_supersedes_old_fact_without_deleting_history
                 "test-local",
                 "user",
                 frozenset({"user"}),
+                frozenset({character.character_id}),
                 frozenset({character.character_id}),
             )
         )
@@ -384,6 +387,7 @@ async def test_delayed_older_capture_cannot_replace_newer_single_value(
                 "user",
                 frozenset({"user"}),
                 frozenset({character.character_id}),
+                frozenset({character.character_id}),
             )
         )
         return result.persisted_event_ids
@@ -456,6 +460,7 @@ async def test_single_slot_waits_for_pending_confirmation_before_next_change(
                     "test-local",
                     "user",
                     frozenset({"user"}),
+                    frozenset({character.character_id}),
                     frozenset({character.character_id}),
                 )
             )
