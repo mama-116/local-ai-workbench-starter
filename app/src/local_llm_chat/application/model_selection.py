@@ -30,16 +30,23 @@ def recommend_chat_model(models: list[ModelInfo]) -> ModelInfo | None:
     general_models = [
         model
         for model in models
-        if model.size_bytes <= _COMFORTABLE_SIZE_BYTES
+        if (not model.size_is_known or model.size_bytes <= _COMFORTABLE_SIZE_BYTES)
         and not any(marker in model.name.lower() for marker in _SPECIALIZED_MARKERS)
     ]
     candidates = general_models or [
-        model for model in models if model.size_bytes <= _COMFORTABLE_SIZE_BYTES
+        model
+        for model in models
+        if not model.size_is_known or model.size_bytes <= _COMFORTABLE_SIZE_BYTES
     ]
-    return min(candidates or models, key=lambda model: model.size_bytes)
+    return min(
+        candidates or models,
+        key=lambda model: model.size_bytes if model.size_is_known else float("inf"),
+    )
 
 
 def model_option_label(model: ModelInfo, recommended_name: str | None) -> str:
-    size_gib = model.size_bytes / 1024**3
     suffix = " · おすすめ" if model.name == recommended_name else ""
+    if not model.size_is_known:
+        return f"{model.name} · サイズ不明{suffix}"
+    size_gib = model.size_bytes / 1024**3
     return f"{model.name} · {size_gib:.1f} GiB{suffix}"

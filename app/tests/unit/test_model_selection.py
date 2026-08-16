@@ -50,3 +50,19 @@ def test_option_label_shows_size_and_recommendation() -> None:
     assert model_option_label(model, model.name) == (
         "qwen3.5:9b · 6.1 GiB · おすすめ"
     )
+
+
+def test_option_label_does_not_invent_vllm_model_size() -> None:
+    model = ModelInfo(
+        name="deepseek-v4-flash-2bit",
+        size_bytes=0,
+        format="vLLM",
+        family="vllm",
+        parameter_size="",
+        quantization="",
+        size_is_known=False,
+    )
+
+    assert model_option_label(model, model.name) == (
+        "deepseek-v4-flash-2bit · サイズ不明 · おすすめ"
+    )

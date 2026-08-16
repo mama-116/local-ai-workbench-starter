@@ -16,6 +16,7 @@ from local_llm_chat.domain.states import (
     Locality,
     MessageRole,
     MessageState,
+    ProviderKind,
     RunState,
     TranslationState,
     ToolCallState,
@@ -49,6 +50,7 @@ class ProviderConnection:
     endpoint: str
     cloud_disabled_confirmed: bool
     is_builtin: bool = False
+    provider_kind: ProviderKind = ProviderKind.OLLAMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,7 @@ class ModelInfo:
     parameter_size: str
     quantization: str
     license_text: str = ""
+    size_is_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)

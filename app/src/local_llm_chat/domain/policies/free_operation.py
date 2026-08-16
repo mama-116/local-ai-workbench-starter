@@ -84,7 +84,7 @@ class FreeOperationPolicy:
                 "cloud_model_name",
                 "Cloudモデルは利用できません。",
             )
-        if model.size_bytes <= 0:
+        if model.size_is_known and model.size_bytes <= 0:
             raise FreeOperationBlocked(
                 "model_has_no_local_data",
                 "ローカル実体を確認できないモデルは利用できません。",

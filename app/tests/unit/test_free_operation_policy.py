@@ -69,6 +69,20 @@ def test_rejects_model_without_local_data() -> None:
         FreeOperationPolicy().require_model(local_model(size_bytes=0))
 
 
+def test_accepts_private_vllm_model_when_size_is_unknown() -> None:
+    model = ModelInfo(
+        "deepseek-v4-flash-2bit",
+        0,
+        "vLLM",
+        "vllm",
+        "",
+        "",
+        size_is_known=False,
+    )
+
+    FreeOperationPolicy().require_model(model)
+
+
 def test_rejects_when_ollama_cloud_is_not_disabled() -> None:
     with pytest.raises(FreeOperationBlocked, match="無効化"):
         FreeOperationPolicy().require_cloud_disabled(False)

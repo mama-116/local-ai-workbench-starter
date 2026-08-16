@@ -4,6 +4,7 @@ import pytest
 
 from local_llm_chat.domain.errors import FreeOperationBlocked
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
+from local_llm_chat.domain.states import ProviderKind
 from local_llm_chat.infrastructure.llm.ollama_registry import OllamaProviderRegistry
 
 
@@ -18,7 +19,15 @@ async def test_includes_local_and_requested_lan_connection(tmp_path: Path) -> No
         endpoints = {item.endpoint for item in registry.list_connections()}
         assert "http://127.0.0.1:11434" in endpoints
         assert "http://192.168.1.17:11434" in endpoints
+        assert "http://192.168.1.17:18080" in endpoints
+        vllm = next(
+            item
+            for item in registry.list_connections()
+            if item.endpoint == "http://192.168.1.17:18080"
+        )
+        assert vllm.provider_kind is ProviderKind.VLLM
         assert registry.cloud_is_disabled("ollama-lan-192-168-1-17") is False
+        assert registry.cloud_is_disabled("vllm-lan-192-168-1-17") is True
     finally:
         await registry.close()
 

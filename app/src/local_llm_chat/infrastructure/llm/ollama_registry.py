@@ -10,11 +10,15 @@ from local_llm_chat.domain.errors import ValidationError
 from local_llm_chat.domain.models import ProviderConnection
 from local_llm_chat.domain.policies.free_operation import FreeOperationPolicy
 from local_llm_chat.domain.ports.llm_provider import LLMProvider
+from local_llm_chat.domain.states import ProviderKind
 from local_llm_chat.infrastructure.llm.ollama_provider import OllamaProvider
+from local_llm_chat.infrastructure.llm.vllm_provider import VllmProvider
 from local_llm_chat.infrastructure.settings import is_ollama_cloud_disabled
 
 LOCAL_PROVIDER_NAME = "ollama-local"
 LOCAL_ENDPOINT = "http://127.0.0.1:11434"
+VLLM_PROVIDER_NAME = "vllm-lan-192-168-1-17"
+VLLM_ENDPOINT = "http://192.168.1.17:18080"
 
 _DEFAULT_CONNECTIONS = (
     ProviderConnection(
@@ -32,6 +36,15 @@ _DEFAULT_CONNECTIONS = (
         endpoint="http://192.168.1.17:11434",
         cloud_disabled_confirmed=False,
     ),
+    ProviderConnection(
+        id="vllm-lan-192-168-1-17",
+        provider_name=VLLM_PROVIDER_NAME,
+        display_name="vLLM 192.168.1.17",
+        endpoint=VLLM_ENDPOINT,
+        cloud_disabled_confirmed=True,
+        is_builtin=True,
+        provider_kind=ProviderKind.VLLM,
+    ),
 )
 
 
@@ -47,9 +60,7 @@ class OllamaProviderRegistry:
         self._free_policy = free_policy
         self._connections = self._load_connections()
         self._providers = {
-            connection.provider_name: OllamaProvider(
-                connection.endpoint, name=connection.provider_name
-            )
+            connection.provider_name: self._build_provider(connection)
             for connection in self._connections
         }
 
@@ -64,7 +75,7 @@ class OllamaProviderRegistry:
         try:
             return self._providers[provider_name]
         except KeyError as error:
-            raise ValidationError("登録されていないOllama接続先です。") from error
+            raise ValidationError("登録されていない推論接続先です。") from error
 
     def cloud_is_disabled(self, provider_name: str) -> bool:
         connection = self._connection(provider_name)
@@ -130,7 +141,7 @@ class OllamaProviderRegistry:
             None,
         )
         if connection is None:
-            raise ValidationError("登録されていないOllama接続先です。")
+            raise ValidationError("登録されていない推論接続先です。")
         return connection
 
     def _load_connections(self) -> list[ProviderConnection]:
@@ -163,6 +174,9 @@ class OllamaProviderRegistry:
                 endpoint=str(raw["endpoint"]).rstrip("/"),
                 cloud_disabled_confirmed=bool(raw["cloud_disabled_confirmed"]),
                 is_builtin=bool(raw.get("is_builtin", False)),
+                provider_kind=ProviderKind(
+                    str(raw.get("provider_kind", ProviderKind.OLLAMA.value))
+                ),
             )
             self._free_policy.require_endpoint(connection.endpoint)
         except (KeyError, TypeError, ValidationError):
@@ -183,6 +197,7 @@ class OllamaProviderRegistry:
                 "endpoint": item.endpoint,
                 "cloud_disabled_confirmed": item.cloud_disabled_confirmed,
                 "is_builtin": item.is_builtin,
+                "provider_kind": item.provider_kind.value,
             }
             for item in self._connections
         ]
@@ -191,3 +206,9 @@ class OllamaProviderRegistry:
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         temporary.replace(self._connections_path)
+
+    @staticmethod
+    def _build_provider(connection: ProviderConnection) -> LLMProvider:
+        if connection.provider_kind is ProviderKind.VLLM:
+            return VllmProvider(connection.endpoint, name=connection.provider_name)
+        return OllamaProvider(connection.endpoint, name=connection.provider_name)
